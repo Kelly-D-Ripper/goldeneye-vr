@@ -667,6 +667,13 @@ STAGESTATUS fileIsStageUnlockedAtDifficulty(s32 foldernum, LEVEL_SOLO_SEQUENCE l
         {
             return STAGESTATUS_UNLOCKED;
         }
+#ifdef GEVR
+        {
+            /* a Tactical save whose player chose "unlock all missions and items" */
+            extern int gevrProgressAllMissions(int folder);
+            if (gevrProgressAllMissions(foldernum)) return STAGESTATUS_UNLOCKED;
+        }
+#endif
 
         if (save)
         {

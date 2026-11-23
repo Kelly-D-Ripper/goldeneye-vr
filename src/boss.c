@@ -610,6 +610,12 @@ void bossMainloop(void)
         init_player_data_ptrs_construct_viewports(localSelectedNumPlayers);
         dynInitMemory();
         joyCheckStatusThreadSafe();
+#ifdef GEVR
+        {
+            extern void gevrProgressBeginMission(void);
+            gevrProgressBeginMission();
+        }
+#endif
         lvlStageLoad(g_StageNum);
 #ifdef GEVR
         if (g_StageNum != LEVELID_TITLE) {
@@ -889,6 +895,12 @@ void bossMainloop(void)
 
         lvlUnloadStageTextData();
         sysLogPrintf(LOG_NOTE, "stage: unloaded stage text data");
+#ifdef GEVR
+        {
+            extern void gevrProgressSave(void);   /* Tactical stats from the mission just played */
+            gevrProgressSave();
+        }
+#endif
         stop_demo_playback();
         mempNullNextEntryInBank(MEMPOOL_STAGE);
         obBlankResourcesLoadedInBank(MEMPOOL_STAGE);
@@ -1015,7 +1027,11 @@ void bossReturnTitleStage(void) {
         return;
     }
 #endif
-    if ((bossGetStageNum() != LEVELID_CUBA) && (objectiveIsAllComplete() != 0x0)) {
+    if ((bossGetStageNum() != LEVELID_CUBA) && (objectiveIsAllComplete() != 0x0)
+#ifdef GEVR
+        && !g_isBondKIA && !mission_failed_or_aborted && g_MainStageNum != LEVELID_TITLE
+#endif
+        ) {
         end_of_mission_briefing();
     }
     bossRunTitleStage();

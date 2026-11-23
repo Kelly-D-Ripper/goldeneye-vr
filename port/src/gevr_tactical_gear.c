@@ -1407,6 +1407,66 @@ int gevrTacticalGearImportPreset(int kind, FILE *file)
     return result;
 }
 
+int gevrTacticalGearSanitize(int kind, int (*allowed)(int, const GevrGearMount *))
+{
+    GearBuild *build = getBuild(kind);
+    if (!build || !allowed) return 0;
+    if (!build->view.count) rebuild(build);
+    const GevrGearAssembly *stock = gevrTacticalGearStockAssembly(kind);
+    int touched = 0;
+    for (int pass = 0; pass < GEVR_GEAR_MOUNTS; ++pass) {
+        int i = 1;
+        while (i < build->view.count && allowed(kind, &build->view.mounts[i])) ++i;
+        if (i == build->view.count) return touched;
+        ++touched;
+        const GevrGearMount *mount = &build->view.mounts[i];
+        const GevrGearSocket *socket = mount->socket;
+        const GevrGearMount *factory = gevrTacticalGearFindMount(stock, mount->path);
+        int replacement = -1;
+        if (factory && factory->part >= 0 && factory->part != mount->part
+            && socketAccepts(socket, factory->part)) {
+            GevrGearMount probe = *mount;
+            probe.part = factory->part;
+            if (allowed(kind, &probe)) replacement = probe.part;
+        }
+        if (replacement < 0 && socket->required) {
+            for (int j = 0; j < socket->count; ++j) {
+                GevrGearMount probe = *mount;
+                probe.part = socket->allowed[j];
+                if (probe.part != mount->part && allowed(kind, &probe)) {
+                    replacement = probe.part;
+                    break;
+                }
+            }
+            if (replacement < 0) break;
+        }
+        char path[GEVR_GEAR_PATH];
+        strcpy(path, mount->path);
+        /* Change only the locked branch; other fitted parts retain their choices. */
+        if (!setGearChoice(build, path, replacement, NULL)) break;
+        rebuild(build);
+    }
+    gevrTacticalGearReset(kind);
+    return touched;
+}
+
+void gevrTacticalGearSanitizeDeployed(int (*allowed)(int, const GevrGearMount *))
+{
+    for (int slot = 0; slot < 2; ++slot) {
+        const int build = s_deployedBuild[slot];
+        const GevrGearAssembly *view = gevrTacticalGearDeployedAssembly(build);
+        const int key = gevrTacticalGearBaseBuild(build);
+        for (int i = 1; view && i < view->count; ++i) {
+            if (!allowed(key, &view->mounts[i])) {
+                /* An issued or scripted build is shared with world items; leave it intact.
+                 * Only the player's starting build falls back to factory. */
+                s_deployedBuild[slot] = -1;
+                break;
+            }
+        }
+    }
+}
+
 void gevrTacticalGearCommit(int stage, int primary, int secondary, int primaryBuild, int secondaryBuild)
 {
     s_issuedLaunch = 0;

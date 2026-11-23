@@ -3104,6 +3104,14 @@ static void gearOpen(int workshop);
 static void gearInterface(void);
 static Gfx *gearDraw(Gfx *g);
 static void gearRestoreRange(void);
+static void gearProgressAskInterface(void);
+static Gfx *gearProgressAskDraw(Gfx *g);
+static int gearProgressOpen(void);
+static void gearProgressShow(void);
+static void gearProgressInterface(void);
+static Gfx *gearProgressDraw(Gfx *g);
+static void gearBrowse(int direction);
+#include "gevr_tactical_progress.h"
 
 static int frontWorkshopAvailable(void)
 {
@@ -3123,6 +3131,7 @@ void init_menu06_modeselect(void)
     load_walletbond();
     fileUpdateBondInCurrentFolder();
 #ifdef GEVR
+    gevrProgressSelectFolder(selected_folder_num);
     if (gevrCoopTacticalKitGuest()) gearOpen(FALSE);
     else gearRestoreRange();
 #endif
@@ -3141,6 +3150,18 @@ void interface_menu06_modesel(void)
 #ifdef GEVR
     if (gevrCoopTacticalKitGuest() || gearWorkshopOpen()) { gearInterface(); return; }
     const int workshop = frontWorkshopAvailable();
+    if (workshop && gevrProgressAsk()) { gearProgressAskInterface(); return; }
+    if (workshop && sysArgCheck("--input-script")) {
+        /* scripted screenshots: --tactical-menu-test progression|workshop */
+        static int opened;
+        const char *test = sysArgGetString("--tactical-menu-test");
+        if (test && !opened) {
+            opened = TRUE;
+            if (!strcmp(test, "progression")) gearProgressShow();
+            else if (!strcmp(test, "workshop")) { gearOpen(TRUE); gearBrowse(1); }
+        }
+    }
+    if (workshop && gearProgressOpen()) { gearProgressInterface(); return; }
 #else
     const int workshop = FALSE;
 #endif
@@ -3181,7 +3202,7 @@ void interface_menu06_modesel(void)
             sndPlaySfx(g_musicSfxBufferPtr, DOOR_METAL_CLOSE2_SFX, 0);
         }
     }
-    else if (is_cheat_menu_available && cursor_v_pos >= (workshop ? 303.f : 275.f))
+    else if (is_cheat_menu_available && cursor_v_pos >= (workshop ? 308.f : 275.f))
     {
         mission_difficulty_highlighted = DIFFICULTY_00;
         if (joyGetButtonsPressedThisFrame(PLAYER_1, START_BUTTON|Z_TRIG|A_BUTTON))
@@ -3191,7 +3212,17 @@ void interface_menu06_modesel(void)
         }
     }
 #ifdef GEVR
-    else if (workshop && cursor_v_pos >= 275.f)
+    else if (workshop && cursor_v_pos >= 280.f)
+    {
+        mission_difficulty_highlighted = DIFFICULTY_MAX;   /* PROGRESSION */
+        if (joyGetButtonsPressedThisFrame(PLAYER_1, START_BUTTON | Z_TRIG | A_BUTTON))
+        {
+            gearProgressShow();
+            sndPlaySfx(g_musicSfxBufferPtr, DOOR_METAL_CLOSE2_SFX, NULL);
+            return;
+        }
+    }
+    else if (workshop && cursor_v_pos >= 252.f)
     {
         mission_difficulty_highlighted = DIFFICULTY_007;
         if (joyGetButtonsPressedThisFrame(PLAYER_1, START_BUTTON | Z_TRIG | A_BUTTON))
@@ -3202,7 +3233,7 @@ void interface_menu06_modesel(void)
         }
     }
 #endif
-    else if ((243.0f <= cursor_v_pos) && GEVR_MP_SELECTABLE())
+    else if (((workshop ? 224.0f : 243.0f) <= cursor_v_pos) && GEVR_MP_SELECTABLE())
     {
         mission_difficulty_highlighted = DIFFICULTY_SECRET;
         if (joyGetButtonsPressedThisFrame(PLAYER_1, START_BUTTON|Z_TRIG|A_BUTTON))
@@ -3380,9 +3411,14 @@ Gfx* constructor_menu06_modesel(Gfx* DL)
 #ifdef GEVR
     if (gevrCoopTacticalKitGuest() || gearWorkshopOpen()) return gearDraw(DL);
     const int workshop = frontWorkshopAvailable();
+    if (workshop && gevrProgressAsk()) return gearProgressAskDraw(DL);
+    if (workshop && gearProgressOpen()) return gearProgressDraw(DL);
 #else
     const int workshop = FALSE;
 #endif
+    /* Five rows with the Workshop and Progression, 28 apart; GoldenEye's own three otherwise. */
+    const s32 rowSelect = workshop ? 0xCC : 0xDC, rowMulti = workshop ? 0xE8 : 0xFC;
+    const s32 rowWorkshop = 0x104, rowProgress = 0x120;
     char *textstring;
     s32 x;
     s32 y;
@@ -3400,7 +3436,7 @@ Gfx* constructor_menu06_modesel(Gfx* DL)
     DL = microcode_constructor(DL);
 
     x = 0x96;
-    y = 0xdc;
+    y = rowSelect;
     DL = frontPrintText(DL, &x, &y, "1.\n", ptrFontZurichBoldChars, ptrFontZurichBold, 0xFF, viGetX(), viGetY(), 0, 0);
 
     textstring = langGet((g_AppendCheatSinglePlayer != 0) ? getStringID(LTITLE, TITLE_STR_117_CHEATSELECTMISSION) : getStringID(LTITLE, TITLE_STR_29_SELECTMISSION));
@@ -3408,16 +3444,16 @@ Gfx* constructor_menu06_modesel(Gfx* DL)
     textMeasure(&x2, &y2, textstring, ptrFontZurichBoldChars, ptrFontZurichBold, 0);
 
     x = 0xAA;
-    y = 0xdc;
+    y = rowSelect;
     if (mission_difficulty_highlighted == 0)
     {
-        DL = microcode_constructor_related_to_menus(DL, 0x94, 0xDA, y2 + 0xAF, 0xEA, 0x32);
+        DL = microcode_constructor_related_to_menus(DL, 0x94, rowSelect - 2, y2 + 0xAF, rowSelect + 14, 0x32);
     }
 
     DL = frontPrintText(DL, &x, &y, textstring, ptrFontZurichBoldChars, ptrFontZurichBold, 0xFF, viGetX(), viGetY(), 0, 0);
 
     x = 0x96;
-    y = 0xFC;
+    y = rowMulti;
     if (GEVR_MP_SELECTABLE())
     {
         text_color = 0xFF;
@@ -3433,33 +3469,44 @@ Gfx* constructor_menu06_modesel(Gfx* DL)
     textMeasure(&x2, &y2, textstring, ptrFontZurichBoldChars, ptrFontZurichBold, 0);
 
     x = 0xAA;
-    y = 0xFC;
+    y = rowMulti;
     if (mission_difficulty_highlighted == 1)
     {
-        DL = microcode_constructor_related_to_menus(DL, 0x94, 0xFA, y2 + 0xAF, 0x10A, 0x32);
+        DL = microcode_constructor_related_to_menus(DL, 0x94, rowMulti - 2, y2 + 0xAF, rowMulti + 14, 0x32);
     }
     DL = frontPrintText(DL, &x, &y, textstring, ptrFontZurichBoldChars, ptrFontZurichBold, text_color, viGetX(), viGetY(), 0, 0);
 
     if (workshop)
     {
         x = 0x96;
-        y = 0x11C;
+        y = rowWorkshop;
         DL = frontPrintText(DL, &x, &y, "3.\n", ptrFontZurichBoldChars, ptrFontZurichBold, 0xFF, viGetX(), viGetY(), 0, 0);
         textstring = "WORKSHOP\n";
         textMeasure(&x2, &y2, textstring, ptrFontZurichBoldChars, ptrFontZurichBold, 0);
         if (mission_difficulty_highlighted == DIFFICULTY_007)
-            DL = microcode_constructor_related_to_menus(DL, 0x94, 0x11A, y2 + 0xAF, 0x12A, 0x32);
+            DL = microcode_constructor_related_to_menus(DL, 0x94, rowWorkshop - 2, y2 + 0xAF, rowWorkshop + 14, 0x32);
         x = 0xAA;
-        y = 0x11C;
+        y = rowWorkshop;
+        DL = frontPrintText(DL, &x, &y, textstring, ptrFontZurichBoldChars, ptrFontZurichBold, 0xFF, viGetX(), viGetY(), 0, 0);
+
+        x = 0x96;
+        y = rowProgress;
+        DL = frontPrintText(DL, &x, &y, "4.\n", ptrFontZurichBoldChars, ptrFontZurichBold, 0xFF, viGetX(), viGetY(), 0, 0);
+        textstring = "PROGRESSION\n";
+        textMeasure(&x2, &y2, textstring, ptrFontZurichBoldChars, ptrFontZurichBold, 0);
+        if (mission_difficulty_highlighted == DIFFICULTY_MAX)
+            DL = microcode_constructor_related_to_menus(DL, 0x94, rowProgress - 2, y2 + 0xAF, rowProgress + 14, 0x32);
+        x = 0xAA;
+        y = rowProgress;
         DL = frontPrintText(DL, &x, &y, textstring, ptrFontZurichBoldChars, ptrFontZurichBold, 0xFF, viGetX(), viGetY(), 0, 0);
     }
 
     if (is_cheat_menu_available != 0)
     {
-        const s32 row = workshop ? 0x136 : 0x11C;
+        const s32 row = workshop ? 0x13C : 0x11C;
         x = 0x96;
         y = row;
-        DL = frontPrintText(DL, &x, &y, workshop ? "4.\n" : "3.\n",
+        DL = frontPrintText(DL, &x, &y, workshop ? "5.\n" : "3.\n",
             ptrFontZurichBoldChars, ptrFontZurichBold, 0xFF, viGetX(), viGetY(), 0, 0);
         textstring = langGet(getStringID(LTITLE, TITLE_STR_31_CHEATOPTIONS));
 
@@ -8090,6 +8137,21 @@ Gfx *constructor_menu0D_missioncomplete(Gfx *DL)
     y = 0xCC;
     DL = frontPrintText(DL, &x, &y, stagename, ptrFontZurichBoldChars, ptrFontZurichBold, 0xFF, viGetX(), viGetY(), 0, 0);
 
+
+#ifdef GEVR
+    {
+        int guns, parts;
+        gevrProgressLastExtraction(&guns, &parts);
+        if (guns || parts) {
+            x = 0xD0;
+            y = 0xCC;
+            snprintf(stagename, sizeof(stagename), "New gear: %d %s, %d %s", guns, guns == 1 ? "gun" : "guns",
+                parts, parts == 1 ? "part" : "parts");
+            DL = frontPrintText(DL, &x, &y, stagename, ptrFontZurichBoldChars, ptrFontZurichBold,
+                0xA00000FF, viGetX(), viGetY(), 0, 0);
+        }
+    }
+#endif
 
     text = langGet(getStringID(LTITLE, TITLE_STR_107_WEAPONOFCHOICE)); //Weapon of choice:*
     x = 0x37;

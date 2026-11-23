@@ -1,5 +1,6 @@
 /* Included by front.c so the dossier keeps its controller, screen pointer and cursor. */
 #include "gevr_tactical_fit.h"
+#include "gevr_tactical_progress.h"
 
 enum { GEAR_CAROUSEL = 1, GEAR_WORKBENCH };
 enum { GEAR_COLUMNS = 5, GEAR_CARDS = 2 * GEAR_COLUMNS, GEAR_OPTIONS = 8, GEAR_LIBRARY_ROWS = 9 };
@@ -19,7 +20,7 @@ enum { GEAR_ZOOM_1X = 1, GEAR_ZOOM_FIXED = 2, GEAR_ZOOM_RANGE = 4 };
 enum { GEAR_FITTINGS = 1, GEAR_OPTICS = 2, GEAR_SCOPE_MOUNTS = 4, GEAR_VISIBLE_MOUNTS = GEVR_GEAR_MOUNTS * 3 };
 typedef struct GearSlotChoice { int mount, category; } GearSlotChoice;
 typedef struct GearOption {
-    int part, fits, conflict, colour;
+    int part, fits, conflict, colour, locked;
     unsigned muzzle;
     unsigned zoom;
     f32 low, high;
@@ -75,11 +76,12 @@ static const GearWeapon gearPrimary[] = {
 #undef TACTICAL_SECONDARY
 #undef TACTICAL_PRIMARY
 };
+/* One Walther PPK (user, 2026-11-23): its suppressor is fitted in the Muzzle
+ * slot, and a PPK with one fitted is issued as the suppressed PPK. */
 static const GearWeapon gearSecondary[] = {
     {ITEM_NOTHING, -1, "Empty"},
-    {ITEM_WPPKSIL, TACTICAL_GUN_USP, "Suppressed PPK"},
-    {ITEM_TT33, TACTICAL_GUN_MAKAROV, "Makarov PM"},
     {ITEM_WPPK, TACTICAL_GUN_USP, "Walther PPK"},
+    {ITEM_TT33, TACTICAL_GUN_MAKAROV, "Makarov PM"},
 #define TACTICAL_PRIMARY(id, name)
 #define TACTICAL_SECONDARY(id, name) {ITEM_TACTICAL_##id, TACTICAL_GUN_##id, name},
 #define TACTICAL_EXPANDED(id, group, native, gun, prop, capacity, cadence, name) TACTICAL_##group(id, name)
@@ -130,14 +132,13 @@ static const char gearPresetKeys[] = "1234567890QWERTYUIOPASDFGHJKL-ZXCVBNM_";
 
 static int gearBuildKey(const GearWeapon *weapon)
 {
-    if (weapon->kind < 0) return -1;
-    return weapon->item == ITEM_WPPKSIL ? GEVR_GEAR_PPK_SUPPRESSED : gevrTacticalGearKey(weapon->kind);
+    return weapon->kind < 0 ? -1 : gevrTacticalGearKey(weapon->kind);
 }
 
 static int gearCount(int tab)
 {
     if (tab == 2) return ARRAYCOUNT(gearMelee);
-    if (!gevrTacticalExpandedEnabled()) return tab ? 4 : 8;
+    if (!gevrTacticalExpandedEnabled()) return tab ? 3 : 8;
     return tab ? (int)ARRAYCOUNT(gearSecondary) : (int)ARRAYCOUNT(gearPrimary);
 }
 
@@ -153,6 +154,47 @@ static int gearWeaponAvailable(const GearWeapon *weapon)
     if (weapon->item == ITEM_KNIFE) return gevrTacticalKnifeEnabled();
     if (weapon->item == ITEM_TACTICAL_KATANA) return gevrTacticalKatanaEnabled();
     return gevrTacticalItem(weapon->item) >= 0;
+}
+
+/* The Workshop name progression and stats use for a gun item. */
+const char *gevrTacticalGearItemName(int item)
+{
+    if (item == ITEM_NOTHING) return NULL;
+    if (item == ITEM_WPPKSIL) item = ITEM_WPPK;   /* the same PPK, suppressor fitted */
+    for (size_t i = 0; i < ARRAYCOUNT(gearPrimary); ++i) if (gearPrimary[i].item == item) return gearPrimary[i].name;
+    for (size_t i = 0; i < ARRAYCOUNT(gearSecondary); ++i) if (gearSecondary[i].item == item) return gearSecondary[i].name;
+    for (size_t i = 0; i < ARRAYCOUNT(gearMelee); ++i) if (gearMelee[i].item == item) return gearMelee[i].name;
+    return NULL;
+}
+
+/* Progression saves: the PPK is the only free gun; Empty and the knife are always there. */
+static int gearWeaponUnlocked(const GearWeapon *weapon)
+{
+    if (weapon->item == ITEM_NOTHING || weapon->item == ITEM_KNIFE) return TRUE;
+    return gevrProgressGunUnlocked(weapon->name);
+}
+
+static int gearPartUnlocked(int build, int part)
+{
+    return gevrProgressPartAllowed(build, part);
+}
+
+/* Existing mission loadouts can still refer to the old Suppressed PPK key.
+ * Both PPK roots use the same sockets, so show its fitted parts on the
+ * Workshop's single PPK, including any changes made in a named preset. */
+static void gearFitLegacyPpk(int build, const char *preset)
+{
+    const int named = gevrTacticalGearNamedBuild(GEVR_GEAR_PPK_SUPPRESSED, preset);
+    const GevrGearAssembly *legacy = named >= 0 ? gevrTacticalGearDeployedAssembly(named)
+        : gevrTacticalGearStockAssembly(GEVR_GEAR_PPK_SUPPRESSED);
+    const GevrGearAssembly *assembly = gevrTacticalGearAssembly(build);
+    for (int i = 1; legacy && assembly && i < legacy->count; ++i) {
+        const GevrGearMount *source = &legacy->mounts[i];
+        const GevrGearMount *target = gevrTacticalGearFindMount(assembly, source->path);
+        int conflict;
+        if (target && target->part != source->part)
+            gevrTacticalGearInstall(build, (int)(target - assembly->mounts), source->part, &conflict);
+    }
 }
 
 static int gearHit(GearRect rect)
@@ -360,6 +402,7 @@ static void gearOpenLibrary(GearSlotChoice slot)
         GearOption *choice = &gearLibrary.choices[gearLibrary.count++];
         *choice = (GearOption){.part = part};
         choice->fits = gevrTacticalGearCanInstall(gear.weapon, index, part, &choice->conflict);
+        choice->locked = !gearPartUnlocked(gear.weapon, part);
         if (info) {
             const unsigned colour = (info->art >> GEVR_GEAR_COLOUR_SHIFT) & GEVR_GEAR_COLOUR_MASK;
             choice->colour = colour < GEVR_GEAR_RED ? colour : GEVR_GEAR_OTHER;
@@ -430,8 +473,10 @@ static void gearChooseWeapon(void)
     const int index = gear.browse[gear.tab];
     const GearWeapon *weapon = gearWeapon(gear.tab, index);
     if (!gearWeaponAvailable(weapon)) return;
-    gear.selected[gear.tab] = index;
     const int build = gearBuildKey(weapon);
+    if (!gearWeaponUnlocked(weapon) && (!gearHit(gearChoose) || !gevrProgressRequisition(build))) return;
+    gevrTacticalGearSanitize(build, gevrProgressMountAllowed);
+    gear.selected[gear.tab] = index;
     const GevrGearAssembly *assembly = gevrTacticalGearAssembly(build);
     if (assembly && assembly->count > 1) {
         gear.page = GEAR_WORKBENCH;
@@ -447,14 +492,19 @@ static void gearOpen(int workshop)
     gevrTacticalGearRefreshPresets();
     memset(gear.loaded, 0, sizeof(gear.loaded));
     GevrLoadoutGun guns[2];
+    int missionKit[2] = {FALSE, FALSE};
     if (!workshop && !gevrCoopTacticalKitGuest() && gevrCampaignMissionGear(gevrBriefingLevel(), guns)) {
         for (int tab = 0; tab < 2; ++tab) {
+            const int ppkSuppressed = guns[tab].key == GEVR_GEAR_PPK_SUPPRESSED;
+            const int key = ppkSuppressed ? gevrTacticalGearKey(TACTICAL_GUN_USP) : guns[tab].key;
             for (int i = 0; i < gearCount(tab); ++i) {
-                if (gearBuildKey(gearWeapon(tab, i)) != guns[tab].key) continue;
-                gevrTacticalGearReset(guns[tab].key);
-                if (strcmp(guns[tab].preset, "-"))
-                    gevrTacticalGearLoadNamedPreset(guns[tab].key, guns[tab].preset);
+                if (gearBuildKey(gearWeapon(tab, i)) != key) continue;
+                gevrTacticalGearReset(key);
+                if (ppkSuppressed) gearFitLegacyPpk(key, guns[tab].preset);
+                else if (strcmp(guns[tab].preset, "-"))
+                    gevrTacticalGearLoadNamedPreset(key, guns[tab].preset);
                 gear.selected[tab] = i;
+                missionKit[tab] = TRUE;
                 break;
             }
         }
@@ -473,6 +523,21 @@ static void gearOpen(int workshop)
     if (!gearWeaponAvailable(gearWeapon(0, gear.browse[0]))) {
         gearBrowse(1);
         gear.selected[0] = gear.browse[0];
+    }
+    if (gevrProgressLocks()) {
+        for (int tab = 0; tab < 3; ++tab) {
+            const GearWeapon *weapon = gearWeapon(tab, gear.selected[tab]);
+            if ((tab < 2 && missionKit[tab]) || gearWeaponUnlocked(weapon)) continue;
+            gear.selected[tab] = 0;
+            for (int i = 0; tab == 1 && i < gearCount(1); ++i)
+                if (gearWeapon(1, i)->item == ITEM_WPPK) gear.selected[1] = i;
+            gear.browse[tab] = gear.selected[tab];
+        }
+        for (int tab = 0; tab < 2; ++tab) {
+            const int build = gearBuildKey(gearWeapon(tab, gear.selected[tab]));
+            if (build >= 0) gevrTacticalGearSanitize(build,
+                missionKit[tab] ? gevrProgressMasteryAllowed : gevrProgressMountAllowed);
+        }
     }
     gear.direction = 1;
     gear.last = -1;
@@ -511,7 +576,15 @@ static void gearCommit(int stage)
 {
     const GearWeapon *primary = gearWeapon(0, gear.selected[0]);
     const GearWeapon *secondary = gearWeapon(1, gear.selected[1]);
-    gevrTacticalGearCommit(stage, primary->item, secondary->item, gearBuildKey(primary), gearBuildKey(secondary));
+    if (gevrProgressLocks()) {
+        gevrTacticalGearSanitize(gearBuildKey(primary), gearWeaponUnlocked(primary) ? gevrProgressMountAllowed : gevrProgressMasteryAllowed);
+        gevrTacticalGearSanitize(gearBuildKey(secondary), gearWeaponUnlocked(secondary) ? gevrProgressMountAllowed : gevrProgressMasteryAllowed);
+    }
+    int secondaryItem = secondary->item;
+    if (secondaryItem == ITEM_WPPK
+        && gevrTacticalGearAssemblySuppressed(gevrTacticalGearAssembly(gearBuildKey(secondary))))
+        secondaryItem = ITEM_WPPKSIL;
+    gevrTacticalGearCommit(stage, primary->item, secondaryItem, gearBuildKey(primary), gearBuildKey(secondary));
     gevrTacticalGearSetMelee(gearWeapon(2, gear.selected[2])->item);
 }
 
@@ -579,6 +652,10 @@ static void gearPresetInput(int ok, int step)
                 gearLeavePage();
                 gear.socketPage = 0;
                 gear.notice = "Preset loaded";
+                if (gevrTacticalGearSanitize(gear.weapon, gevrProgressMountAllowed)) {
+                    gear.notice = "Locked parts replaced; saved preset kept";
+                    gear.loaded[gear.weapon].revision = 0;
+                }
             }
             return;
         }
@@ -643,6 +720,7 @@ static void gearWorkbenchInput(int ok, int step)
             const GearOption *choice = gearLibraryOption(row);
             if (!choice || !gearHit(gearLibraryRow(row))) continue;
             int conflict;
+            if (choice->locked) return;
             if (choice->fits && gevrTacticalGearInstall(gear.weapon, gear.option, choice->part, &conflict)) {
                 gearLeavePage();
                 const int remaining = gearSocketPages(gearOrderMounts(assembly, order));
@@ -805,16 +883,56 @@ static Gfx *gearModelPass(Gfx *g)
     return g;
 }
 
+/* A customisable gun turns in the carousel as it is built (user,
+ * 2026-11-23: after Done it showed only the base gun). The workbench's side
+ * view, swung about the vertical axis like the carousel's own guns. */
+static Gfx *gearCarouselAssembly(Gfx *g, const GevrGearAssembly *assembly, int kind, f32 x)
+{
+    f32 low[2] = {10000.f, 10000.f}, high[2] = {-10000.f, -10000.f};
+    for (int i = 0; i < assembly->count; ++i) {
+        f32 bounds[3], top[3];
+        const GevrGearMount *mount = &assembly->mounts[i];
+        if (gevrTacticalGearIsRootChoice(mount->path) || !gevrTacticalGearPartList(mount->part, bounds, top)) continue;
+        for (int corner = 0; corner < 8; ++corner) {
+            for (int axis = 0; axis < 2; ++axis) {
+                f32 extent = mount->frame[3][axis + 1];
+                for (int j = 0; j < 3; ++j) extent += ((corner & (1 << j)) ? top[j] : bounds[j]) * mount->frame[j][axis + 1];
+                low[axis] = fminf(low[axis], extent);
+                high[axis] = fmaxf(high[axis], extent);
+            }
+        }
+    }
+    if (low[0] > high[0]) return g;
+    const f32 scale = fminf(312.f / fmaxf(1, high[0] - low[0]), 112.f / fmaxf(1, high[1] - low[1]));
+    const f32 side = (f32)gevrTacticalGearLateral(kind);
+    const f32 angle = .16f + .56f * sinf(gear.time * .018f);
+    const f32 c = cosf(angle) * scale, sn = sinf(angle) * scale;
+    const f32 centre = (low[0] + high[0]) * .5f, height = (low[1] + high[1]) * .5f;
+    Mtxf pose = {.m = {{sn * side, 0, -c * side, 0}, {c, 0, sn, 0}, {0, -scale, 0, 0},
+        {x - centre * c, 157.f + height * scale, -550.f - centre * sn, 1}}};
+    for (int i = 0; i < assembly->count; ++i) {
+        const GevrGearMount *mount = &assembly->mounts[i];
+        if (gevrTacticalGearIsRootChoice(mount->path)) continue;
+        Mtxf part, local;
+        memcpy(local.m, mount->frame, sizeof(local.m));
+        gearCompose(&local, &pose, &part);
+        g = gearModel(g, &part, gevrTacticalGearPartList(mount->part, NULL, NULL));
+    }
+    return g;
+}
+
 static Gfx *gearCarouselGun(Gfx *g, int index, f32 x)
 {
     const GearWeapon *weapon = gearWeapon(gear.tab, index);
-    const int suppressed = weapon->item == ITEM_WPPKSIL;
+    const int build = gearBuildKey(weapon);
+    const GevrGearAssembly *built = build >= 0 ? gevrTacticalGearAssembly(build) : NULL;
+    if (built && built->count > 1) return gearCarouselAssembly(g, built, weapon->kind, x);
     f32 low[3], high[3];
     if (weapon->item == ITEM_NOTHING) return g;
     void *list;
     if (weapon->kind < 0) list = gevrTacticalBladePreview(weapon->item, low, high);
-    else list = gevrTacticalMountedGunBounds(weapon->kind, suppressed, low, high)
-        ? gevrTacticalMountedGunList(weapon->kind, suppressed, TRUE) : NULL;
+    else list = gevrTacticalMountedGunBounds(weapon->kind, FALSE, low, high)
+        ? gevrTacticalMountedGunList(weapon->kind, FALSE, TRUE) : NULL;
     if (!list) return g;
     const f32 angle = .16f + .56f * sinf(gear.time * .018f);
     const f32 k = fminf(312.f / fmaxf(1, high[2] - low[2]), 119.f / fmaxf(1, high[1] - low[1]));
@@ -860,8 +978,19 @@ static Gfx *gearCarouselDraw(Gfx *g)
     g = gearLabel(g, gearNext, ">");
     g = gearText(g, 220, 90, weapon->name, GEAR_TEXT, TRUE, TRUE, 320);
     const GevrGearAssembly *assembly = gevrTacticalGearAssembly(gearBuildKey(weapon));
-    g = gearLabel(g, gearChoose, assembly && assembly->count > 1 ? "Select and customise" :
+    const int locked = !gearWeaponUnlocked(weapon);
+    const unsigned reserveAt = gevrProgressReserveThreshold(gearBuildKey(weapon));
+    const unsigned reserve = gevrProgressReserve();
+    const int canRequisition = locked && reserveAt && reserve && gevrProgressTotalClears() >= reserveAt;
+    g = gearLabel(g, gearChoose, canRequisition ? "Requisition (1)" : locked ? "Locked" :
+        assembly && assembly->count > 1 ? "Select and customise" :
         gear.browse[gear.tab] == gear.selected[gear.tab] ? "Selected" : "Select weapon");
+    if (locked) {
+        char note[80];
+        if (reserveAt) snprintf(note, sizeof(note), "Extract or reserve at %u clears (%u available)", reserveAt, reserve);
+        else snprintf(note, sizeof(note), "Locked - extract with this gun");
+        g = gearText(g, 220, 108, note, GEAR_ACCENT, TRUE, FALSE, 340);
+    }
     int guests;
     const int ready = gevrCoopTacticalKitCount(&guests);
     const int guest = gevrCoopTacticalKitGuest();
@@ -1263,13 +1392,14 @@ static Gfx *gearLibraryDraw(Gfx *g)
         const GevrGearPart *part = gevrTacticalGearPart(choice->part);
         const int capacity = part ? part->capacity : 0;
         char detail[24] = "";
-        if (!choice->fits) snprintf(detail, sizeof(detail), "Conflict");
+        if (choice->locked) snprintf(detail, sizeof(detail), "Locked");
+        else if (!choice->fits) snprintf(detail, sizeof(detail), "Conflict");
         else if (choice->zoom) gearZoomLabel(choice, detail);
         else if (capacity) snprintf(detail, sizeof(detail), "%d", capacity);
         g = gearText(g, box.x + 8, box.y + 3, part ? part->name : "Empty",
-            choice->fits ? GEAR_TEXT : GEAR_MUTED, FALSE, FALSE, box.w - (*detail ? 64 : 16));
+            choice->fits && !choice->locked ? GEAR_TEXT : GEAR_MUTED, FALSE, FALSE, box.w - (*detail ? 64 : 16));
         if (*detail) g = gearText(g, box.x + box.w - 30, box.y + 3, detail,
-            choice->fits ? GEAR_MUTED : GEAR_ACCENT, TRUE, FALSE, 56);
+            choice->fits && !choice->locked ? GEAR_MUTED : GEAR_ACCENT, TRUE, FALSE, 56);
     }
 
     const GevrGearPart *preview = gevrTacticalGearPart(display->part);
@@ -1282,7 +1412,11 @@ static Gfx *gearLibraryDraw(Gfx *g)
         else if (preview->capacity) snprintf(detail, sizeof(detail), "%d rounds", preview->capacity);
         if (*detail) g = gearText(g, centre, 96, detail, GEAR_MUTED, TRUE, FALSE, 164);
     } else g = gearText(g, centre, 166, "Empty slot", GEAR_MUTED, TRUE, FALSE, 164);
-    if (!display->fits) {
+    if (display->locked) {
+        char requirement[100];
+        gevrProgressPartRequirement(gear.weapon, display->part, requirement, sizeof(requirement));
+        g = gearText(g, centre, 249, requirement, GEAR_ACCENT, TRUE, FALSE, gearPartPreview.w);
+    } else if (!display->fits) {
         const GevrGearPart *conflict = gevrTacticalGearPart(display->conflict);
         char status[100];
         if (conflict) snprintf(status, sizeof(status), "Conflicts with %s", conflict->name);
@@ -1368,6 +1502,162 @@ static Gfx *gearDraw(Gfx *g)
 }
 
 static int gearWorkshopOpen(void) { return gear.workshop && gear.page; }
+
+static const GearRect gearAskYes = {72, 214, 136, 34}, gearAskNo = {232, 214, 136, 34};
+
+static void gearProgressAskInterface(void)
+{
+    static int placed;
+    if (!placed) {
+        /* between the two answers, so a hurried press doesn't choose one */
+        cursor_h_pos = 220;
+        cursor_v_pos = 262;
+        placed = TRUE;
+    }
+    if (sysArgCheck("--input-script")) {
+        /* scripted tests: --tactical-progress-answer yes|no */
+        const char *answer = sysArgGetString("--tactical-progress-answer");
+        if (answer && (!strcmp(answer, "yes") || !strcmp(answer, "no"))) {
+            gevrProgressAnswer(!strcmp(answer, "yes"));
+            return;
+        }
+    }
+    frontUpdateControlStickPosition();
+    const int buttons = joyGetButtonsPressedThisFrame(PLAYER_1, START_BUTTON | A_BUTTON | Z_TRIG);
+    if (!buttons) return;
+    if (gearHit(gearAskYes)) gevrProgressAnswer(TRUE);
+    else if (gearHit(gearAskNo)) gevrProgressAnswer(FALSE);
+    else return;
+    sndPlaySfx((struct ALBankAlt_s *)g_musicSfxBufferPtr, DOOR_METAL_CLOSE2_SFX, NULL);
+}
+
+static Gfx *gearProgressAskDraw(Gfx *g)
+{
+    g = gearFill(g);
+    g = gearRect(g, (GearRect){0, 0, 440, 330}, GEAR_BG);
+    g = gearRect(g, (GearRect){8, 5, 424, 320}, GEAR_LINE);
+    g = gearRect(g, (GearRect){10, 7, 420, 316}, GEAR_PAPER);
+    g = gearRect(g, (GearRect){16, 10, 408, 2}, GEAR_ACCENT);
+    g = gearRect(g, (GearRect){40, 70, 360, 190}, GEAR_PANEL);
+    g = gearButton(g, gearAskYes, FALSE);
+    g = gearButton(g, gearAskNo, TRUE);
+    g = microcode_constructor(g);
+    g = gearText(g, 17, 21, "NEW SAVE", GEAR_ACCENT, FALSE, TRUE, 210);
+    g = gearText(g, 220, 86, "Unlock all missions and items for this save?", GEAR_TEXT, TRUE, TRUE, 340);
+    g = gearText(g, 220, 118, "Yes: every mission, gun and part, ready to use.", GEAR_TEXT, TRUE, FALSE, 340);
+    g = gearText(g, 220, 138, "No: start with only the PPK. Extract with gear", GEAR_TEXT, TRUE, FALSE, 340);
+    g = gearText(g, 220, 154, "to unlock it for future missions.", GEAR_TEXT, TRUE, FALSE, 340);
+    g = gearText(g, 220, 184, "You won't be asked again for this save.", GEAR_ACCENT, TRUE, FALSE, 340);
+    g = gearLabel(g, gearAskYes, "Yes, unlock all");
+    g = gearLabel(g, gearAskNo, "No, progression");
+    return frontDrawCursor(g);
+}
+
+static struct { int open, page; } gearProgressPage;
+static const GearRect gearProgressPrev = {311, 47, 22, 24}, gearProgressNext = {401, 47, 23, 24};
+enum { GEAR_PROGRESS_ROWS = 9 };
+
+static int gearProgressOpen(void) { return gearProgressPage.open; }
+
+static void gearProgressShow(void)
+{
+    gearProgressPage.open = TRUE;
+    gearProgressPage.page = 0;
+    cursor_h_pos = 370;
+    cursor_v_pos = 300;
+    sysLogPrintf(LOG_NOTE, "progression: opened from main menu");
+}
+
+static void gearProgressInterface(void)
+{
+    frontUpdateControlStickPosition();
+    const int buttons = joyGetButtonsPressedThisFrame(PLAYER_1,
+        START_BUTTON | A_BUTTON | B_BUTTON | Z_TRIG | L_JPAD | R_JPAD | L_CBUTTONS | R_CBUTTONS);
+    const int ok = buttons & (A_BUTTON | Z_TRIG);
+    const int pages = (gevrProgressGunCount() + GEAR_PROGRESS_ROWS - 1) / GEAR_PROGRESS_ROWS;
+    int step = !!(buttons & (R_JPAD | R_CBUTTONS)) - !!(buttons & (L_JPAD | L_CBUTTONS));
+    if (ok && gearHit(gearProgressPrev)) step = -1;
+    if (ok && gearHit(gearProgressNext)) step = 1;
+    if (step && pages > 1) gearProgressPage.page = (gearProgressPage.page + step + pages) % pages;
+    if ((buttons & B_BUTTON) || (ok && (gearHit(gearBack) || gearHit(gearDone)))) {
+        gearProgressPage.open = FALSE;
+        cursor_h_pos = NEXTTAB_CURSOR_HPOS;
+        cursor_v_pos = STARTTAB_TEXT_HALF;
+    }
+    if (ok || step || (buttons & B_BUTTON))
+        sndPlaySfx((struct ALBankAlt_s *)g_musicSfxBufferPtr, DOOR_METAL_CLOSE2_SFX, NULL);
+}
+
+static void gearPercent(char *out, size_t size, unsigned part, unsigned whole)
+{
+    if (whole) snprintf(out, size, "%u%%", (part * 100u + whole / 2) / whole);
+    else snprintf(out, size, "-");
+}
+
+static Gfx *gearProgressDraw(Gfx *g)
+{
+    unsigned kills, headshots, shots, hits;
+    gevrProgressTotals(&kills, &headshots, &shots, &hits);
+    const int guns = gevrProgressGunCount();
+    const int pages = (guns + GEAR_PROGRESS_ROWS - 1) / GEAR_PROGRESS_ROWS;
+    g = gearFill(g);
+    g = gearRect(g, (GearRect){0, 0, 440, 330}, GEAR_BG);
+    g = gearRect(g, (GearRect){8, 5, 424, 320}, GEAR_LINE);
+    g = gearRect(g, (GearRect){10, 7, 420, 316}, GEAR_PAPER);
+    g = gearRect(g, (GearRect){16, 10, 408, 2}, GEAR_ACCENT);
+    g = gearRect(g, (GearRect){16, 76, 408, 52}, GEAR_PANEL);
+    g = gearRect(g, (GearRect){16, 134, 408, 146}, GEAR_PANEL);
+    g = gearButton(g, gearBack, FALSE);
+    if (pages > 1) {
+        g = gearButton(g, gearProgressPrev, FALSE);
+        g = gearButton(g, gearProgressNext, FALSE);
+    }
+    g = microcode_constructor(g);
+    g = gearText(g, 17, 21, "PROGRESSION", GEAR_ACCENT, FALSE, TRUE, 210);
+    g = gearLabel(g, gearBack, "Main menu");
+    const int mode = gevrProgressMode();
+    g = gearText(g, 17, 52, mode == GEVR_PROGRESS_ALL ? "Save: everything unlocked"
+        : mode == GEVR_PROGRESS_EARN ? "Save: progression" : "Save: not set up", GEAR_TEXT, FALSE, FALSE, 280);
+
+    char line[96], accuracy[16], headshare[16];
+    gearPercent(accuracy, sizeof(accuracy), hits, shots);
+    gearPercent(headshare, sizeof(headshare), headshots, kills);
+    snprintf(line, sizeof(line), "Kills %u   Headshots %u (%s)   Accuracy %s", kills, headshots, headshare, accuracy);
+    g = gearText(g, 24, 82, line, GEAR_TEXT, FALSE, FALSE, 392);
+    snprintf(line, sizeof(line), "Missions  Agent %u   Secret Agent %u   00 Agent %u",
+        gevrProgressMissions(0), gevrProgressMissions(1), gevrProgressMissions(2));
+    g = gearText(g, 24, 98, line, GEAR_TEXT, FALSE, FALSE, 392);
+    if (mode == GEVR_PROGRESS_EARN) {
+        snprintf(line, sizeof(line), "Guns unlocked %d   Reserve %u", gevrProgressUnlockedGuns(), gevrProgressReserve());
+        g = gearText(g, 24, 114, line, GEAR_MUTED, FALSE, FALSE, 392);
+    }
+
+    g = gearText(g, 24, 140, "Gun", GEAR_MUTED, FALSE, FALSE, 150);
+    g = gearText(g, 232, 140, "Kills", GEAR_MUTED, TRUE, FALSE, 60);
+    g = gearText(g, 292, 140, "Heads", GEAR_MUTED, TRUE, FALSE, 60);
+    g = gearText(g, 352, 140, "Accuracy", GEAR_MUTED, TRUE, FALSE, 70);
+    if (!guns) g = gearText(g, 220, 196, "No shots fired yet on this save", GEAR_MUTED, TRUE, FALSE, 300);
+    for (int row = 0; row < GEAR_PROGRESS_ROWS; ++row) {
+        const GevrProgressGun *gun = gevrProgressGun(gearProgressPage.page * GEAR_PROGRESS_ROWS + row);
+        if (!gun) break;
+        const int y = 158 + row * 13;
+        char value[16];
+        g = gearText(g, 24, y, gun->name, GEAR_TEXT, FALSE, FALSE, 170);
+        snprintf(value, sizeof(value), "%u", gun->kills);
+        g = gearText(g, 232, y, value, GEAR_TEXT, TRUE, FALSE, 60);
+        snprintf(value, sizeof(value), "%u", gun->headshots);
+        g = gearText(g, 292, y, value, GEAR_TEXT, TRUE, FALSE, 60);
+        gearPercent(value, sizeof(value), gun->hits, gun->shots);
+        g = gearText(g, 352, y, value, GEAR_TEXT, TRUE, FALSE, 70);
+    }
+    if (pages > 1) {
+        snprintf(line, sizeof(line), "%d / %d", gearProgressPage.page + 1, pages);
+        g = gearText(g, 367, 52, line, GEAR_MUTED, TRUE, FALSE, 60);
+        g = gearLabel(g, gearProgressPrev, "<");
+        g = gearLabel(g, gearProgressNext, ">");
+    }
+    return frontDrawCursor(g);
+}
 
 static void gearRestoreRange(void)
 {

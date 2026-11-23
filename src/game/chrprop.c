@@ -1427,6 +1427,12 @@ void chraiDefaultWeaponFireHandler(s32 hand)
     bullet_path_from_screen_center(&shotdata.viewOrigin, &shotdata.viewDir, hand);
     shotdata.weapon = getCurrentPlayerWeaponId(hand);
     shotdata.maxdist = M_U32_MAX_VALUE_F;
+#ifdef GEVR
+    {
+        extern void gevrProgressShot(int item);   /* Tactical stats: shots fired */
+        gevrProgressShot(shotdata.weapon);
+    }
+#endif
 
     for (k = 0; k < 10; k++)
     {

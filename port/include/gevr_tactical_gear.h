@@ -102,6 +102,9 @@ int gevrTacticalGearCanInstall(int kind, int mount, int part, int *conflict);
 int gevrTacticalGearPreviewVariant(int kind, int mount, int part, GevrGearAssembly *out);
 int gevrTacticalGearInstall(int kind, int mount, int part, int *conflict);
 void gevrTacticalGearReset(int kind);
+/* Use an explicit policy so the authoring editor and NPC presets remain unrestricted. */
+int gevrTacticalGearSanitize(int kind, int (*allowed)(int, const GevrGearMount *));
+void gevrTacticalGearSanitizeDeployed(int (*allowed)(int, const GevrGearMount *));
 int gevrTacticalGearPresetCount(int kind);
 const char *gevrTacticalGearPresetName(int kind, int index);
 uint64_t gevrTacticalGearPresetRevision(int kind, const char *name);

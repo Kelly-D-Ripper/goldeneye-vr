@@ -235,6 +235,9 @@ def prepare(workshop, candidates, pack_roots):
             used.add(name)
             root = workshop.id(workshop.builds[key][0])
             name = BUNDLED_PRESET_NAMES.get(name, name)
+            if key == workshop.roots[M4] and name in {"Pine Watch", "Pine Watch Suppressed"}:
+                # Keep the rear sight out of the optic's view on these two builds.
+                choices = {**choices, "mod_reciever/mod_sight_rear": -1}
             rows.append(f"P {root} {len(choices)} {name}")
             rows.extend(f"{path} {workshop.id(part) if part >= 0 else '-'}" for path, part in choices.items())
             notes.append((key, name, source, skipped))

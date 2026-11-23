@@ -4345,6 +4345,14 @@ void chrHandleBulletHit(struct ShotData *shot, struct BulletHit *bhit)
     if (!applied) {
         return;
     }
+#ifdef GEVR
+    {
+        /* Tactical stats: a hit, and the kill if this shot put him down */
+        extern void gevrProgressHit(int item, int killed, int headshot);
+        gevrProgressHit(shot->weapon, !wasDead && (chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD),
+            bhit->hitpart == HIT_HEAD);
+    }
+#endif
 
     if (bhit->hitpart == HIT_GUN) {
         for (i = 0; i != 2; i++) {

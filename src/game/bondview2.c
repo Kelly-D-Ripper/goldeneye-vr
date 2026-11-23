@@ -22,6 +22,7 @@ static int s_gevrHordeBHeld;
 #include "gevr_romlayout.h"
 #include "gevr_dam_boat.h"
 #include "gevr_tactical_range.h"
+#include "gevr_tactical_progress.h"
 #include "gevr_android_paths.h"
 #include "gevr_tactical_heavy_guards.h"
 #endif
@@ -21333,17 +21334,54 @@ static void gevrTacticalMoveMagneticMagazines(void)
     if (count) sysLogPrintf(LOG_NOTE, "tactical magnet: brought %u physical magazines within reach", count);
 }
 
-static const GevrGearAssembly *gevrTacticalCarriedAssembly(int kind, s32 hand)
+static const GevrGearAssembly *gevrTacticalWeaponAssembly(int item, int kind, int carried)
 {
-    const int key = kind == TACTICAL_GUN_USP && getCurrentPlayerWeaponId(hand) == ITEM_WPPKSIL
+    const int key = kind == TACTICAL_GUN_USP && item == ITEM_WPPKSIL
         ? GEVR_GEAR_PPK_SUPPRESSED : gevrTacticalGearKey(kind);
-    const int carried = *gevrTacticalCarriedBuild(kind, hand);
     const int base = gevrTacticalGearBaseBuild(carried);
     if (base == key || (kind == TACTICAL_GUN_USP && (base == GEVR_GEAR_PPK_SUPPRESSED || base == TACTICAL_GUN_USP))) {
         const GevrGearAssembly *assembly = gevrTacticalGearDeployedAssembly(carried);
         if (assembly) return assembly;
     }
     return gevrTacticalGearStockAssembly(key);
+}
+
+static const GevrGearAssembly *gevrTacticalCarriedAssembly(int kind, s32 hand)
+{
+    return gevrTacticalWeaponAssembly(getCurrentPlayerWeaponId(hand), kind, *gevrTacticalCarriedBuild(kind, hand));
+}
+
+static void gevrTacticalExtractWeapon(const char *slot, int item, int build, const TacticalMagazine *mag)
+{
+    const int kind = gevrTacticalItem(item);
+    if (kind < 0 || !gevrTacticalGearItemName(item)) return;
+    /* -2 is the non-physical fallback. An empty well or an unkeyed stock magazine
+     * must not award a custom magazine that used to be fitted in this build. */
+    const int part = !mag ? -2 : mag->id && mag->gear_part ? (int)mag->gear_part - 1 : -1;
+    gevrProgressExtractGun(gevrTacticalGearKey(kind), slot, gevrTacticalWeaponAssembly(item, kind, build), part);
+}
+
+void gevrTacticalProgressExtractCarried(void)
+{
+    if (!g_CurrentPlayer || g_CurrentPlayer->bonddead || !gevrTacticalLocalPlayer()) return;
+    const int physical = s_tacticalStarted && sysArgCheck("--tactical-physical");
+    for (int hand = GUNRIGHT; hand <= GUNLEFT; ++hand) {
+        /* The end cinema or a pending swap can change the drawn model;
+         * the physical slot still owns its assigned rifle. */
+        const int assigned = physical ? s_physicalPrimary[hand] : ITEM_NOTHING;
+        if (assigned <= ITEM_UNARMED && physical && s_physicalLeaving[hand]) continue;
+        const int item = assigned > ITEM_UNARMED ? assigned : getCurrentPlayerWeaponId(hand);
+        const int kind = gevrTacticalItem(item);
+        if (kind >= 0)
+            gevrTacticalExtractWeapon(hand == GUNRIGHT ? "right hand" : "left hand", item,
+                physical ? *gevrTacticalCarriedBuild(kind, hand) : -1,
+                physical ? &s_tactical.inv.slots[gevrTacticalHandWell(kind, hand)] : NULL);
+    }
+    if (!physical) return;
+    gevrTacticalExtractWeapon("back", s_physicalShoulder.item, s_physicalShoulder.build, &s_physicalShoulder.gun.magazine);
+    for (int hip = 0; hip < 2; ++hip)
+        gevrTacticalExtractWeapon(hip == 0 ? "left holster" : "right holster",
+            s_physicalPistols[hip].item, s_physicalPistols[hip].build, &s_physicalPistols[hip].gun.magazine);
 }
 
 void gevrTacticalDrawPlayerAccessories(void)
@@ -22083,6 +22121,7 @@ static int gevrTacticalEquipSelectedGear(void)
     const int stage = bossGetStageNum();
     if (!gevrTacticalGearLoadout(stage, &primary, &secondary)
         && (!gevrCampaignTryDeployGear(stage) || !gevrTacticalGearLoadout(stage, &primary, &secondary))) return FALSE;
+    if (gevrProgressLocks()) gevrTacticalGearSanitizeDeployed(gevrProgressMasteryAllowed);
     const int rifle = gevrTacticalItem(primary), pistol = gevrTacticalItem(secondary);
     if ((primary != ITEM_NOTHING && !gevrTacticalIsLongGun(rifle))
         || (secondary != ITEM_NOTHING && !gevrTacticalIsPistol(pistol))) return FALSE;

@@ -2,6 +2,9 @@
 #include "file.h"
 #include "file2.h"
 #include "front.h"
+#ifdef GEVR
+#include "gevr_tactical_progress.h"
+#endif
 
 f32 get_007_reaction_speed(void)
 {
@@ -45,6 +48,7 @@ void end_of_mission_briefing(void)
         extern void gevrLiveSplitMissionComplete(int time60);
         extern s32 getMissiontimer(void);
 
+        gevrProgressClearExtraction();
         gevrLiveSplitMissionComplete(getMissiontimer());
     }
 #endif
@@ -62,6 +66,7 @@ void end_of_mission_briefing(void)
             /* the run counts as a best time does: keep it as the ghost if it is the fastest */
             extern void gevrGhostMissionComplete(void);
             gevrGhostMissionComplete();
+            gevrProgressMissionComplete(mission_folder_setup_entries[briefingpage].mission_num, selected_difficulty);
         }
 #endif
         var1 = solo_target_time_array[mission_folder_setup_entries[briefingpage].mission_num][selected_difficulty];
