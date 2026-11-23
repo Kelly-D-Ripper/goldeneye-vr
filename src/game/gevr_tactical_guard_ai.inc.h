@@ -26,7 +26,8 @@ typedef struct TacticalGuardMind {
     coord3d cover;
     StandTile *coverFloor;
     s32 coverArriveBy, nextPeek, peekUntil;
-    s32 nextAdvance, flankBy, suppressUntil;
+    s32 nextAdvance, flankBy, suppressUntil, coverUntil, nextCensus, searchFrom, searchBlockedUntil;
+    coord3d searchStart;
     s8 peekPose, peekSide;
     enum TacticalContact contact;
     enum TacticalGuardOrder order;
@@ -203,7 +204,6 @@ static bool tacticalGuardSight(ChrRecord *guard, const PropRecord *target, f32 h
         &target->pos, target->stan, height, tacticalTargetHeight(target, height), chars);
 }
 
-static bool tacticalGuardSightFromCover(ChrRecord *guard, const PropRecord *target);
 
 void gevrTacticalGuardNoise(int player, float radius)
 {
@@ -414,8 +414,7 @@ static bool tacticalGuardCanSpot(ChrRecord *guard, int slot, bool alert)
         && (!netIsActive() || gevrCoopPlayerTargetable(slot))
         && tacticalDistance(&guard->prop->pos, &target->pos) < SQR(range)
         && tacticalGuardFacing(guard, &target->pos, alert)
-        && (tacticalGuardSightFromCover(guard, target)
-            || tacticalGuardSight(guard, target, sightHeight, 0));
+        && tacticalGuardSight(guard, target, sightHeight, 0);
 }
 
 int gevrTacticalGuardVisiblePlayer(ChrRecord *guard, int player)
@@ -494,12 +493,62 @@ static bool tacticalGuardRoute(ChrRecord *guard, coord3d *point, StandTile *floo
     return plot_course_for_actor(guard, point, floor, speed);
 }
 
+static bool tacticalGuardAimOnly(const ChrRecord *guard)
+{
+    return guard->actiontype == ACT_ATTACK && (guard->act_attack.attacktype & TARGET_AIM_ONLY);
+}
+
+/* Turn to the contact with the weapon up and no shot: an aim-only attack
+ * at its compass bearing, kneeling if he is down. The game turns a guard
+ * reliably only through an action like this; a bare stand turn or a yaw
+ * set on a standing guard is put back by his idle animation, which is why
+ * 0.11-0.18 guards were left facing odd ways (user, 2026-11-23). */
 static void tacticalGuardFaceContact(ChrRecord *guard, const TacticalGuardMind *mind)
 {
     const coord3d *pos = &guard->prop->pos;
     if (SQR(mind->location.x - pos->x) + SQR(mind->location.z - pos->z) < SQR(40.0f)) return;
     const f32 angle = atan2f(mind->location.x - pos->x, mind->location.z - pos->z);
-    check_set_actor_standing_still(guard, TARGET_COMPASS, (s32)(angle * 65536.0f / M_TAU_F) & 0xffff);
+    const s32 compass = (s32)(angle * 65536.0f / M_TAU_F) & 0xffff;
+    if (guard->actiontype == ACT_ATTACK && (guard->act_attack.attacktype & TARGET_AIM_ONLY)) {
+        if (!(guard->act_attack.attacktype & TARGET_COMPASS)
+            || abs((s16)(guard->act_attack.entityid - compass)) > 0x0400)
+            actor_fire_or_aim_at_target_update(guard, TARGET_COMPASS | TARGET_AIM_ONLY, compass);
+        return;
+    }
+    const int before = guard->actiontype;
+    const bool aimed = guard->actiontype == ACT_KNEEL || mind->crouched
+        ? actor_kneel_aim_at_actor(guard, TARGET_COMPASS | TARGET_AIM_ONLY, compass)
+        : actor_aim_at_actor(guard, TARGET_COMPASS | TARGET_AIM_ONLY, compass);
+    if (aimed && tacticalGuardAimOnly(guard)) {
+        /* An automatic's aim ends after one animation cycle (unk37) and the
+         * guard drops back to standing; hold it until the AI moves on. */
+        guard->act_attack.unk37 = 0;
+        guard->act_attack.unk34 = 120;
+    }
+    if (s_traceGuardAi && sysArgCheck("--tactical-turn-trace"))
+        sysLogPrintf(LOG_NOTE, "tactical AI: aim guard %d t %d action %d -> %d ok %d attacktype 0x%x",
+            guard->chrnum, g_GlobalTimer, before, guard->actiontype, aimed,
+            guard->actiontype == ACT_ATTACK ? guard->act_attack.attacktype : -1);
+}
+
+/* An alerted guard who is standing still or kneeling turns to face his
+ * contact, 5 degrees a tick. tacticalGuardFaceContact asks the stand action
+ * to turn, but a kneel issued straight after it (the usual case) replaced
+ * the stand before it turned, so 0.11-0.18 guards knelt facing wherever
+ * they had been looking (user, 2026-11-23: "enemies facing weird
+ * directions"). Native turns already under way are left to finish. */
+static void tacticalGuardTurnToContact(ChrRecord *guard, TacticalGuardMind *mind)
+{
+    if (mind->contact == CONTACT_NONE || mind->expires <= g_GlobalTimer) return;
+    const bool still = guard->actiontype == ACT_KNEEL || tacticalGuardAimOnly(guard)
+        || (guard->actiontype == ACT_STAND && !guard->act_stand.reaim);
+    if (!still) return;
+    const coord3d *pos = &guard->prop->pos;
+    const f32 dx = mind->location.x - pos->x, dz = mind->location.z - pos->z;
+    if (SQR(dx) + SQR(dz) < SQR(40.0f)) return;
+    if (!tacticalGuardAimOnly(guard)
+        && fabsf(remainderf(atan2f(dx, dz) - getsubroty(guard->model), M_TAU_F)) < 0.35f) return;
+    tacticalGuardFaceContact(guard, mind);
 }
 
 static void tacticalGuardOrder(TacticalGuardMind *mind, enum TacticalGuardOrder order)
@@ -546,29 +595,6 @@ static bool tacticalGuardCovered(const TacticalGuardMind *mind)
             && g_GlobalTimer - other->lastDischarge < 75) covering = TRUE;
     }
     return covering && moving < 2;
-}
-
-/* A clear lane from a crouched muzzle to the last known position: fire there
- * keeps the player's head down, and never goes through a wall or a friend. */
-static bool tacticalGuardSuppressLane(ChrRecord *guard, const TacticalGuardMind *mind)
-{
-    return mind->floor && mind->expires > g_GlobalTimer
-        && (mind->contact == CONTACT_SIGHT || mind->contact == CONTACT_TEAM || mind->contact == CONTACT_SOUND)
-        && tacticalDistance(&guard->prop->pos, &mind->location) < SQR(3400.0f)
-        && tacticalTrace(guard, &guard->prop->pos, guard->prop->stan, &mind->location, mind->floor,
-            guard->chrheight - 50.0f, tacticalEvidenceHeight(mind), CDTYPE_CHRS);
-}
-
-static bool tacticalGuardSuppress(ChrRecord *guard, TacticalGuardMind *mind)
-{
-    if (!tacticalGuardSuppressLane(guard, mind)) return FALSE;
-    const coord3d *pos = &guard->prop->pos;
-    const f32 angle = atan2f(mind->location.x - pos->x, mind->location.z - pos->z);
-    if (!actor_kneel_aim_at_actor(guard, TARGET_COMPASS, (s32)(angle * 65536.0f / M_TAU_F) & 0xffff)) return FALSE;
-    mind->crouched = TRUE;
-    mind->suppressUntil = g_GlobalTimer + 150;
-    tacticalGuardOrder(mind, ORDER_SUPPRESS);
-    return TRUE;
 }
 
 /* Work round to the contact's side, 5-7 m out, on floor joined to it. */
@@ -678,6 +704,36 @@ static bool tacticalGuardThink(ChrRecord *guard)
         }
     }
 
+    if (s_traceGuardAi && mind->contact != CONTACT_NONE && now >= mind->nextCensus) {
+        /* Diagnosis: an alerted guard looking well away from the player */
+        mind->nextCensus = now + 90;
+        const PropRecord *player = getCurrentPlayerProp();
+        f32 yaw = getsubroty(guard->model);
+        if (guard->actiontype == ACT_ATTACK && guard->act_attack.animfloats) {
+            /* an attack animation aims at an angle to the body (chrlvTickAttack) */
+            const f32 offset = guard->act_attack.animfloats->angle_offset;
+            yaw += guard->model->gunhand != GUNRIGHT ? M_TAU_F - offset : offset;
+        }
+        const f32 toPlayer = atan2f(player->pos.x - guard->prop->pos.x, player->pos.z - guard->prop->pos.z);
+        const f32 toContact = atan2f(mind->location.x - guard->prop->pos.x, mind->location.z - guard->prop->pos.z);
+        f32 offPlayer = fabsf(remainderf(toPlayer - yaw, M_TAU_F)) * (360.0f / M_TAU_F);
+        f32 offContact = fabsf(remainderf(toContact - yaw, M_TAU_F)) * (360.0f / M_TAU_F);
+        if (offPlayer > 60.0f) {
+            static const char *const names[] = {"hold", "search", "charge", "fire", "flank", "cover", "peek",
+                "advance", "suppress", "fall back"};
+            static const char *const kinds[] = {"none", "near miss", "body", "nearby combat", "sound", "squad", "sight"};
+            sysLogPrintf(LOG_NOTE, "tactical AI: facing guard %d action %d order %s contact %s off player %.0f off contact %.0f"
+                " contact %.0f from player stand %d/%d/%d sleep %d", guard->chrnum, guard->actiontype, names[mind->order],
+                kinds[mind->contact], (double)offPlayer, (double)offContact,
+                (double)sqrtf(tacticalDistance(&mind->location, &player->pos)),
+                guard->actiontype == ACT_STAND ? guard->act_stand.reaim : -1,
+                guard->actiontype == ACT_STAND ? guard->act_stand.face_entitytype : -1,
+                guard->actiontype == ACT_STAND ? guard->act_stand.turning : -1, guard->sleep);
+        }
+    }
+
+    tacticalGuardTurnToContact(guard, mind);
+
     if (mind->contact != CONTACT_NONE && guard->actiontype == ACT_PATROL) {
         tacticalGuardFaceContact(guard, mind);
         mind->nextOrder = now;
@@ -686,7 +742,8 @@ static bool tacticalGuardThink(ChrRecord *guard)
     if (mind->contact == CONTACT_NONE) {
         tacticalGuardLeaveCover(guard, mind);
         if (now < mind->nextOrder) return TRUE;
-        if (mind->order != ORDER_NONE) {
+        if (mind->order != ORDER_NONE || tacticalGuardAimOnly(guard)) {
+            if (tacticalGuardAimOnly(guard)) chrStopFiring(guard);
             if (guard->actiontype != ACT_PATROL) chrlvMergeKneelToStand(guard, 12.0f);
             tacticalGuardOrder(mind, ORDER_NONE);
         }
@@ -717,7 +774,7 @@ static bool tacticalGuardThink(ChrRecord *guard)
             if (guard->actiontype != ACT_ATTACK) actor_aim_at_actor(guard, TARGET_BOND, 0);
             tacticalGuardOrder(mind, ORDER_FIRE);
         } else {
-            if (guard->actiontype == ACT_ATTACK) chrStopFiring(guard);
+            if (guard->actiontype == ACT_ATTACK && !tacticalGuardAimOnly(guard)) chrStopFiring(guard);
             tacticalGuardFaceContact(guard, mind);
             tacticalGuardOrder(mind, ORDER_NONE);
         }
@@ -737,6 +794,12 @@ static bool tacticalGuardThink(ChrRecord *guard)
     }
 
     const f32 range2 = evidenceDist;
+    if (clear && tacticalGuardAimOnly(guard) && role != GUARD_ASSAULT) {
+        actor_fire_or_aim_at_target_update(guard, TARGET_BOND, 0);
+        tacticalGuardOrder(mind, ORDER_FIRE);
+        return TRUE;
+    }
+    if (clear && tacticalGuardAimOnly(guard)) chrStopFiring(guard);
     if (clear) {
         switch (role) {
         case GUARD_ASSAULT:
@@ -791,24 +854,21 @@ static bool tacticalGuardThink(ChrRecord *guard)
         }
     }
 
-    /* No firing line to the player. */
-    if (guard->actiontype == ACT_ATTACKWALK || (guard->actiontype == ACT_ATTACK && mind->order != ORDER_SUPPRESS)) {
+    /* No firing line to the player. An aimed weapon stays on the contact. */
+    if (guard->actiontype == ACT_ATTACKWALK || (guard->actiontype == ACT_ATTACK && !tacticalGuardAimOnly(guard))) {
         chrStopFiring(guard);
         chrlvMergeKneelToStand(guard, 10.0f);
     }
-    if (mind->order == ORDER_SUPPRESS && guard->actiontype == ACT_ATTACK && now < mind->suppressUntil
-        && tacticalGuardSuppressLane(guard, mind)) return TRUE;
 
-    /* The suppressor keeps rounds on the last known position while the
-     * others move; with no clear lane he takes cover and watches. */
+    /* The support gunner holds: into cover if there is some, otherwise
+     * down on one knee watching where the contact was. No blind fire. */
     if (role == GUARD_SUPPORT && mind->contact >= CONTACT_SOUND && mind->contact != CONTACT_BODY) {
-        if (tacticalGuardSuppress(guard, mind)) return TRUE;
         if (now >= mind->nextCover && tacticalCoverProbeAvailable()) {
             mind->nextCover = now + 135 + ((u16)guard->chrnum % 63);
             if (tacticalGuardFindCover(guard, mind, FALSE, FALSE, FALSE)) return TRUE;
         }
+        mind->crouched = TRUE;
         tacticalGuardFaceContact(guard, mind);
-        if (guard->actiontype != ACT_KNEEL) check_if_able_to_then_kneel(guard);
         tacticalGuardOrder(mind, ORDER_NONE);
         return TRUE;
     }
@@ -825,15 +885,27 @@ static bool tacticalGuardThink(ChrRecord *guard)
 
     /* Searching: the brave run in, the rest move in ready, and a squad sends
      * at most two forward to check a body or a noise. */
-    const bool investigate = role == GUARD_ASSAULT || mind->group < 0 || mind->member < 2
-        || mind->contact >= CONTACT_TEAM;
+    if (mind->order == ORDER_SEARCH && guard->actiontype != ACT_GOPOS && now - mind->searchFrom < 120
+        && tacticalDistance(&guard->prop->pos, &mind->searchStart) < SQR(120.0f)) {
+        /* The last search stopped almost where it began: an unreachable
+         * spot. Hold and watch for a few seconds rather than re-route,
+         * stand, aim and re-route every half second. */
+        mind->searchBlockedUntil = now + 240 + ((u16)guard->chrnum % 90);
+        if (s_traceGuardAi) sysLogPrintf(LOG_NOTE, "tactical AI: guard %d search blocked", guard->chrnum);
+    }
+    const bool investigate = now >= mind->searchBlockedUntil && (role == GUARD_ASSAULT || mind->group < 0
+        || mind->member < 2 || mind->contact >= CONTACT_TEAM);
     if (investigate && mind->floor && range2 > SQR(standOff) && mind->contact != CONTACT_IMPACT
         && tacticalGuardRoute(guard, &mind->location, mind->floor,
             role == GUARD_ASSAULT ? SPEED_SPRINT : mind->contact >= CONTACT_COMBAT ? SPEED_RUN : SPEED_WALK)) {
+        if (mind->order != ORDER_SEARCH || guard->actiontype != ACT_GOPOS) {
+            mind->searchFrom = now;
+            mind->searchStart = guard->prop->pos;
+        }
         tacticalGuardOrder(mind, ORDER_SEARCH);
     } else {
+        mind->crouched = role != GUARD_ASSAULT;
         tacticalGuardFaceContact(guard, mind);
-        if (role != GUARD_ASSAULT && guard->actiontype != ACT_KNEEL) check_if_able_to_then_kneel(guard);
         tacticalGuardOrder(mind, ORDER_NONE);
     }
     return TRUE;
@@ -847,10 +919,6 @@ static bool tacticalGuardCanFire(ChrRecord *guard)
     const bool managed = mind->active && tacticalGuardManaged(guard);
     if (!managed && guard->actiontype != ACT_ATTACKWALK && guard->actiontype != ACT_ATTACKROLL
         && !(guard->actiontype == ACT_ATTACK && (guard->act_attack.attacktype & TARGET_BOND))) return TRUE;
-    if (managed && mind->coverFloor)
-        return mind->peekPose && mind->peekUntil > g_GlobalTimer && bondviewGetVisibleToGuardsFlag();
-    if (managed && mind->order == ORDER_SUPPRESS)
-        return g_GlobalTimer < mind->suppressUntil && tacticalGuardSuppressLane(guard, mind);
     const PropRecord *target = getCurrentPlayerProp();
     const bool crouched = managed && guard->actiontype == ACT_ATTACK && mind->crouched;
     const bool clear = target && bondviewGetVisibleToGuardsFlag() && !g_CurrentPlayer->bonddead

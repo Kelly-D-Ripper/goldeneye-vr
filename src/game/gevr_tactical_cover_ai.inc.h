@@ -67,23 +67,6 @@ static bool tacticalCoverPeekPoint(ChrRecord *guard, const TacticalGuardMind *mi
     return FALSE;
 }
 
-static bool tacticalGuardSightFromCover(ChrRecord *guard, const PropRecord *target)
-{
-    if (!target || !target->stan) return FALSE;
-    float offset[2], blend;
-    const int pose = gevrGuardCoverPoseGet(guard, offset, &blend);
-    if ((pose != GEVR_GUARD_COVER_LEAN_LEFT && pose != GEVR_GUARD_COVER_LEAN_RIGHT) || blend < .8f)
-        return FALSE;
-    const PropRecord *prop = guard->prop;
-    coord3d peek = {.x = prop->pos.x + offset[0] * TACTICAL_COVER_REACH,
-                    .z = prop->pos.z + offset[1] * TACTICAL_COVER_REACH};
-    StandTile *tile = prop->stan;
-    if (!tacticalPeekTile(&prop->pos, &tile, &peek)) return FALSE;
-    const f32 height = tacticalCoverEye(guard);
-    return tacticalTrace(guard, &peek, tile, &target->pos, target->stan,
-        height, tacticalTargetHeight(target, height), 0);
-}
-
 /* Strict cover (user, 2026-11-23: "use crates, corners of hallways, doors
  * ... keep the rules strict on what they can use so they don't get caught
  * up on weird geometry"). The thing hiding the guard must stand within
@@ -166,17 +149,13 @@ static bool tacticalGuardFindCover(ChrRecord *guard, TacticalGuardMind *mind, bo
         mind->peekSide = preferredSide;
         mind->nextPeek = g_GlobalTimer + 28;
         mind->coverArriveBy = g_GlobalTimer + 165;
+        mind->coverUntil = g_GlobalTimer + 165 + (advance ? 140 : retreat ? 300 : 230) + ((u16)guard->chrnum % 80);
         if (i != 0) chrlvDirectRoute(guard, &point, floor, SPEED_RUN);
         else tacticalGuardFaceContact(guard, mind);
         tacticalGuardOrder(mind, advance ? ORDER_ADVANCE : retreat ? ORDER_FALLBACK : ORDER_COVER);
         return TRUE;
     }
     return FALSE;
-}
-
-static bool tacticalCoverBlind(int pose)
-{
-    return pose == GEVR_GUARD_COVER_BLIND_LEFT || pose == GEVR_GUARD_COVER_BLIND_RIGHT;
 }
 
 static bool tacticalGuardHoldCover(ChrRecord *guard, TacticalGuardMind *mind)
@@ -201,106 +180,42 @@ static bool tacticalGuardHoldCover(ChrRecord *guard, TacticalGuardMind *mind)
         return FALSE;
     }
 
-    if (mind->peekPose) {
-        if (now < mind->peekUntil && guard->actiontype == ACT_ATTACK) return TRUE;
-        chrStopFiring(guard);
-        mind->peekPose = GEVR_GUARD_COVER_NONE;
-        mind->nextPeek = now + 38 + ((u16)guard->chrnum % 25);
-        tacticalGuardOrder(mind, ORDER_COVER);
+    /* 0.18.1 (user, 2026-11-23): no leans and no blind fire. A guard stays
+     * down behind cover, fires only at a player he can see from where he
+     * kneels, and moves on after a short hold. */
+    mind->peekPose = GEVR_GUARD_COVER_NONE;
+    gevrGuardCoverPoseSet(guard, GEVR_GUARD_COVER_NONE, 0.0f, 0.0f);
+    if (guard->actiontype == ACT_ATTACK && now < mind->peekUntil) return TRUE;
+    if (now >= mind->coverUntil) {
+        tacticalGuardLeaveCover(guard, mind);
+        mind->nextCover = now + 200 + ((u16)guard->chrnum % 60);
+        return FALSE;
     }
-    if (guard->actiontype != ACT_KNEEL) {
+    if (guard->actiontype != ACT_ATTACK) {
+        /* down on one knee, weapon on the contact */
+        mind->crouched = TRUE;
         tacticalGuardFaceContact(guard, mind);
-        check_if_able_to_then_kneel(guard);
     }
-    gevrGuardCoverPoseSet(guard, GEVR_GUARD_COVER_DUCK, 0.0f, 0.0f);
     if (now < mind->nextPeek || !tacticalCoverProbeAvailable()) return TRUE;
-    mind->nextPeek = now + 40 + ((u16)guard->chrnum % 13);
-
-    coord3d peek;
-    StandTile *tile;
-    int side;
-    if (!tacticalCoverPeekPoint(guard, mind, &prop->pos, prop->stan, mind->peekSide, &peek, &tile, &side))
-        return TRUE;
+    mind->nextPeek = now + 30 + ((u16)guard->chrnum % 13);
     const PropRecord *target = getCurrentPlayerProp();
     const bool visible = target && target->stan && bondviewGetVisibleToGuardsFlag() && !g_CurrentPlayer->bonddead
         && (!netIsActive() || gevrCoopPlayerTargetable(get_cur_playernum()))
         && tacticalGuardFacing(guard, &target->pos, TRUE)
-        && tacticalTrace(guard, &peek, tile, &target->pos, target->stan,
+        && tacticalTrace(guard, &prop->pos, prop->stan, &target->pos, target->stan,
             eye, tacticalTargetHeight(target, eye), CDTYPE_CHRS);
-    const bool suppress = !visible && mind->contact >= CONTACT_TEAM && now + 125 < mind->expires
-        && tacticalDistance(&prop->pos, &mind->location) < SQR(2700.0f)
-        && fabsf(mind->cover.y - stanGetPositionYValue(mind->floor, mind->location.x, mind->location.z)) < 75.0f;
-    if (!visible && !suppress) return TRUE;
-    const f32 angle = atan2f(mind->location.x - prop->pos.x, mind->location.z - prop->pos.z);
-    const int compass = (s32)(angle * 65536.0f / M_TAU_F) & 0xffff;
-    if (!actor_kneel_aim_at_actor(guard, visible ? TARGET_BOND : TARGET_COMPASS, visible ? 0 : compass)) return TRUE;
-    mind->peekPose = visible ? (side < 0 ? GEVR_GUARD_COVER_LEAN_LEFT : GEVR_GUARD_COVER_LEAN_RIGHT)
-        : (side < 0 ? GEVR_GUARD_COVER_BLIND_LEFT : GEVR_GUARD_COVER_BLIND_RIGHT);
-    mind->peekSide = -side;
-    mind->peekUntil = now + (visible ? 104 : 78);
+    if (!visible || !actor_kneel_aim_at_actor(guard, TARGET_BOND, 0)) return TRUE;
+    mind->peekUntil = now + 90;
     mind->crouched = TRUE;
-    if (visible) {
-        setSeenBondTimeToNow(guard);
-        chrlvSetTargetToPlayer(guard);
-    }
-    gevrGuardCoverPoseSet(guard, mind->peekPose, (peek.x - prop->pos.x) / TACTICAL_COVER_REACH,
-        (peek.z - prop->pos.z) / TACTICAL_COVER_REACH);
-    tacticalGuardOrder(mind, ORDER_PEEK);
-    if (s_traceGuardAi) sysLogPrintf(LOG_NOTE, "tactical AI: guard %d %s %s", guard->chrnum,
-        visible ? "leaned" : "blind peek", side < 0 ? "left" : "right");
+    setSeenBondTimeToNow(guard);
+    chrlvSetTargetToPlayer(guard);
+    tacticalGuardOrder(mind, ORDER_FIRE);
     return TRUE;
 }
 
-/* -1 uses the ordinary shot, 0 blocks it, and 1 supplies a checked muzzle. */
+/* Guards fire only their ordinary, aimed shots now. */
 static int tacticalGuardCoverShot(ChrRecord *guard, s32 hand, coord3d *muzzle, StandTile **floor)
 {
-    if (!tacticalGuardAiAllowed() || !tacticalGuardOrdinary(guard)) return -1;
-    TacticalGuardMind *mind = tacticalGuardMind(guard);
-    if (!mind || !mind->coverFloor) return -1;
-    if (s_traceGuardAi && tacticalCoverBlind(mind->peekPose))
-        sysLogPrintf(LOG_NOTE, "tactical AI: guard %d blind shot attempt", guard->chrnum);
-    if (!mind->peekPose) return 0;
-    if (!gevrGuardCoverMuzzle(guard, hand, muzzle)) {
-        /* The rendered muzzle is captured only while the gun is on screen.
-         * Off screen, use the lean's own reach (gevr_avatar.c coverBend:
-         * 72% of the offset) at kneeling shoulder height, so a guard still
-         * fires from cover when the player is looking elsewhere. */
-        float offset[2], blend;
-        const int pose = gevrGuardCoverPoseGet(guard, offset, &blend);
-        if (!guard->weapons_held[hand] || pose < GEVR_GUARD_COVER_LEAN_LEFT || blend < 1.0f) return 0;
-        muzzle->x = guard->prop->pos.x + offset[0] * TACTICAL_COVER_REACH;
-        muzzle->z = guard->prop->pos.z + offset[1] * TACTICAL_COVER_REACH;
-        muzzle->y = stanGetPositionYValue(guard->prop->stan, guard->prop->pos.x, guard->prop->pos.z)
-            + tacticalCoverEye(guard) - 6.0f;
-    }
-    if (tacticalDistance(muzzle, &guard->prop->pos) > SQR(245.0f)) return 0;
-    *floor = guard->prop->stan;
-    if (!walkTilesBetweenPoints_NoCallback(floor, guard->prop->pos.x, guard->prop->pos.z, muzzle->x, muzzle->z)) return 0;
-    const f32 height = muzzle->y - stanGetPositionYValue(*floor, muzzle->x, muzzle->z);
-    if (height < 25.0f || height > guard->chrheight + 30.0f
-        || !tacticalTrace(guard, &guard->prop->pos, guard->prop->stan, muzzle, *floor,
-            tacticalCoverEye(guard) - 20.0f, height, CDTYPE_CHRS)) return 0;
-    const bool blind = tacticalCoverBlind(mind->peekPose);
-    bool clear;
-    if (blind) {
-        clear = tacticalTrace(guard, muzzle, *floor, &mind->location, mind->floor,
-            height, tacticalEvidenceHeight(mind), CDTYPE_CHRS);
-    } else {
-        const PropRecord *target = getCurrentPlayerProp();
-        clear = target && target->stan && !g_CurrentPlayer->bonddead
-            && (!netIsActive() || gevrCoopPlayerTargetable(get_cur_playernum()))
-            && tacticalTrace(guard, muzzle, *floor, &target->pos, target->stan,
-                height, tacticalTargetHeight(target, height), CDTYPE_CHRS);
-    }
-    if (clear && s_traceGuardAi) sysLogPrintf(LOG_NOTE, "tactical AI: guard %d fired %s from cover", guard->chrnum,
-        blind ? "blind" : "aimed");
-    if (!clear && s_traceGuardAi && blind) {
-        float off[2], bl;
-        gevrGuardCoverPoseGet(guard, off, &bl);
-        sysLogPrintf(LOG_NOTE, "tactical AI: guard %d blind lane blocked, guard %.0f,%.0f,%.0f muzzle %.0f,%.0f h%.0f"
-            " pose %.0f,%.0f to %.0f,%.0f,%.0f h%.0f", guard->chrnum, (double)guard->prop->pos.x, (double)guard->prop->pos.y,
-            (double)guard->prop->pos.z, (double)muzzle->x, (double)muzzle->z, (double)height, (double)off[0], (double)off[1],
-            (double)mind->location.x, (double)mind->location.y, (double)mind->location.z, (double)tacticalEvidenceHeight(mind));
-    }
-    return clear;
+    (void)guard; (void)hand; (void)muzzle; (void)floor;
+    return -1;
 }
