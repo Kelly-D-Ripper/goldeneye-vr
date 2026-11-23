@@ -48,6 +48,7 @@ void gfx_set_texture_filter(enum FilteringMode mode) { (void)mode; }
 void gfx_texture_cache_clear(void) { }
 void gfx_texture_cache_delete(const uint8_t *orig_addr) { (void)orig_addr; }
 int gfx_prewarm_bean_textures(void) { return 0; }
+int gfx_tactical_texture_prepare(const void *address) { (void)address; return 0; }
 /* port/vr/gevr_loading.cpp: no screen to load behind */
 void gevrLoadingBegin(void) { }
 void gevrLoadingProgress(float progress) { (void)progress; }
@@ -68,6 +69,7 @@ void gfx_copy_framebuffer(int fb_dst, int fb_src, int left, int top, int use_bac
 {
 	(void)fb_dst; (void)fb_src; (void)left; (void)top; (void)use_back;
 }
+void gfx_static_mesh_prepare(GevrStaticMesh *mesh) { (void)mesh; }
 void gfx_static_mesh_release(GevrStaticMesh *mesh) { (void)mesh; }
 
 int gevrTexpackState(void) { return -1; }
