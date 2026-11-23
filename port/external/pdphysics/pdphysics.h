@@ -205,6 +205,11 @@ void pdphysRagdollAddVelocity(int handle, int part, const float vel[3]);
 void pdphysRagdollCarry(int handle, int part, const float delta[3], const float velocity[3], float dt);
 void pdphysRagdollClampSpeed(int handle, const float ref[3], float maxspeed);
 
+// A bounded point attachment for a held blade. The other joints stay free.
+int pdphysRagdollAttachPoint(int handle, int part, const float point[3]);
+void pdphysRagdollMovePoint(int handle, const float point[3], const float velocity[3]);
+void pdphysRagdollReleasePoint(int handle);
+
 // Writes each part's current joint frame (same convention as jointmtx). Returns part count.
 int pdphysRagdollGetJoints(int handle, float (*outmtx)[16]);
 
@@ -267,6 +272,11 @@ int pdphysRagdollIsAsleep(int handle);
 // capped at maxforce newtons, so heavy pulls lag and sag: the rest of the
 // body hangs off the held part. Call every tick while holding; wakes the body.
 void pdphysRagdollPull(int handle, int part, const float target[3], float maxforce, float frequency);
+
+// A capped spring applied at a world-space point on a part, so a wrist
+// can bend its elbow through contact and joint constraints.
+void pdphysRagdollGuidePoint(int handle, int part, const float point[3],
+    const float target[3], float maxforce, float frequency);
 
 // Current position (PD units) of a part's centre of mass.
 void pdphysRagdollGetPartPos(int handle, int part, float outpos[3]);

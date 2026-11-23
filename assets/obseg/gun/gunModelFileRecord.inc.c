@@ -87,5 +87,17 @@ GunModelFileRecord gitem_structs[] = {
 	#include <assets/obseg/gun/joypad/gunFileRecord.inc.c>
 	{         NULL              ,                   NULL, 0, GUNSTATS(null1), getStringID(LGUN, GUN_STR_83_LF), getStringID(LGUN, GUN_STR_54_NULL_LF),   0.0,   0.0, 1000.0,   0.0, 0.0, getStringID(LGUN, GUN_STR_83_LF), getStringID(LGUN, GUN_STR_83_LF), 10.0, 10.0, 1000.0},
 	{         NULL              ,                   NULL, 0, GUNSTATS(null2), getStringID(LGUN, GUN_STR_83_LF), getStringID(LGUN, GUN_STR_54_NULL_LF),   0.0,   0.0, 1000.0,   0.0, 0.0, getStringID(LGUN, GUN_STR_83_LF), getStringID(LGUN, GUN_STR_83_LF), 10.0, 10.0, 1000.0},
-	{         NULL              ,                   NULL, 0, GUNSTATS(token), getStringID(LGUN, GUN_STR_83_LF), getStringID(LGUN, GUN_STR_73_TOKEN_LF),  12.0,   0.0,  528.0,  80.0, 0.0, getStringID(LGUN, GUN_STR_73_TOKEN_LF), getStringID(LGUN, GUN_STR_CC_TOKEN_LF), 0.0, -4.0, 310.0}
+	{         NULL              ,                   NULL, 0, GUNSTATS(token), getStringID(LGUN, GUN_STR_83_LF), getStringID(LGUN, GUN_STR_73_TOKEN_LF),  12.0,   0.0,  528.0,  80.0, 0.0, getStringID(LGUN, GUN_STR_73_TOKEN_LF), getStringID(LGUN, GUN_STR_CC_TOKEN_LF), 0.0, -4.0, 310.0},
+#ifdef GEVR
+    GUNFILERECORD(m16, 0, GUNSTATS(ak47), getStringID(LGUN, GUN_STR_08_AK47_LF), getStringID(LGUN, GUN_STR_68_SOVIET_LF), -29.0, 307.0, 1410.0, 0.0, 0.0, getStringID(LGUN, GUN_STR_42_AK47_LF), getStringID(LGUN, GUN_STR_AB_AK47_LF), 304.0, -31.0, 1020.0)
+#define TACTICAL_EXPANDED(id, group, native, gun, prop, capacity, cadence, name) \
+    GUNFILERECORD(gun, 0, GUNSTATS(gun), getStringID(LGUN, GUN_STR_83_LF), getStringID(LGUN, GUN_STR_83_LF), \
+        0.0, 100.0, 1000.0, 0.0, 0.0, getStringID(LGUN, GUN_STR_83_LF), getStringID(LGUN, GUN_STR_83_LF), 0.0, 0.0, 1000.0)
+#define TACTICAL_EXPANDED_MELEE_BOUNDARY \
+    GUNFILERECORD(knife, 0, GUNSTATS(knife), getStringID(LGUN, GUN_STR_83_LF), getStringID(LGUN, GUN_STR_46_KNIFE_LF), \
+        0.0, 100.0, 1000.0, 0.0, 0.0, getStringID(LGUN, GUN_STR_83_LF), getStringID(LGUN, GUN_STR_83_LF), 0.0, 0.0, 1000.0)
+#include "gevr_tactical_expanded.inc.h"
+#undef TACTICAL_EXPANDED
+#undef TACTICAL_EXPANDED_MELEE_BOUNDARY
+#endif
 };

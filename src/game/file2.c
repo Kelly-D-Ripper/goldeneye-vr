@@ -657,13 +657,19 @@ STAGESTATUS fileIsStageUnlockedAtDifficulty(s32 foldernum, LEVEL_SOLO_SEQUENCE l
     {
         save = fileGetSaveForFoldernum(foldernum);
 
+        if (save && fileGetSaveStageCompletedForDifficulty(save, levelid, difficulty))
+        {
+            return STAGESTATUS_COMPLETED;
+        }
+
+        /* Launch-time testing access applies to the bonus missions too. */
+        if (get_debug_enable_all_levels_flag())
+        {
+            return STAGESTATUS_UNLOCKED;
+        }
+
         if (save)
         {
-            if ( fileGetSaveStageCompletedForDifficulty(save, levelid, difficulty))
-            {
-                return STAGESTATUS_COMPLETED; //found on first try, stage has been completed and a time saved.
-            }
-
             if ((levelid == GEVR_SP_AZTEC && difficulty < DIFFICULTY_SECRET) ||
                 (levelid == GEVR_SP_EGYPT && difficulty < DIFFICULTY_00))
             {
@@ -740,11 +746,6 @@ STAGESTATUS fileIsStageUnlockedAtDifficulty(s32 foldernum, LEVEL_SOLO_SEQUENCE l
             return STAGESTATUS_UNLOCKED;
         }
 
-        // no save, cheat enabled, its unlocked. (basically a repeat of above)
-        if (get_debug_enable_all_levels_flag())
-        {
-            return STAGESTATUS_UNLOCKED;
-        }
     }
     // After all that the stage is not unlocked
     return STAGESTATUS_LOCKED;

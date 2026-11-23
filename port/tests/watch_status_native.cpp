@@ -15,7 +15,7 @@ using f32 = float; using f64 = double;
 #define MAX_PLAYER_COUNT 8
 struct coord16 { short x,y,z; };
 struct damage_display_val { coord16 pos, normal; struct { unsigned char r,g,b,a; } colour; };
-struct WatchVertex { unsigned char data[16]; };
+struct WatchVertex { coord16 coord1, coord2; struct { unsigned char r,g,b,a; } color; };
 #define GAUGE_BAR_VERTEX_PAIR_STRIDE (2 * sizeof(WatchVertex))
 struct Vertex { coord16 coord; };
 struct ModelNode;
@@ -121,6 +121,23 @@ int main() {
     for(Gfx *g=output;g<end;g++)if(g->op==LIST)lists.push_back((Gfx*)g->arg);
     health=(damage_display_val *)lists[0][0].arg;
     assert(health!=savedHealth && fullSegments(health)<full && fullSegments(savedHealth)==full);
+    reset();
+    // The Tactical dial uses the original pause-watch panel and the unrotated gauge arcs.
+    players[0].bondarmour=.90f;
+    end=gevrDrawWatchGauges(output,&wrist,true);
+    lists.clear();
+    for(Gfx *g=output;g<end;g++)if(g->op==LIST)lists.push_back((Gfx*)g->arg);
+    assert(lists.size()==3);
+    auto *panel=(WatchVertex *)lists[0][1].arg;
+    assert(panel->color.g>0 && panel->color.a==0xb0 && panel->coord1.z==0);
+    health=(damage_display_val *)lists[1][0].arg;
+    auto *armour=(damage_display_val *)lists[2][0].arg;
+    assert(fullSegments(health)<fullSegments(armour));
+    for(int i=0;i<46;i++) {
+        assert(health[i].pos.x<0 && armour[i].pos.x>0);
+        assert(health[i].pos.y==armour[i].pos.y && health[i].pos.x==-armour[i].pos.x);
+        assert(health[i].colour.r==255 && armour[i].colour.b==255);
+    }
     reset();connected=true;players[7].bondhealth=0;players[7].bondarmour=1;
     end=gevrRenderWatchStatus(output,&wrist);int dotCount=0,listCount=0;
     for(Gfx *g=output;g<end;g++) {

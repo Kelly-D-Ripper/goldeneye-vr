@@ -339,5 +339,18 @@ ItemModelFileRecord PitemZ_entries[] = {
     #include <assets/obseg/prop/doorconsole/propFileRecord.inc.c>
     #include <assets/obseg/prop/chrtesttube/propFileRecord.inc.c>
     #include <assets/obseg/prop/bollard/propFileRecord.inc.c>
+#ifdef GEVR
+    {&tacticalak74n_header, "Pchrm16Z", 0.1f},
+#define TACTICAL_EXPANDED(id, group, native, gun, prop, capacity, cadence, name) \
+    {&tactical_##id##_header, STR(P##prop##Z), 0.1f},
+#define TACTICAL_EXPANDED_BOUNDARY \
+    {&tacticalaltyn_header, "PhatberetZ", 0.1f}, \
+    {&tacticalfasttrooper_header, "PhathelmetgreyZ", 0.1f},
+#define TACTICAL_EXPANDED_MELEE_BOUNDARY {&tacticalkatana_header, "PchrknifeZ", 0.1f},
+#include "gevr_tactical_expanded.inc.h"
+#undef TACTICAL_EXPANDED
+#undef TACTICAL_EXPANDED_BOUNDARY
+#undef TACTICAL_EXPANDED_MELEE_BOUNDARY
+#endif
     {0, "", 1.0}
 };

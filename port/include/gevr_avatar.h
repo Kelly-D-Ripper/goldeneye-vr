@@ -8,6 +8,11 @@ extern "C" {
 #endif
 void gevrAvatarCapture(GevrAvatarPose *pose, struct player *player);
 void gevrAvatarApply(ChrRecord *chr, ModelRenderData *data);
+Gfx *gevrAvatarTacticalDraw(ChrRecord *chr, ModelRenderData *body, Gfx *gdl);
+/* Presentation-only support-hand reach for the experimental guard AK. */
+void gevrAvatarGuardForget(ChrRecord *chr);
+void gevrAvatarGuardReset(void);
+void gevrAvatarGuardApply(ChrRecord *chr, ModelRenderData *data);
 /* Active only during the avatar's second matrix build. */
 int gevrAvatarJointRotation(Model *model, ModelNode *node, coord3d *rotation);
 void gevrAvatarJointOffset(Model *model, ModelNode *node);

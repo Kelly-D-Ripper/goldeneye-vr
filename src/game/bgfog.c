@@ -1,6 +1,6 @@
 #include <ultra64.h>
 #ifdef GEVR
-#include "net_match.h"
+#include "net_core.h"
 #endif
 
 #include <bondtypes.h>
@@ -13,6 +13,8 @@
 #include <float.h>   /* FLT_MAX */
 #ifdef GEVR
 #include "gevr_bean.h"
+#include "boss.h"
+#include "system.h"
 static float s_gevrFogTransition;
 #endif
 #ifdef GEVR
@@ -309,6 +311,17 @@ f32 fogGetScaledFarFogIntensitySquared(void)
  */
 static f32 s_gevrFarFog;
 
+static bool gevrTacticalTrainVisibility(void)
+{
+    return bossGetStageNum() == LEVELID_TRAIN && getPlayerCount() == 1
+        && !netIsActive() && sysArgCheck("--tactical-physical");
+}
+
+f32 gevrTacticalTrainShadowLift(void)
+{
+    return gevrTacticalTrainVisibility() ? 0.72f : 0.0f;
+}
+
 f32 gevrFogPropVisRange(f32 maxvisrange)
 {
     f32 edge = s_gevrFarFog;
@@ -360,12 +373,19 @@ void fogLoadCurrentEnvironment(EnvironmentRecord *arg0)
     assert(fmax <= 1.0F);
 #endif
 
-    viSetZRange(arg0->Visibility.BlendMultiplier, arg0->Visibility.FarFog);
+    f32 farFog = arg0->Visibility.FarFog;
+#ifdef GEVR
+    /* Train's 1500-unit fog turns the end of a straight carriage black.
+     * Extend the range used by the rooms and props together. Keep the
+     * longer scripted exterior range when it takes over. */
+    if (gevrTacticalTrainVisibility() && farFog < 4500.0f) farFog = 4500.0f;
+#endif
+    viSetZRange(arg0->Visibility.BlendMultiplier, farFog);
     viGetZRange(&zrange);
 
     temp_f0 = bgGetLevelVisibilityScale();
 #ifdef GEVR
-    s_gevrFarFog = (f32)arg0->Visibility.FarFog / temp_f0;
+    s_gevrFarFog = farFog / temp_f0;
 #endif
     zrange[0] /= temp_f0;
     zrange[1] /= temp_f0;
@@ -378,7 +398,7 @@ void fogLoadCurrentEnvironment(EnvironmentRecord *arg0)
 
     g_CurFogDetails.g_CurFogDetails = (arg0->Visibility.BlendMultiplier / temp_f0);
     pk0 = g_CurFogDetails.g_CurFogDetails;
-    g_CurFogDetails.scaled_far_fog_dist = (arg0->Visibility.FarFog / temp_f0);
+    g_CurFogDetails.scaled_far_fog_dist = farFog / temp_f0;
     pk4 = g_CurFogDetails.scaled_far_fog_dist;
 
     // numerator is constant 128.0f

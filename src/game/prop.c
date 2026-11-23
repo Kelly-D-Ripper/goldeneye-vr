@@ -1,11 +1,21 @@
 #ifdef GEVR
+#include "net_core.h"
+#include "bondaicommands.h"
+#include "boss.h"
 #include "net_horde.h"
 #include "net_match.h"
 #include "system.h"
 #include "net_objects.h"
+#include "gevr_romlayout.h"
+#include "gevr_tactical_range.h"
+#include "gevr_tactical_facility.h"
+#include "gevr_tactical_mesh.h"
+#include "gevr_tactical_loadouts.h"
 #endif
 #include <ultra64.h>
+#include <math.h>
 #include <memp.h>
+#include <string.h>
 #include "game/mp_weapon.h"
 #include "game/bondview_r.h"
 #include "bg.h"
@@ -34,6 +44,7 @@
 #ifdef GEVR
 #include "gevr_dam_boat.h"
 #include "gevr_arena.h"
+#include "gevr_tactical_gear.h"
 #endif
 #include "token.h"
 
@@ -80,6 +91,569 @@ s32 load_proptype(PROPDEF_TYPE type)
     }
     return count;
 }
+
+#ifdef GEVR
+enum {
+    JUNGLE_COMBAT_AI = 0x040d,
+    JUNGLE_PATROL_FIRST_ID = 20000,
+    CAMPAIGN_PARTNER_FIRST_ID = 22000,
+    CAMPAIGN_THIRD_FIRST_ID = 22100,
+    SURFACE_ROOF_MARKSMAN = 23000,
+    SURFACE2_ROOF_MARKSMAN = 14,
+    CAMPAIGN_PATROL_FIRST_ID = 25000,
+    CAMPAIGN_PATROL_STRIDE = 5,
+    CAMPAIGN_EXPANSION_FIRST_ID = 26000,
+    CAMPAIGN_EXPANSION_STRIDE = 3
+};
+
+/* Only regular armed posts with an adjacent, clear pad on that same floor. */
+static const struct {
+    enum LEVELID stage;
+    u16 sentry, pad;
+    u8 partners;
+} campaignGuardPosts[] = {
+    {LEVELID_DAM,      12,  93, 1},
+    {LEVELID_FACILITY, 16,  98, 1},
+    {LEVELID_BUNKER1,  10,  36, 1},
+    {LEVELID_BUNKER1,  15,  62, 1},
+    {LEVELID_STREETS,  11, 212, 1},
+    {LEVELID_DEPOT,    16, 118, 2},
+    {LEVELID_DEPOT,    19, 339, 1},
+    {LEVELID_CAVERNS,  12, 207, 1},
+    {LEVELID_CAVERNS,  42, 283, 1},
+#include "gevr_campaign_posts_open.inc.h"
+#include "gevr_campaign_posts_tight.inc.h"
+};
+
+static const struct {
+    enum LEVELID stage;
+    u16 body, item, model;
+    u8 size;
+    u16 pads[8];
+} campaignPatrols[] = {
+#include "gevr_campaign_patrols_open.inc.h"
+};
+
+enum CampaignEncounterRole { ENCOUNTER_IDLE, ENCOUNTER_PATROL, ENCOUNTER_MARKSMAN };
+
+typedef struct CampaignEncounter {
+    enum LEVELID stage;
+    u16 body, item, model;
+    enum CampaignEncounterRole role;
+    u8 size;
+    u16 pads[8];
+} CampaignEncounter;
+
+static const CampaignEncounter campaignExpansions[] = {
+#include "gevr_campaign_expanded_early.inc.h"
+#include "gevr_campaign_expanded_late.inc.h"
+};
+
+typedef struct CampaignPatrolRoute {
+    struct patrol_path path;
+    s32 ids[ARRAYCOUNT(campaignExpansions[0].pads) + 1];
+    PadRecord pads[ARRAYCOUNT(campaignExpansions[0].pads)];
+} CampaignPatrolRoute;
+
+static CampaignPatrolRoute campaignRoutes[ARRAYCOUNT(campaignExpansions)];
+
+_Static_assert(CAMPAIGN_EXPANSION_FIRST_ID + CAMPAIGN_EXPANSION_STRIDE * ARRAYCOUNT(campaignExpansions)
+    <= 0x8000, "Campaign encounter actor IDs must fit in s16");
+
+static bool tacticalEncountersEnabled(void)
+{
+    return sysArgCheck("--tactical-physical") && gevrTacticalCampaignRules()
+        && !gevrRomIsVariant() && !gevrTacticalRangeActive();
+}
+
+int gevrCampaignExtraGuardCapacity(int stage)
+{
+    if (!tacticalEncountersEnabled()) return 0;
+    int count = stage == LEVELID_JUNGLE ? GEVR_JUNGLE_PATROL_CAPACITY : stage == LEVELID_SURFACE;
+    for (size_t i = 0; i < ARRAYCOUNT(campaignGuardPosts); i++) {
+        if (campaignGuardPosts[i].stage == stage) count += campaignGuardPosts[i].partners;
+    }
+    for (size_t i = 0; i < ARRAYCOUNT(campaignPatrols); i++) {
+        if (campaignPatrols[i].stage == stage) count += campaignPatrols[i].size;
+    }
+    for (size_t i = 0; i < ARRAYCOUNT(campaignExpansions); i++) {
+        if (campaignExpansions[i].stage == stage) count += campaignExpansions[i].size;
+    }
+    return count;
+}
+
+static int campaignEncounterIndex(const ChrRecord *chr)
+{
+    if (!chr || chr->chrnum < CAMPAIGN_EXPANSION_FIRST_ID) return -1;
+    const int actor = chr->chrnum - CAMPAIGN_EXPANSION_FIRST_ID;
+    const int row = actor / CAMPAIGN_EXPANSION_STRIDE;
+    return row < (int)ARRAYCOUNT(campaignExpansions)
+        && campaignExpansions[row].stage == bossGetStageNum()
+        && actor % CAMPAIGN_EXPANSION_STRIDE < campaignExpansions[row].size ? row : -1;
+}
+
+bool gevrCampaignGuardIsMarksman(const ChrRecord *chr)
+{
+    const int row = campaignEncounterIndex(chr);
+    if (row >= 0) return campaignExpansions[row].role == ENCOUNTER_MARKSMAN;
+    if (!chr || chr->bodynum != BODY_Siberian_Special_Forces || !tacticalEncountersEnabled()) return FALSE;
+    const int stage = bossGetStageNum();
+    return (stage == LEVELID_SURFACE && chr->chrnum == SURFACE_ROOF_MARKSMAN)
+        || (stage == LEVELID_SURFACE2 && chr->chrnum == SURFACE2_ROOF_MARKSMAN);
+}
+
+struct patrol_path *gevrCampaignGuardRoute(const ChrRecord *chr)
+{
+    const int row = campaignEncounterIndex(chr);
+    return row >= 0 && campaignRoutes[row].path.data ? &campaignRoutes[row].path : NULL;
+}
+
+PadRecord *gevrCampaignPatrolPad(struct patrol_path *path, s32 step)
+{
+    /* Direct patrol paths are always the first member of a CampaignPatrolRoute. */
+    CampaignPatrolRoute *route = (CampaignPatrolRoute *)path;
+    return &route->pads[step];
+}
+
+int gevrJunglePatrolSquad(const ChrRecord *chr)
+{
+    if (!chr || chr->bodynum != BODY_Jungle_Commando || bossGetStageNum() != LEVELID_JUNGLE)
+        return -1;
+    const int member = chr->chrnum - JUNGLE_PATROL_FIRST_ID;
+    return member >= 0 && member < GEVR_JUNGLE_PATROL_CAPACITY ? member / GEVR_JUNGLE_SQUAD_SIZE : -1;
+}
+
+int gevrCampaignGuardPost(const ChrRecord *chr, int *member)
+{
+    if (!chr) return -1;
+    const int row = campaignEncounterIndex(chr);
+    if (row >= 0) {
+        if (campaignExpansions[row].role == ENCOUNTER_MARKSMAN) return -1;
+        *member = (chr->chrnum - CAMPAIGN_EXPANSION_FIRST_ID) % CAMPAIGN_EXPANSION_STRIDE;
+        return 100 + ARRAYCOUNT(campaignPatrols) + row;
+    }
+    const int stage = bossGetStageNum();
+    const int patrolActor = chr->chrnum - CAMPAIGN_PATROL_FIRST_ID;
+    if (patrolActor >= 0) {
+        const int patrol = patrolActor / CAMPAIGN_PATROL_STRIDE;
+        const int index = patrolActor % CAMPAIGN_PATROL_STRIDE;
+        if (patrol >= (int)ARRAYCOUNT(campaignPatrols) || campaignPatrols[patrol].stage != stage
+            || index >= campaignPatrols[patrol].size) return -1;
+        *member = index;
+        return 100 + patrol;
+    }
+    for (size_t i = 0; i < ARRAYCOUNT(campaignGuardPosts); i++) {
+        if (campaignGuardPosts[i].stage != stage) continue;
+        const int sentry = campaignGuardPosts[i].sentry;
+        if (chr->chrnum == sentry) *member = 0;
+        else if (chr->chrnum == CAMPAIGN_PARTNER_FIRST_ID + sentry) *member = 1;
+        else if (campaignGuardPosts[i].partners == 2 && chr->chrnum == CAMPAIGN_THIRD_FIRST_ID + sentry) *member = 2;
+        else continue;
+        return sentry;
+    }
+    return -1;
+}
+
+bool gevrCampaignGuardIsIdleGroupMember(const ChrRecord *chr)
+{
+    const int row = campaignEncounterIndex(chr);
+    if (row >= 0) return campaignExpansions[row].role == ENCOUNTER_IDLE && campaignExpansions[row].size > 1;
+    int member;
+    return gevrJunglePatrolSquad(chr) >= 0 || gevrCampaignGuardPost(chr, &member) >= 0;
+}
+
+static void spawnJunglePatrols(int npads)
+{
+    int placed = 0;
+    for (PropDefHeaderRecord *def = (PropDefHeaderRecord *)g_CurrentSetup.propDefs;
+         def->type != PROPDEF_END; def += sizepropdef(def)) {
+        if (def->type != PROPDEF_GUARD) continue;
+        const GuardRecord *guard = (const GuardRecord *)def;
+        /* The end cinematic uses the same commando body with a different list. */
+        if (guard->BodyID == BODY_Jungle_Commando && guard->AIListID == JUNGLE_COMBAT_AI
+            && guard->Data && guard->Data->model) placed++;
+    }
+
+    /* Each row is one encounter. Extra pads keep the squad together if trees,
+     * props or a co-op start position make one of the first five unusable. */
+    static const u16 squadPads[GEVR_JUNGLE_SQUAD_COUNT][9] = {
+        {144, 334, 271, 267, 335, 217, 282, 367, 268},    /* Early forest */
+        {190, 261, 329, 138, 327, 259, 191, 328, 260},   /* Clearing */
+        {187, 252, 75, 319, 525, 320, 324, 162, 73},    /* Treeline */
+        {401, 213, 400, 403, 316, 64, 506, 65, 315},     /* Forest path */
+        {419, 416, 415, 50, 420, 244, 412, 414, 51},    /* Bridge approach */
+        {409, 293, 114, 109, 410, 204, 105, 175, 117},  /* Across the bridge */
+        {91, 237, 423, 424, 238, 128, 98, 296, 297},    /* Ravine */
+        {516, 126, 205, 308, 430, 184, 431, 429, 207},  /* Hillside */
+        {455, 456, 454, 538, 457, 537, 564, 460, 540},  /* Lift approach */
+    };
+    AIRecord *ai = ailistFindById(GAILIST_STANDARD_GUARD);
+    int added = 0, armed = 0, full = 0;
+    const bool rockets = cheatIsActive(CHEAT_ENEMY_ROCKETS);
+    for (size_t i = 0; ai && i < ARRAYCOUNT(squadPads); i++) {
+        int members = 0;
+        for (size_t j = 0; j < ARRAYCOUNT(squadPads[i]) && members < GEVR_JUNGLE_SQUAD_SIZE; j++) {
+            const u16 index = squadPads[i][j];
+            if (!index || index >= npads) continue;
+            const PadRecord *pad = &g_CurrentSetup.pads[index];
+            if (!gevrCampaignOpeningPointClear(pad)) continue;
+
+            const int id = JUNGLE_PATROL_FIRST_ID + (int)i * GEVR_JUNGLE_SQUAD_SIZE + members;
+            const f32 angle = atan2f(pad->look.x, pad->look.z);
+            PropRecord *actor = gevrSpawnCampaignGuard(BODY_Jungle_Commando, pad, angle, ai, id);
+            if (!actor) continue;
+            actor->chr->visionrange = 100.0f; /* Regular Jungle sentry. */
+            if (chrGiveWeapon(actor->chr, rockets ? PROP_CHRROCKETLAUNCH : PROP_CHRM16,
+                              rockets ? ITEM_ROCKETLAUNCH : ITEM_M16, 0)) armed++;
+            added++;
+            members++;
+            sysLogPrintf(LOG_NOTE, "tactical jungle: squad %u member %d actor %d pad %u",
+                         (unsigned)i + 1, members, id, (unsigned)index);
+        }
+        if (members == GEVR_JUNGLE_SQUAD_SIZE) full++;
+    }
+    sysLogPrintf(LOG_NOTE, "tactical jungle: %d placed commandos, %d additional commandos (%d armed), %d full squads",
+                 placed, added, armed, full);
+}
+
+static PropRecord *spawnSentryPartner(ChrRecord *sentry, const PadRecord *preferred,
+                                    AIRecord *ai, s32 id, const PropRecord *first,
+                                    int *attemptUsed, const char **failure)
+{
+    const coord3d *at = &sentry->prop->pos;
+    StandTile *const origin = sentry->prop->stan;
+    const f32 ground = stanGetPositionYValue(origin, at->x, at->z);
+    const f32 bearing = atan2f(preferred->pos.x - at->x, preferred->pos.z - at->z);
+
+    /* Try the authored pad first, then eight positions close to the sentry. */
+    for (int attempt = 0; attempt <= 8; attempt++) {
+        PadRecord spot = *preferred;
+        if (attempt > 0) {
+            const f32 heading = bearing + (attempt - 1) * (M_PI_F / 4.0f);
+            spot.pos = *at;
+            spot.pos.x += 145.0f * sinf(heading);
+            spot.pos.z += 145.0f * cosf(heading);
+            spot.stan = origin;
+            if (!walkTilesBetweenPoints_NoCallback(&spot.stan, at->x, at->z, spot.pos.x, spot.pos.z)) {
+                *failure = "no connected floor";
+                continue;
+            }
+        }
+        if (!spot.stan || origin->room != spot.stan->room) {
+            *failure = "different room";
+            continue;
+        }
+        const f32 floor = stanGetPositionYValue(spot.stan, spot.pos.x, spot.pos.z);
+        if (fabsf(ground - floor) > 30.0f) {
+            *failure = "different floor height";
+            continue;
+        }
+        StandTile *tile = origin;
+        if (!stanTestLineUnobstructed(&tile, at->x, at->z, spot.pos.x, spot.pos.z,
+                                    CDTYPE_OBJS | CDTYPE_DOORS | CDTYPE_PATHBLOCKER,
+                                    ground + 100.0f, ground + 20.0f, floor + 100.0f, floor + 20.0f)) {
+            *failure = "path obstructed";
+            continue;
+        }
+        if (first) {
+            const f32 dx = first->pos.x - spot.pos.x, dz = first->pos.z - spot.pos.z;
+            if (dx * dx + dz * dz < 110.0f * 110.0f) {
+                *failure = "too close to first partner";
+                continue;
+            }
+        }
+        if (!gevrCampaignOpeningPointClear(&spot)) {
+            *failure = "start area, sightline or standing space rejected";
+            continue;
+        }
+        const f32 angle = atan2f(at->x - spot.pos.x, at->z - spot.pos.z);
+        PropRecord *partner = gevrSpawnCampaignGuard(sentry->bodynum, &spot, angle, ai, id);
+        if (partner) {
+            *attemptUsed = attempt;
+            return partner;
+        }
+        *failure = "standing space, start proximity or spawn floor rejected";
+    }
+    return NULL;
+}
+
+static void spawnCampaignSentryPairs(int stage, int npads)
+{
+    AIRecord *ai = ailistFindById(GAILIST_STANDARD_GUARD);
+    for (size_t i = 0; ai && i < ARRAYCOUNT(campaignGuardPosts); i++) {
+        if (campaignGuardPosts[i].stage != stage || campaignGuardPosts[i].pad >= npads) continue;
+        ChrRecord *sentry = chrFindByLiteralId(campaignGuardPosts[i].sentry);
+        const bool eligible = sentry && sentry->prop && sentry->model && sentry->prop->stan
+            && !(sentry->chrflags & (CHRFLAG_INVINCIBLE | CHRFLAG_COUNT_DEATH_AS_CIVILIAN | CHRFLAG_CAN_SHOOT_CHRS));
+        const PropRecord *weapon = eligible ? sentry->weapons_held[GUNRIGHT] : NULL;
+        if (eligible && !weapon) weapon = sentry->weapons_held[GUNLEFT];
+        if (!weapon || !weapon->weapon || !gevrCampaignGunIsFirearm(weapon->weapon->weaponnum)) {
+            sysLogPrintf(LOG_NOTE, "tactical guard pair: skipped stage %d sentry %u, original guard unavailable or unarmed",
+                         stage, (unsigned)campaignGuardPosts[i].sentry);
+            continue;
+        }
+
+        const u16 index = campaignGuardPosts[i].pad;
+        const coord3d *at = &sentry->prop->pos;
+        PropRecord *first = NULL;
+        f32 towardX = 0.0f, towardZ = 0.0f;
+        for (int member = 0; member < campaignGuardPosts[i].partners; member++) {
+            const int id = (member == 0 ? CAMPAIGN_PARTNER_FIRST_ID : CAMPAIGN_THIRD_FIRST_ID) + sentry->chrnum;
+            int attemptUsed = 0;
+            const char *failure = "no usable position";
+            PropRecord *partner = spawnSentryPartner(sentry, &g_CurrentSetup.pads[index], ai, id,
+                                                    first, &attemptUsed, &failure);
+            if (!partner) {
+                sysLogPrintf(LOG_NOTE, "tactical guard pair: skipped stage %d sentry %d partner %d, %s",
+                             stage, sentry->chrnum, id, failure);
+                break;
+            }
+            partner->chr->visionrange = sentry->visionrange;
+            if (!gevrCloneGuardWeapon(partner->chr, weapon, 0)) {
+                sysLogPrintf(LOG_WARNING, "tactical guard pair: stage %d partner %d could not equip", stage, id);
+                partner->chr->hidden |= CHRHIDDEN_REMOVE;
+                partner->chr->chrflags |= CHRFLAG_HIDDEN;
+                break;
+            }
+            if (!first) first = partner;
+            towardX += partner->pos.x - at->x;
+            towardZ += partner->pos.z - at->z;
+            setsubroty(partner->chr->model, atan2f(at->x - partner->pos.x, at->z - partner->pos.z));
+            sysLogPrintf(LOG_NOTE, "tactical guard pair: stage %d sentry %d partner %d pad %u fallback %d at %.0f %.0f %.0f",
+                         stage, sentry->chrnum, id, (unsigned)index, attemptUsed,
+                         partner->pos.x, partner->pos.y, partner->pos.z);
+        }
+        if (first) setsubroty(sentry->model, atan2f(towardX, towardZ));
+    }
+}
+
+static bool campaignPatrolConnected(const coord3d *from, StandTile *start, const PadRecord *pad, f32 maxDistance)
+{
+    if (!start || !pad->stan) return FALSE;
+    const f32 d2 = SQR(from->x - pad->pos.x) + SQR(from->z - pad->pos.z);
+    if (d2 < SQR(100.0f) || d2 > SQR(maxDistance)) return FALSE;
+    const f32 fromY = stanGetPositionYValue(start, from->x, from->z);
+    const f32 toY = stanGetPositionYValue(pad->stan, pad->pos.x, pad->pos.z);
+    if (fabsf(fromY - toY) > 110.0f) return FALSE;
+    return stanTestLineUnobstructed(&start, from->x, from->z, pad->pos.x, pad->pos.z,
+        CDTYPE_OBJS | CDTYPE_DOORS | CDTYPE_PATHBLOCKER,
+        fromY + 95.0f, fromY + 25.0f, toY + 95.0f, toY + 25.0f) && start == pad->stan;
+}
+
+static bool campaignPatrolSegment(const PadRecord *from, const PadRecord *to)
+{
+    StandTile *tile = from->stan;
+    if (!campaignPatrolConnected(&from->pos, tile, to, 1000.0f)) return FALSE;
+    for (int quarter = 1; quarter < 4; quarter++) {
+        const f32 t = quarter * .25f;
+        const f32 x = from->pos.x + (to->pos.x - from->pos.x) * t;
+        const f32 z = from->pos.z + (to->pos.z - from->pos.z) * t;
+        tile = from->stan;
+        if (!walkTilesBetweenPoints_NoCallback(&tile, from->pos.x, from->pos.z, x, z)) return FALSE;
+        StandTile *space = tile;
+        if (stanTestVolume(&space, x, z, 28.0f, CDTYPE_OBJS | CDTYPE_DOORS | CDTYPE_PATHBLOCKER,
+                           185.0f, 2.0f) >= 0) return FALSE;
+    }
+    return TRUE;
+}
+
+static void prepareCampaignPatrol(size_t row, int npads)
+{
+    const CampaignEncounter *encounter = &campaignExpansions[row];
+    CampaignPatrolRoute *route = &campaignRoutes[row];
+    int len = 0;
+    for (; len < (int)ARRAYCOUNT(encounter->pads) && encounter->pads[len]; len++) {
+        const u16 index = encounter->pads[len];
+        if (index >= npads || !g_CurrentSetup.pads[index].stan) return;
+        route->ids[len] = index;
+        PadRecord *pad = &route->pads[len];
+        *pad = g_CurrentSetup.pads[index];
+        /* Off-screen native patrol motion uses the marker's full position.
+         * Some ROM markers are up near eye level on an otherwise flat floor. */
+        pad->pos.y = stanGetPositionYValue(pad->stan, pad->pos.x, pad->pos.z) + 1.0f;
+    }
+    if (len < 2 || len < encounter->size) return;
+    route->ids[len] = -1;
+    route->path = (struct patrol_path){route->ids, 0, GEVR_PATROL_DIRECT_PADS, len};
+}
+
+static bool campaignMarksmanSight(const PadRecord *post, const PadRecord *look)
+{
+    StandTile *tile = post->stan;
+    const f32 fromY = stanGetPositionYValue(tile, post->pos.x, post->pos.z) + 150.0f;
+    const f32 toY = stanGetPositionYValue(look->stan, look->pos.x, look->pos.z) + 100.0f;
+    return stanTestLineUnobstructed(&tile, post->pos.x, post->pos.z, look->pos.x, look->pos.z,
+        CDTYPE_OBJS | CDTYPE_DOORS | CDTYPE_PATHBLOCKER | CDTYPE_AIOPAQUE,
+        fromY + 1.0f, fromY - 1.0f, toY + 1.0f, toY - 1.0f) && tile == look->stan;
+}
+
+static void spawnCampaignExpansions(int stage, int npads, bool host)
+{
+    const char *const labels[] = {"idle", "patrol", "marksman"};
+    AIRecord *ai = ailistFindById(GAILIST_STANDARD_GUARD);
+    for (size_t row = 0; ai && row < ARRAYCOUNT(campaignExpansions); row++) {
+        const CampaignEncounter *encounter = &campaignExpansions[row];
+        if (encounter->stage != stage) continue;
+        const bool patrol = encounter->role == ENCOUNTER_PATROL;
+        const bool marksman = encounter->role == ENCOUNTER_MARKSMAN;
+        if (patrol) prepareCampaignPatrol(row, npads);
+        if (!host) continue;
+
+        const struct patrol_path *path = &campaignRoutes[row].path;
+        if (patrol) {
+            int step = 0;
+            for (; step < path->len; step++) {
+                const PadRecord *pad = &g_CurrentSetup.pads[path->data[step]];
+                if (!gevrCampaignSpawnPointClear(pad)) break;
+                if (step && !campaignPatrolSegment(&g_CurrentSetup.pads[path->data[step - 1]], pad)) break;
+            }
+            if (!path->data || step < path->len) {
+                sysLogPrintf(LOG_NOTE, "tactical encounter: stage %d row %u skipped patrol clearance at pad %d",
+                    stage, (unsigned)row, path->data ? path->data[step] : -1);
+                continue;
+            }
+        }
+
+        PropRecord *lead = NULL;
+        int placed = 0;
+        const int candidates = marksman ? 1 : (int)ARRAYCOUNT(encounter->pads);
+        for (int j = 0; j < candidates && placed < encounter->size; j++) {
+            const u16 index = encounter->pads[j];
+            if (!index || index >= npads) continue;
+            const PadRecord *pad = &g_CurrentSetup.pads[index];
+            if (!gevrCampaignOpeningPointClear(pad)) continue;
+            f32 angle = atan2f(pad->look.x, pad->look.z);
+            if (marksman) {
+                const u16 sight = encounter->pads[1];
+                if (!sight || sight >= npads || !g_CurrentSetup.pads[sight].stan) continue;
+                const PadRecord *look = &g_CurrentSetup.pads[sight];
+                if (!campaignMarksmanSight(pad, look)) {
+                    sysLogPrintf(LOG_NOTE, "tactical encounter: stage %d row %u blocked sightline %u to %u",
+                        stage, (unsigned)row, (unsigned)index, (unsigned)sight);
+                    continue;
+                }
+                angle = atan2f(look->pos.x - pad->pos.x, look->pos.z - pad->pos.z);
+            } else if (lead && !patrol) {
+                if (!campaignPatrolConnected(&lead->pos, lead->stan, pad, 800.0f)) continue;
+                angle = atan2f(lead->pos.x - pad->pos.x, lead->pos.z - pad->pos.z);
+            }
+            const int id = CAMPAIGN_EXPANSION_FIRST_ID + (int)row * CAMPAIGN_EXPANSION_STRIDE + placed;
+            PropRecord *actor = gevrSpawnCampaignGuard(encounter->body, pad, angle, ai, id);
+            if (!actor) continue;
+            if (!chrGiveWeapon(actor->chr, encounter->model, encounter->item, 0)) {
+                actor->chr->hidden |= CHRHIDDEN_REMOVE;
+                actor->chr->chrflags |= CHRFLAG_HIDDEN;
+                break;
+            }
+            actor->chr->visionrange = marksman ? 160.0f : 100.0f;
+            if (patrol) set_actor_on_path(actor->chr, &campaignRoutes[row].path);
+            if (!lead) lead = actor;
+            else if (!patrol && placed == 1) setsubroty(lead->chr->model,
+                atan2f(actor->pos.x - lead->pos.x, actor->pos.z - lead->pos.z));
+            placed++;
+            sysLogPrintf(LOG_NOTE, "tactical encounter: stage %d actor %d role %s pad %u at %.0f %.0f %.0f",
+                stage, id, labels[encounter->role], (unsigned)index,
+                (double)actor->pos.x, (double)actor->pos.y, (double)actor->pos.z);
+        }
+        if (placed < encounter->size)
+            sysLogPrintf(LOG_NOTE, "tactical encounter: stage %d row %u skipped %s placement (%d/%u)",
+                stage, (unsigned)row, labels[encounter->role], placed, (unsigned)encounter->size);
+    }
+}
+
+static void spawnCampaignPatrols(int stage, int npads)
+{
+    AIRecord *ai = ailistFindById(GAILIST_STANDARD_GUARD);
+    for (size_t i = 0; ai && i < ARRAYCOUNT(campaignPatrols); i++) {
+        if (campaignPatrols[i].stage != stage) continue;
+        PropRecord *first = NULL;
+        int placed = 0;
+        for (size_t j = 0; j < ARRAYCOUNT(campaignPatrols[i].pads) && placed < campaignPatrols[i].size; j++) {
+            const u16 index = campaignPatrols[i].pads[j];
+            if (index == 0 || index >= npads) continue;
+            const PadRecord *pad = &g_CurrentSetup.pads[index];
+            if (!gevrCampaignOpeningPointClear(pad)) continue;
+            f32 angle = atan2f(pad->look.x, pad->look.z);
+            if (first) {
+                if (!campaignPatrolConnected(&first->pos, first->stan, pad, 800.0f)) continue;
+                angle = atan2f(first->pos.x - pad->pos.x, first->pos.z - pad->pos.z);
+            } else if (campaignPatrols[i].size > 1) {
+                /* Pick a lead only if a second space can actually be reached
+                 * from it. Prefer leaving a blocked optional encounter out. */
+                bool canPair = FALSE;
+                for (size_t k = j + 1; k < ARRAYCOUNT(campaignPatrols[i].pads); k++) {
+                    const int next = campaignPatrols[i].pads[k];
+                    if (!next || next >= npads) continue;
+                    const PadRecord *partner = &g_CurrentSetup.pads[next];
+                    if (campaignPatrolConnected(&pad->pos, pad->stan, partner, 800.0f)
+                        && gevrCampaignOpeningPointClear(partner)) {
+                        canPair = TRUE;
+                        break;
+                    }
+                }
+                if (!canPair) continue;
+            }
+            const int id = CAMPAIGN_PATROL_FIRST_ID + (int)i * CAMPAIGN_PATROL_STRIDE + placed;
+            PropRecord *actor = gevrSpawnCampaignGuard(campaignPatrols[i].body, pad, angle, ai, id);
+            if (!actor) continue;
+            if (!chrGiveWeapon(actor->chr, campaignPatrols[i].model, campaignPatrols[i].item, 0)) {
+                actor->chr->hidden |= CHRHIDDEN_REMOVE;
+                actor->chr->chrflags |= CHRFLAG_HIDDEN;
+                break;
+            }
+            actor->chr->visionrange = 100.0f;
+            if (!first) first = actor;
+            else if (placed == 1) setsubroty(first->chr->model,
+                atan2f(actor->pos.x - first->pos.x, actor->pos.z - first->pos.z));
+            placed++;
+            sysLogPrintf(LOG_NOTE, "tactical patrol: stage %d actor %d pad %u at %.0f %.0f %.0f",
+                stage, id, (unsigned)index, (double)actor->pos.x, (double)actor->pos.y, (double)actor->pos.z);
+        }
+    }
+}
+
+static void spawnSurfaceMarksman(int npads)
+{
+    /* Authored walkable roof above the satellite control building. */
+    static const u16 candidates[] = {292, 293, 294, 295};
+    AIRecord *ai = ailistFindById(GAILIST_SIMPLE_GUARD_DEAF);
+    for (size_t i = 0; ai && i < ARRAYCOUNT(candidates); i++) {
+        const u16 index = candidates[i];
+        if (index >= npads || !g_CurrentSetup.pads[index].stan) continue;
+        const PadRecord *pad = &g_CurrentSetup.pads[index];
+        if (!gevrCampaignOpeningPointClear(pad)) continue;
+        const f32 angle = atan2f(pad->look.x, pad->look.z);
+        PropRecord *actor = gevrSpawnCampaignGuard(BODY_Siberian_Special_Forces, pad, angle, ai,
+                                                  SURFACE_ROOF_MARKSMAN);
+        if (!actor) continue;
+        actor->chr->visionrange = 160.0f;
+        if (chrGiveWeapon(actor->chr, PROP_CHRSNIPERRIFLE, ITEM_SNIPERRIFLE, 0)) {
+            sysLogPrintf(LOG_NOTE, "tactical marksman: stage %d guard %d pad %u at %.0f %.0f %.0f",
+                         LEVELID_SURFACE, SURFACE_ROOF_MARKSMAN, (unsigned)index,
+                         actor->pos.x, actor->pos.y, actor->pos.z);
+        }
+        return;
+    }
+    sysLogPrintf(LOG_NOTE, "tactical marksman: Surface I roof has no clear stand");
+}
+
+void gevrCampaignEncountersStageLoaded(int stage)
+{
+    memset(campaignRoutes, 0, sizeof(campaignRoutes));
+    if (!gevrCampaignExtraGuardCapacity(stage) || !g_CurrentSetup.propDefs || !g_CurrentSetup.pads) return;
+    int npads = 0;
+    while (g_CurrentSetup.pads[npads].plink) npads++;
+    const bool host = !netIsActive() || netIsHost();
+    if (host && stage == LEVELID_JUNGLE) {
+        spawnJunglePatrols(npads);
+    } else if (host) {
+        if (stage == LEVELID_SURFACE) spawnSurfaceMarksman(npads);
+        spawnCampaignSentryPairs(stage, npads);
+        spawnCampaignPatrols(stage, npads);
+    }
+    spawnCampaignExpansions(stage, npads, host);
+}
+#endif
 
 
 /**
@@ -540,6 +1114,22 @@ void weaponAssignToHome(s32 arg0, WeaponObjRecord* weapon, s32 cmdindex)
 
         if (chr && chr->prop && chr->model)
         {
+#ifdef GEVR
+            const bool surfaceMarksman = arg0 == LEVELID_SURFACE2 && tacticalEncountersEnabled()
+                && chr->chrnum == SURFACE2_ROOF_MARKSMAN && chr->bodynum == BODY_Siberian_Special_Forces
+                && !(weapon->flags & (PROPFLAG_IS_DOUBLE | PROPFLAG_WEAPON_LEFTHANDED));
+            if (surfaceMarksman) {
+                /* Reuse the authored rooftop guard and its patrol script. */
+                weapon->weaponnum = ITEM_SNIPERRIFLE;
+                weapon->obj = PROP_CHRSNIPERRIFLE;
+            }
+            /* The two final-car guards have a pair of Uzis in the setup.
+             * A Tactical kit gives each one rifle, with an optional editor build. */
+            if ((weapon->flags & PROPFLAG_IS_DOUBLE) && gevrTrainGuardSingleWeapon(chr)) {
+                if (weapon->flags & PROPFLAG_WEAPON_LEFTHANDED) return;
+                weapon->flags &= ~PROPFLAG_IS_DOUBLE;
+            }
+#endif
             if (cheatIsActive(CHEAT_ENEMY_ROCKETS))
             {
                 switch ((s8)GEVR_ITEM_AS(weapon->weaponnum))
@@ -578,6 +1168,13 @@ void weaponAssignToHome(s32 arg0, WeaponObjRecord* weapon, s32 cmdindex)
 
             weaponLoadProjectileModels((s8)weapon->weaponnum);
             sub_GAME_7F052030(weapon, chr);
+#ifdef GEVR
+            if (surfaceMarksman && chr->weapons_held[GUNRIGHT]
+                && chr->weapons_held[GUNRIGHT]->weapon->weaponnum == ITEM_SNIPERRIFLE) {
+                sysLogPrintf(LOG_NOTE, "tactical marksman: stage %d guard %d pad %u at %.0f %.0f %.0f",
+                             arg0, chr->chrnum, 283u, chr->prop->pos.x, chr->prop->pos.y, chr->prop->pos.z);
+            }
+#endif
         }
         #ifdef DEBUG
         else
@@ -653,6 +1250,20 @@ void setupHat(s32 arg0, ObjectRecord* hat, s32 cmdindex)
     if (hat->flags & PROPFLAG_ASSIGNEDTOCHR) {
         ChrRecord* chr = chrFindByLiteralId(hat->pad);
         if (chr && chr->prop && chr->model) {
+#ifdef GEVR
+            const int helmet = gevrCampaignGuardHelmet(chr);
+            if (helmet == GEVR_LOADOUT_NO_HELMET) return;
+            if (helmet >= 0 && gevrTacticalHelmetAvailable(helmet)) {
+                hat->obj = helmet == GEVR_HELMET_ALTYN ? PROP_TACTICAL_ALTYN : PROP_HATHELMET;
+            } else if (gevrTacticalFacilityArmor() && gevrTacticalFacilityVest(chr->chrnum)) {
+                if (chr->chrnum == GEVR_FACILITY_CORRIDOR_CENTER && sysArgCheck("--tactical-heavy-guards")
+                    && gevrTacticalHelmetAvailable(GEVR_HELMET_ALTYN)) {
+                    hat->obj = PROP_TACTICAL_ALTYN;
+                } else if (gevrTacticalHelmetAvailable(GEVR_HELMET_SSH68)) {
+                    hat->obj = PROP_HATHELMET;
+                }
+            }
+#endif
             hatAssignToChr(hat, chr);
         }
         #ifdef DEBUG
@@ -1291,6 +1902,10 @@ void setupDoor(s32 arg0, struct DoorRecord *door, s32 arg2)
 void proplvreset2(enum LEVELID stageId)
 {
 #ifdef GEVR
+    gevrCampaignLoadoutsReset(stageId);
+    gevrTacticalReinforcementsReset(stageId);
+#endif
+#ifdef GEVR
     gevrAmmoResetSpawns();
     { extern void gevrTpStageReset(void); gevrTpStageReset(); }   /* gevr_thirdperson.c */
     { extern void gevrGhostStageReset(s32 stage); gevrGhostStageReset(stageId); }   /* gevr_ghost.c */
@@ -1527,14 +2142,28 @@ void proplvreset2(enum LEVELID stageId)
 #ifdef GEVR
         gevrArenaPrepareSetup(stageId);
         gevrHordePrepareSetup();
+        if (gevrTacticalRangeActive()) {
+            g_CurrentSetup.propDefs = NULL;
+            /* Runway's background AI can spawn reinforcements without any placed guards. */
+            g_CurrentSetup.ailists = NULL;
+            numAnimatedObjects += GEVR_RANGE_TARGETS * 2;
+            numObjects += 24;
+        }
 #endif
         // PD rejoins here
 
         if (withchrs)
         {
-            alloc_init_GUARDdata_entries(load_proptype(PROPDEF_GUARD));
-            numAnimatedObjects += load_proptype(PROPDEF_GUARD);
-            numObjects += load_proptype(PROPDEF_COLLECTABLE);
+            s32 guards = load_proptype(PROPDEF_GUARD);
+            s32 guardObjects = 0;
+#ifdef GEVR
+            const int extras = gevrCampaignExtraGuardCapacity(stageId);
+            guards += extras;
+            guardObjects = extras * 2; /* rifle and optional helmet */
+#endif
+            alloc_init_GUARDdata_entries(guards);
+            numAnimatedObjects += guards;
+            numObjects += load_proptype(PROPDEF_COLLECTABLE) + guardObjects;
             numObjects += load_proptype(PROPDEF_KEY);
             numObjects += load_proptype(PROPDEF_HAT);
         }
@@ -1574,7 +2203,13 @@ void proplvreset2(enum LEVELID stageId)
             numObjects += HORDE_GUARD_SLOTS * 2 + HORDE_AMMO_DROPS + 7;
         }
 #endif
-        modelmgrAllocateModelSlots(numObjects);
+        s32 spareModels = weaponGetSlotCapacity();
+        if (spareModels > BASE_WEAPON_SLOTS) {
+            /* Weapon creation can need a model before it recycles an old
+             * weapon. Keep the general-purpose model reserve available. */
+            spareModels += BASE_WEAPON_SLOTS;
+        }
+        modelmgrAllocateModelSlots(numObjects, spareModels);
         modelmgrAllocateAnimModelSlots(numAnimatedObjects);
 
         for (i8 = 0; i8 < getPlayerCount(); i8++)
@@ -1673,7 +2308,20 @@ void proplvreset2(enum LEVELID stageId)
                     case PROPDEF_COLLECTABLE:
                         if (withchrs && (!(((struct WeaponObjRecord *) phead)->flags2 & flags)))
                         {
-                            weaponAssignToHome(stageId, (struct WeaponObjRecord *) phead, pdefIndex);
+                            WeaponObjRecord *weapon = (WeaponObjRecord *)phead;
+#ifdef GEVR
+                            /* These two campaign pickups come with 40 mm supply
+                             * crates. Give them the existing physical M32. */
+                            if (!gevrMpRules() && sysArgCheck("--tactical-physical")
+                                && (stageId == LEVELID_SURFACE || stageId == LEVELID_STREETS)
+                                && weapon->weaponnum == ITEM_GRENADELAUNCH
+                                && !(weapon->flags & PROPFLAG_ASSIGNEDTOCHR)
+                                && gevrTacticalExpandedEnabled()) {
+                                weapon->weaponnum = ITEM_TACTICAL_M32A1;
+                                weapon->obj = PROP_TACTICAL_M32A1;
+                            }
+#endif
+                            weaponAssignToHome(stageId, weapon, pdefIndex);
                         }
                         break;
                     case PROPDEF_KEY:
@@ -2165,6 +2813,7 @@ void proplvreset2(enum LEVELID stageId)
             }
         }
 #ifdef GEVR
+        for (int i = 0; i < g_NumChrSlots; ++i) gevrCampaignFinishGuard(&g_ChrSlots[i], TRUE);
         gevrDamBoatPrepare(stageId);
 #endif
     }
@@ -2181,7 +2830,7 @@ void proplvreset2(enum LEVELID stageId)
         g_CurrentSetup.padnames = NULL;
         g_CurrentSetup.boundpadnames = NULL;
         alloc_init_GUARDdata_entries(0);
-        modelmgrAllocateModelSlots(0);
+        modelmgrAllocateModelSlots(0, BASE_WEAPON_SLOTS);
         modelmgrAllocateAnimModelSlots(0);
     }
 

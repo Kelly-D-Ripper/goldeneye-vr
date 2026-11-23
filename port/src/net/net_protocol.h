@@ -11,6 +11,7 @@
 #include "net_match.h"
 #include "gevr_avatar_math.h"
 #include "gevr_pull.h"
+#include "gevr_guard_cover.h"
 
 #define GEVR_NET_MAGIC           0x47455652  /* "GEVR" */
 #define GEVR_NET_VERSION         27  /* 27: the Community Edition's fixes to GoldenEye's own stage setups and tiles (gevr_romswap.c gevrRomFixData), which change what peers load; 26: force pull, catch and disarm (NET_MSG_FORCE_PULL); 25: Horde briefcase powers and consumable buys; 24: all gameplay maps in Horde and Deathmatch (older peers reject the expanded stage set); 23: bounded Horde ammo drops and pickup grants, the Horde map, starting wave and two-gun lists; 22: Horde and guard generations, tracked head/both wrists and torso yaw for multiplayer IK, the synchronized PvE companion (all peers must update); 21: host movement speed; 20: v0.4.14, the hit immunity rule's bits (NET_FUN_HIT_IMMUNITY, NET_FUN_HIT_EVERY), which v0.4.11-v0.4.13 refuse, and soft collision; 19: the No radar match rule (NET_FUN_NO_RADAR), which v0.4.11 rejects, and bots (the match config's bot fields, the lobby slot's is_bot); 18: v0.4.6, a match config may name Statue (22) and Cradle (41), which v0.4.5 rejects; 17: v0.4.0, the released form of 16 (16 named only unreleased test builds, whose packet layout changed under it); 16: eight player slots and the host's player count; co-op mode (mode, difficulty in the match config; guard, mission, menu and revive messages); 15: clock synchronization, timestamped shots, epoch/life IDs; 14: next-round fun settings; 13: team voice routing; 12: friendly fire and authoritative ammo transforms; 11: voice modes, pending/active teams, elimination, ping; 10: the owner's health, armour and death in PLAYER_STATE; 9: the match config, spectators, loadouts, the left hand; 8: votes, host migration; 7: gun aim, projectile/explosion/object events */
@@ -39,6 +40,8 @@ enum {
 #define UCMD_AIMVALID       (1 << 9)    /* aimorigin/aimdir hold the right gun's barrel */
 #define UCMD_FIRE_LEFT      (1 << 10)   /* the left gun's trigger (dual wielding) */
 #define UCMD_AIMVALID_LEFT  (1 << 11)   /* aimorigin_l/aimdir_l hold the left gun's barrel */
+#define UCMD_SUPPRESSED_RIGHT (1 << 12)
+#define UCMD_SUPPRESSED_LEFT  (1 << 13)
 
 /* Packet Opcodes */
 typedef enum {
@@ -120,6 +123,12 @@ typedef enum {
     NET_MSG_COOP_POKES = 61,    /* Host -> all: its level scripts' writes to the hack's memory, and the objectives' show/hide (gevr_footsteps.c) */
     /* Additive, no bump: an older build ignores the type and shows no device. */
     NET_MSG_PLATFORMS = 62,     /* Host -> all: u8 n, then n x u8 NET_PLATFORM_* by slot (the roster's "Device" column) */
+    NET_MSG_TACTICAL_LAYOUT = 80, /* Tactical co-op: ordered attachment choices for each held or stowed weapon. */
+    NET_MSG_TACTICAL_LOOT = 83, /* Tactical co-op: shared physical loot. */
+    NET_MSG_TACTICAL_GUARD = 82, /* Tactical co-op: the host’s fitted guard weapons. */
+    NET_MSG_TACTICAL_VISUAL = 81, /* Tactical co-op: magazine, mechanism and accessory state for that layout. */
+    NET_MSG_TACTICAL_KIT_READY = 84, /* Guest has locked their local mission kit. */
+    NET_MSG_TACTICAL_GORE = 85, /* Host's hit effects and final guard death state. */
 } NetMsgType;
 
 #define NET_DISCONNECT_KICKED 0x47454b49u
@@ -182,6 +191,7 @@ enum {
     NET_CHR_FLIP = 8,           /* the animation is mirrored (model gunhand) */
     NET_CHR_NO_TRANSLATE = 16,  /* CHRFLAG_IGNORE_ANIM_TRANSLATION */
     NET_CHR_INVINCIBLE = 32,    /* CHRFLAG_INVINCIBLE */
+    NET_CHR_COVER = 64,         /* Tactical campaign: optional cover pose */
 };
 enum {
     NET_COOP_EVENT_ROOM = 1,    /* s32 room: entered */
@@ -203,6 +213,7 @@ enum {
 #define NET_COOP_TANK_BYTES 25  /* u8 flags, f32 x y z, hull yaw, turret yaw, turret pitch */
 #define NET_CHR_NO_ANIM 0xFFFF
 #define NET_CHR_STATE_BYTES 52
+#define NET_CHR_COVER_BYTES 3
 #define NET_CHR_STATES_PER_PACKET 20
 typedef struct {
     u16 slot;
@@ -219,6 +230,8 @@ typedef struct {
     u8 weapon[2];               /* the held guns' ITEM_IDS, 0 none */
     u8 fade;                    /* fadealpha */
     u8 damage;                  /* damage / maxdamage, x 100 (0 unhurt .. 100 dead) */
+    u8 coverPose;
+    s8 coverOffset[2];          /* world X/Z from this guard's feet */
 } NetChrState;
 static inline void netbufWriteChrState(struct netbuf *b, const NetChrState *c) {
     netbufWriteU16(b,c->slot);netbufWriteU64(b,c->generation);netbufWriteU8(b,c->flags);netbufWriteU8(b,c->actiontype);
@@ -227,6 +240,11 @@ static inline void netbufWriteChrState(struct netbuf *b, const NetChrState *c) {
     netbufWriteF32(b,c->frame);netbufWriteF32(b,c->speed);
     for(int i=0;i<4;i++)netbufWriteS16(b,c->aim[i]);
     netbufWriteU8(b,c->weapon[0]);netbufWriteU8(b,c->weapon[1]);netbufWriteU8(b,c->fade);netbufWriteU8(b,c->damage);
+    if (c->flags & NET_CHR_COVER) {
+        netbufWriteU8(b, c->coverPose);
+        netbufWriteS8(b, c->coverOffset[0]);
+        netbufWriteS8(b, c->coverOffset[1]);
+    }
 }
 static inline int netbufReadChrState(struct netbuf *b, NetChrState *c) {
     c->slot=netbufReadU16(b);c->generation=netbufReadU64(b);c->flags=netbufReadU8(b);c->actiontype=netbufReadU8(b);
@@ -235,6 +253,18 @@ static inline int netbufReadChrState(struct netbuf *b, NetChrState *c) {
     c->frame=netbufReadF32(b);c->speed=netbufReadF32(b);
     for(int i=0;i<4;i++)c->aim[i]=netbufReadS16(b);
     c->weapon[0]=netbufReadU8(b);c->weapon[1]=netbufReadU8(b);c->fade=netbufReadU8(b);c->damage=netbufReadU8(b);
+    c->coverPose = GEVR_GUARD_COVER_NONE;
+    c->coverOffset[0] = c->coverOffset[1] = 0;
+    if (c->flags & NET_CHR_COVER) {
+        c->coverPose = netbufReadU8(b);
+        c->coverOffset[0] = netbufReadS8(b);
+        c->coverOffset[1] = netbufReadS8(b);
+        const int x = c->coverOffset[0], z = c->coverOffset[1];
+        const int limit = GEVR_GUARD_COVER_MAX_OFFSET + 1; /* rounding to signed world units */
+        if (c->coverPose == GEVR_GUARD_COVER_NONE || c->coverPose > GEVR_GUARD_COVER_BLIND_RIGHT
+            || x * x + z * z > limit * limit
+            || (c->coverPose == GEVR_GUARD_COVER_DUCK && (x || z))) return 0;
+    }
     return !b->error && isfinite(c->pos.x) && isfinite(c->pos.y) && isfinite(c->pos.z) && fabsf(c->pos.x) < 1.0e6f &&
         fabsf(c->pos.y) < 1.0e6f && fabsf(c->pos.z) < 1.0e6f && isfinite(c->ground) && fabsf(c->ground) < 1.0e6f &&
         isfinite(c->frame) && fabsf(c->frame) < 1.0e5f && isfinite(c->speed) && fabsf(c->speed) < 100.0f &&
@@ -497,14 +527,14 @@ struct netplayermove {
     f32 movespeed[2];   /* [0]: forward (-1..1), [1]: strafe (-1..1) */
     f32 angles[2];      /* [0]: theta (yaw), [1]: verta (pitch) */
     f32 crosspos[2];    /* crosshair pos */
-    s8  weaponnum;      /* equipped weapon ITEM_* */
+    u8  weaponnum;      /* equipped weapon ITEM_* */
     s8  crouchpos;      /* 0: stand, 1: crouch */
     coord3d pos;        /* world position */
     coord3d handpos;    /* 6DoF hand aim position in world/view */
     coord3d handrot;    /* 6DoF hand aim rotation (pitch, yaw, roll) */
     coord3d aimorigin;  /* right gun's muzzle, world space (UCMD_AIMVALID) */
     coord3d aimdir;     /* right gun's barrel direction, world space, unit length */
-    s8  weaponnum_left; /* the left hand's ITEM_*, ITEM_UNARMED when empty (dual wielding) */
+    u8  weaponnum_left; /* the left hand's ITEM_*, ITEM_UNARMED when empty (dual wielding) */
     coord3d aimorigin_l;/* left gun's muzzle (UCMD_AIMVALID_LEFT) */
     coord3d aimdir_l;   /* left gun's barrel direction */
     /*
@@ -532,14 +562,14 @@ static inline u32 netbufWritePlayerMove(struct netbuf *buf, const struct netplay
     netbufWriteF32(buf, m->angles[1]);
     netbufWriteF32(buf, m->crosspos[0]);
     netbufWriteF32(buf, m->crosspos[1]);
-    netbufWriteS8(buf, m->weaponnum);
+    netbufWriteU8(buf, m->weaponnum);
     netbufWriteS8(buf, m->crouchpos);
     netbufWriteCoord(buf, &m->pos);
     netbufWriteCoord(buf, &m->handpos);
     netbufWriteCoord(buf, &m->handrot);
     netbufWriteCoord(buf, &m->aimorigin);
     netbufWriteCoord(buf, &m->aimdir);
-    netbufWriteS8(buf, m->weaponnum_left);
+    netbufWriteU8(buf, m->weaponnum_left);
     netbufWriteCoord(buf, &m->aimorigin_l);
     netbufWriteCoord(buf, &m->aimdir_l);
     netbufWriteF32(buf, m->health);
@@ -565,14 +595,14 @@ static inline u32 netbufReadPlayerMove(struct netbuf *buf, struct netplayermove 
     m->angles[1] = netbufReadF32(buf);
     m->crosspos[0] = netbufReadF32(buf);
     m->crosspos[1] = netbufReadF32(buf);
-    m->weaponnum = netbufReadS8(buf);
+    m->weaponnum = netbufReadU8(buf);
     m->crouchpos = netbufReadS8(buf);
     netbufReadCoord(buf, &m->pos);
     netbufReadCoord(buf, &m->handpos);
     netbufReadCoord(buf, &m->handrot);
     netbufReadCoord(buf, &m->aimorigin);
     netbufReadCoord(buf, &m->aimdir);
-    m->weaponnum_left = netbufReadS8(buf);
+    m->weaponnum_left = netbufReadU8(buf);
     netbufReadCoord(buf, &m->aimorigin_l);
     netbufReadCoord(buf, &m->aimdir_l);
     m->health = netbufReadF32(buf);

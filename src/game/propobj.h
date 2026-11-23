@@ -68,6 +68,7 @@ extern ExplosionDetailsRecord *object_explosion_details;
 void                 sub_GAME_7F04F218(struct PropRecord *arg0, s32 arg1);
 
 void                 objFreePermanently(struct ObjectRecord *obj, bool freeprop);
+s32                  weaponGetSlotCapacity(void);
 
 void                 chrobjApplySpeed(f32 *openPosition, f32 maxFrac, f32 *speedPtr, f32 accel, f32 decel, f32 maxSpeed);
 void                 chrobjCallsApplySpeed(f32 *openPosition, f32 maxFrac, f32 *speedPtr, f32 accel, f32 decel, f32 maxSpeed);
@@ -86,6 +87,10 @@ void                 chrobjMaybeDetonateObjectIfFlags(ObjectRecord *arg0, f32 ar
 void                 sub_GAME_7F03FDA8(PropRecord *);
 void                 projectileSetSticky(PropRecord *);
 void                 chrobjCollisionRelated(ObjectRecord *);
+#ifdef GEVR
+f32 gevrTacticalSurfaceY(const coord3d *pos, f32 ceiling, f32 floor, const PropRecord *ignore);
+PropRecord *gevrGiveReplicatedGuardWeapon(ChrRecord *chr, s32 model, ITEM_IDS item, s32 flags);
+#endif
 void                 objChangeShading(ObjectRecord *, coord3d *, Mtxf *, StandTile *);
 s32                  projectileTestPropBoundingSphere(coord3d *arg0, coord3d *arg1, coord3d *arg2, f32 arg3);
 void                 sub_GAME_7F04F244(PropRecord *arg0, struct rect4f **arg1, s32 *arg2, f32 *arg3, f32 *arg4);
@@ -160,6 +165,9 @@ HATTYPE              get_hat_model(PropRecord *prop);
 s32                  objDrop(PropRecord *prop);
 void                 sub_GAME_7F050DE8(Model* model);
 PropRecord          *something_with_generating_object(ChrRecord *self, s32 propid, ITEM_IDS itemid, s32 flags, WeaponObjRecord *weapon, ItemModelFileRecord *prop_header);
+#ifdef GEVR
+PropRecord          *gevrCloneGuardWeapon(ChrRecord *clone, const PropRecord *source, s32 flags);
+#endif
 Gfx                 *countdownTimerRender(Gfx *DL);
 
 void chrobjSndCreatePostEventDamage(ALSoundState *state, coord3d *pos);

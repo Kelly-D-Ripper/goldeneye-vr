@@ -1,6 +1,12 @@
 #ifdef GEVR
 #include "system.h"
 #include "gevr_romlayout.h"
+#include "gevr_tactical_gear.h"
+#include "gevr_tactical_stats.h"
+#include "gevr_tactical_loadouts.h"
+#include "gevr_tactical_mesh.h"
+#include "gevr_tactical_range.h"
+#include "gevr_tactical_session.h"
 #endif
 #include <os_extension.h>
 #include <assets/oddtextures.h>
@@ -484,6 +490,9 @@ static void gevrLevelJumpProbe(void)
     };
     static u32 tick;
     const char *path = "/sdcard/Android/data/com.gevr.port/files/gevr_level.txt";
+#ifdef _WIN32
+    if (sysArgCheck("--input-script")) path = "gevr_level.txt";
+#endif
     char word[32] = {0};
     s32 level = LEVELID_NONE, diff = DIFFICULTY_AGENT, entry, i, cuba = 0;
     FILE *fp;
@@ -1518,7 +1527,7 @@ Gfx *frontDrawCursor(Gfx *DL)
 // TABS
 //********************************************************************************************************
 
-Gfx* frontAddStartTabText(Gfx* DL)
+static Gfx *frontAddStartTabLabel(Gfx *DL, u8 *label)
 {
     s32 v;
     s32 h;
@@ -1526,7 +1535,7 @@ Gfx* frontAddStartTabText(Gfx* DL)
     s32 textWidth;
     s32 textHeight;
 
-    g_textPtrTAB1 = langGet(getStringID(LTITLE, TITLE_STR_04_START));
+    g_textPtrTAB1 = label;
     setTextSpacingInverted(TRUE);
     textHeight = 0;
     textWidth = 0;
@@ -1549,6 +1558,11 @@ Gfx* frontAddStartTabText(Gfx* DL)
     return DL;
 }
 
+
+Gfx *frontAddStartTabText(Gfx *DL)
+{
+    return frontAddStartTabLabel(DL, langGet(getStringID(LTITLE, TITLE_STR_04_START)));
+}
 
 s32 frontCheckCursorOnStartTab(void)
 {
@@ -3084,6 +3098,18 @@ Gfx *constructor_menu05_fileselect(Gfx *DL)
 //********************************************************************************************************
 //MODE SELECT
 //********************************************************************************************************
+#ifdef GEVR
+static int gearWorkshopOpen(void);
+static void gearOpen(int workshop);
+static void gearInterface(void);
+static Gfx *gearDraw(Gfx *g);
+static void gearRestoreRange(void);
+
+static int frontWorkshopAvailable(void)
+{
+    return gevrTacticalGearEnabled() && !gevrRomIsVariant();
+}
+#endif
 void init_menu06_modeselect(void)
 {
 #ifdef GEVR_FLAT
@@ -3096,6 +3122,10 @@ void init_menu06_modeselect(void)
     tab_prev_selected = FALSE;
     load_walletbond();
     fileUpdateBondInCurrentFolder();
+#ifdef GEVR
+    if (gevrCoopTacticalKitGuest()) gearOpen(FALSE);
+    else gearRestoreRange();
+#endif
 }
 
 
@@ -3108,6 +3138,12 @@ void update_menu06_modesel(void)
 void interface_menu06_modesel(void)
 {
     u32 i;
+#ifdef GEVR
+    if (gevrCoopTacticalKitGuest() || gearWorkshopOpen()) { gearInterface(); return; }
+    const int workshop = frontWorkshopAvailable();
+#else
+    const int workshop = FALSE;
+#endif
 
     is_cheat_menu_available = FALSE;
     for (i=CHEAT_EXTRA_MP_CHARS; i != CHEAT_INVALID; i++)
@@ -3145,7 +3181,7 @@ void interface_menu06_modesel(void)
             sndPlaySfx(g_musicSfxBufferPtr, DOOR_METAL_CLOSE2_SFX, 0);
         }
     }
-    else if ((is_cheat_menu_available) && (275.0f <= cursor_v_pos))
+    else if (is_cheat_menu_available && cursor_v_pos >= (workshop ? 303.f : 275.f))
     {
         mission_difficulty_highlighted = DIFFICULTY_00;
         if (joyGetButtonsPressedThisFrame(PLAYER_1, START_BUTTON|Z_TRIG|A_BUTTON))
@@ -3154,6 +3190,18 @@ void interface_menu06_modesel(void)
             sndPlaySfx(g_musicSfxBufferPtr, DOOR_METAL_CLOSE_SFX, 0);
         }
     }
+#ifdef GEVR
+    else if (workshop && cursor_v_pos >= 275.f)
+    {
+        mission_difficulty_highlighted = DIFFICULTY_007;
+        if (joyGetButtonsPressedThisFrame(PLAYER_1, START_BUTTON | Z_TRIG | A_BUTTON))
+        {
+            gearOpen(TRUE);
+            sndPlaySfx(g_musicSfxBufferPtr, DOOR_METAL_CLOSE2_SFX, NULL);
+            return;
+        }
+    }
+#endif
     else if ((243.0f <= cursor_v_pos) && GEVR_MP_SELECTABLE())
     {
         mission_difficulty_highlighted = DIFFICULTY_SECRET;
@@ -3329,6 +3377,12 @@ void setCursorPOSforMode(int mode)
 
 Gfx* constructor_menu06_modesel(Gfx* DL)
 {
+#ifdef GEVR
+    if (gevrCoopTacticalKitGuest() || gearWorkshopOpen()) return gearDraw(DL);
+    const int workshop = frontWorkshopAvailable();
+#else
+    const int workshop = FALSE;
+#endif
     char *textstring;
     s32 x;
     s32 y;
@@ -3386,20 +3440,36 @@ Gfx* constructor_menu06_modesel(Gfx* DL)
     }
     DL = frontPrintText(DL, &x, &y, textstring, ptrFontZurichBoldChars, ptrFontZurichBold, text_color, viGetX(), viGetY(), 0, 0);
 
-    if (is_cheat_menu_available != 0)
+    if (workshop)
     {
         x = 0x96;
         y = 0x11C;
         DL = frontPrintText(DL, &x, &y, "3.\n", ptrFontZurichBoldChars, ptrFontZurichBold, 0xFF, viGetX(), viGetY(), 0, 0);
+        textstring = "WORKSHOP\n";
+        textMeasure(&x2, &y2, textstring, ptrFontZurichBoldChars, ptrFontZurichBold, 0);
+        if (mission_difficulty_highlighted == DIFFICULTY_007)
+            DL = microcode_constructor_related_to_menus(DL, 0x94, 0x11A, y2 + 0xAF, 0x12A, 0x32);
+        x = 0xAA;
+        y = 0x11C;
+        DL = frontPrintText(DL, &x, &y, textstring, ptrFontZurichBoldChars, ptrFontZurichBold, 0xFF, viGetX(), viGetY(), 0, 0);
+    }
+
+    if (is_cheat_menu_available != 0)
+    {
+        const s32 row = workshop ? 0x136 : 0x11C;
+        x = 0x96;
+        y = row;
+        DL = frontPrintText(DL, &x, &y, workshop ? "4.\n" : "3.\n",
+            ptrFontZurichBoldChars, ptrFontZurichBold, 0xFF, viGetX(), viGetY(), 0, 0);
         textstring = langGet(getStringID(LTITLE, TITLE_STR_31_CHEATOPTIONS));
 
         textMeasure(&x2, &y2, textstring, ptrFontZurichBoldChars, ptrFontZurichBold, 0);
 
         x = 0xAA;
-        y = 0x11C;
+        y = row;
         if (mission_difficulty_highlighted == 2)
         {
-            DL = microcode_constructor_related_to_menus(DL, 0x94, 0x11A, y2 + 0xAF, 0x12A, 0x32);
+            DL = microcode_constructor_related_to_menus(DL, 0x94, row - 2, y2 + 0xAF, row + 14, 0x32);
         }
         DL = frontPrintText(DL, &x, &y, textstring, ptrFontZurichBoldChars, ptrFontZurichBold, 0xFF, viGetX(), viGetY(), 0, 0);
     }
@@ -3458,17 +3528,10 @@ s32 get_highest_unlocked_difficulty_for_level(s32 arg0)
 
         for (difficulty=num; difficulty >= 0; difficulty--)
         {
-#ifdef GEVR
-            extern int VrUnlockAll;
-#endif
             temp_v0 = fileIsStageUnlockedAtDifficulty(selected_folder_num, arg0, difficulty);
-            /*
-             * With a cheat on, the game offers only completed stages. Unlock
-             * all (issue #54) opens every stage without writing completions
-             * into the save, so it offers the unlocked ones too.
-             */
+            /* A testing launch also offers unlocked stages when a cheat is on. */
 #ifdef GEVR
-            if (g_AppendCheatSinglePlayer == 0 || VrUnlockAll)
+            if (g_AppendCheatSinglePlayer == 0 || get_debug_enable_all_levels_flag())
 #else
             if (g_AppendCheatSinglePlayer == 0)
 #endif
@@ -7110,8 +7173,21 @@ void load_briefing_text_for_stage(void)
 //********************************************************************************************************
 //BRIEFING SCREEN
 //********************************************************************************************************
+#ifdef GEVR
+#include "gevr_tactical_gear_menu.inc.h"
+
+static int frontBriefingHasGear(void)
+{
+    return gamemode == GAMEMODE_SOLO && !gevrRomIsVariant() && gevrTacticalGearEnabled()
+        && gevrTacticalMissionAllowsStartingKit(gevrBriefingLevel());
+}
+#endif
+
 void init_menu0A_briefing(void)
 {
+#ifdef GEVR
+    gear.page = 0;
+#endif
     tab_next_selected = 0;
     tab_prev_selected = 0;
     final_menu_briefing_page = 5;
@@ -7145,6 +7221,12 @@ void interface_menu0A_briefing(void)
     viSetAspect(ASPECT_RATIO_SD);
     viSetZRange(100.0f, 10000.0f);
     viSetUseZBuf(FALSE);
+#ifdef GEVR
+    if (gear.page && frontBriefingHasGear()) {
+        gearInterface();
+        return;
+    }
+#endif
     tab_prev_highlight = FALSE;
     tab_next_highlight = FALSE;
     tab_start_highlight = FALSE;
@@ -7218,6 +7300,19 @@ void interface_menu0A_briefing(void)
     frontUpdateControlStickPosition();
     if (tab_next_selected)
     {
+#ifdef GEVR
+        if (frontBriefingHasGear()) {
+            tab_next_selected = FALSE;
+            gearOpen(FALSE);
+            return;
+        }
+        int guests;
+        const int ready = gevrCoopTacticalKitCount(&guests);
+        if (ready != guests) {
+            tab_next_selected = FALSE;
+            return;
+        }
+#endif
         frontChangeMenu(MENU_RUN_STAGE, TRUE);
         return;
     }
@@ -7335,6 +7430,9 @@ Gfx *constructor_menu0A_briefing(Gfx *DL)
     s32 spC04;
     struct MatchHack_front_rodata_3000 sp4C;
 
+#ifdef GEVR
+    if (gear.page && frontBriefingHasGear()) return gearDraw(DL);
+#endif
     DL = viSetFillColor(DL,0,0,0);
     DL = viFillScreen(DL);
 #ifdef VERSION_EU
@@ -7410,7 +7508,21 @@ Gfx *constructor_menu0A_briefing(Gfx *DL)
         setTextOverlapCorrection(-1);
     }
 
+#ifdef GEVR
+    if (frontBriefingHasGear()) {
+        DL = frontAddStartTabLabel(DL, (u8 *)"SELECT GEAR\n");
+    } else {
+        int guests;
+        const int ready = gevrCoopTacticalKitCount(&guests);
+        if (ready < guests) {
+            char label[24];
+            snprintf(label, sizeof(label), "TEAM %d/%d READY\n", ready, guests);
+            DL = frontAddStartTabLabel(DL, (u8 *)label);
+        } else DL = frontAddStartTabText(DL);
+    }
+#else
     DL = frontAddStartTabText(DL);
+#endif
     DL = frontAddPreviousTabText(DL);
 
     if (current_menu_briefing_page < BRIEFING_MONEYPENNY)

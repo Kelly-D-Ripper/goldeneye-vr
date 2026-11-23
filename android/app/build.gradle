@@ -19,6 +19,7 @@ if (rootProject.file("local.properties").exists()) localProperties.load(new File
 def discordSdk = file(localProperties.getProperty("gevr.discordSdk", "${rootProject.projectDir}/../build/discord/discord_partner_sdk.aar"))
 def withDiscord = discordSdk.exists()
 logger.lifecycle("Discord Social SDK: " + (withDiscord ? discordSdk : "not found, building without Discord"))
+def tacticalAssets = providers.gradleProperty("gevrTacticalAssets").orNull
 
 android {
     namespace 'com.gevr.port'
@@ -30,6 +31,8 @@ android {
         targetSdk 34
         versionCode 135
         versionName "0.5.22"
+        manifestPlaceholders = [gevrJoinScheme: "goldeneyevr"]
+        buildConfigField 'boolean', 'TACTICAL', 'false'
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
@@ -77,7 +80,7 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-            if (keystorePropertiesFile.exists()) {
+            if (keystorePropertiesFile.exists() && tacticalAssets == null) {
                 signingConfig signingConfigs.release
             }
             ndk { debugSymbolLevel 'SYMBOL_TABLE' }
@@ -102,6 +105,25 @@ android {
     productFlavors {
         quest {
             dimension 'device'
+        }
+        tactical {
+            dimension 'device'
+            applicationId 'com.gevr.tactical'
+            versionCode 17
+            versionName '0.16-test'
+            manifestPlaceholders = [gevrJoinScheme: "gevrtactical"]
+            buildConfigField 'boolean', 'TACTICAL', 'true'
+            externalNativeBuild {
+                cmake {
+                    arguments "-DGEVR_TACTICAL_QUEST=ON", "-DGEVR_DISCORD=OFF"
+                    def cachedDeps = providers.gradleProperty("gevrTacticalDependencyCache").orNull
+                    if (cachedDeps) {
+                        for (def dependency in ['opus', 'joltphysics']) {
+                            arguments "-DFETCHCONTENT_SOURCE_DIR_${dependency.toUpperCase(java.util.Locale.ROOT)}=${cachedDeps}/${dependency}"
+                        }
+                    }
+                }
+            }
         }
         mobile {
             dimension 'device'
@@ -149,6 +171,21 @@ android {
         }
         quest {
             jniLibs.srcDirs = ['../../OpenXR/Libs/Android']   // Meta's OpenXR loader: the Quest's only
+        }
+        tactical {
+            jniLibs.srcDirs = ['../../OpenXR/Libs/Android']
+            if (tacticalAssets != null) assets.srcDir(file(tacticalAssets))
+        }
+    }
+}
+
+tasks.configureEach { task ->
+    if (task.name == "preTacticalReleaseBuild" || task.name == "preTacticalDebugBuild") {
+        task.doFirst {
+            if (tacticalAssets == null || !file("$tacticalAssets/tactical-launch.args").isFile()
+                    || !file("$tacticalAssets/mods/tactical/gear/catalog.txt").isFile()) {
+                throw new GradleException("Set -PgevrTacticalAssets to the staged Tactical release assets.")
+            }
         }
     }
 }

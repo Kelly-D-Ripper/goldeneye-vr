@@ -8,6 +8,7 @@
 #include "net_voice.h"
 #include "net_core.h"
 #include <string.h>
+#include <stdlib.h>
 
 static SDL_AudioDeviceID dev;
 static const s16 *nextBuf;
@@ -17,6 +18,7 @@ static s32 bufferSize = 512;
 static s32 queueLimit = 8192;
 #ifdef GEVR
 static s32 sAudioPaused;
+static u32 sAudioRefills;
 /*
  * #229/#226: sound going bit-crushed with an echo, until a restart, on Quest,
  * in Perfect Dark VR too (its #139), which shares this output code. There
@@ -32,6 +34,77 @@ static s32 outputRate = 48000;
 static s32 sDeviceRate = 22050;
 static SDL_AudioStream *sConvert;
 static s32 sAudioStarted;   /* audioInit succeeded: Reset sound may reopen a closed device */
+
+enum { TACT_AUDIO_COUNT = TACT_AUDIO_SKORPION_BASE + 4 };
+typedef struct TacticalAudioSample { s16 *pcm; u32 samples; } TacticalAudioSample;
+typedef struct TacticalAudioVoice { s32 sample; u32 cursor; } TacticalAudioVoice;
+static TacticalAudioSample sTacticalSamples[TACT_AUDIO_COUNT];
+static TacticalAudioVoice sTacticalVoices[8];
+static SDL_SpinLock sTacticalAudioLock;
+
+static void audioTacticalLoad(void)
+{
+    static const char *paths[TACT_AUDIO_COUNT] = {
+        "mods/tactical/sounds/aks74un-magout.wav", "mods/tactical/sounds/aks74un-magin.wav",
+        "mods/tactical/sounds/aks74un-rack.wav", "mods/tactical/sounds/aks74un-magrelease.wav",
+        "mods/tactical/sounds/ppk-magout.wav", "mods/tactical/sounds/ppk-magin.wav",
+        "mods/tactical/sounds/ppk-rack.wav", "mods/tactical/sounds/ppk-magrelease.wav",
+        "mods/tactical/sounds/scorpio61-magout.wav", "mods/tactical/sounds/scorpio61-magin.wav",
+        "mods/tactical/sounds/scorpio61-rack.wav", "mods/tactical/sounds/scorpio61-magrelease.wav"
+    };
+    if (!sysArgCheck("--tactical-physical")) return;
+    const int count = sysArgCheck("--tactical-skorpion") ? TACT_AUDIO_COUNT : TACT_AUDIO_SKORPION_BASE;
+    for (int i = 0; i < count; i++) {
+        SDL_AudioSpec spec; SDL_AudioCVT cvt; Uint8 *wav = NULL; Uint32 length = 0;
+        if (sTacticalSamples[i].pcm) continue;
+        if (!SDL_LoadWAV(paths[i], &spec, &wav, &length)) {
+            sysLogPrintf(LOG_WARNING, "tactical audio: cannot load %s: %s", paths[i], SDL_GetError());
+            continue;
+        }
+        if (SDL_BuildAudioCVT(&cvt, spec.format, spec.channels, spec.freq, AUDIO_S16SYS, 2, 22050) < 0) {
+            SDL_FreeWAV(wav); continue;
+        }
+        cvt.len = (int)length;
+        cvt.buf = SDL_malloc((size_t)length * cvt.len_mult);
+        if (!cvt.buf) { SDL_FreeWAV(wav); continue; }
+        memcpy(cvt.buf, wav, length); SDL_FreeWAV(wav);
+        if (SDL_ConvertAudio(&cvt) < 0) { SDL_free(cvt.buf); continue; }
+        sTacticalSamples[i].pcm = (s16 *)cvt.buf;
+        sTacticalSamples[i].samples = (u32)cvt.len_cvt / sizeof(s16);
+        sysLogPrintf(LOG_NOTE, "tactical audio: loaded sound %d (%u samples)", i, sTacticalSamples[i].samples);
+    }
+}
+
+void audioTacticalPlay(int sound)
+{
+    int slot = -1;
+    if (sound < 0 || sound >= TACT_AUDIO_COUNT || !sTacticalSamples[sound].pcm) return;
+    SDL_AtomicLock(&sTacticalAudioLock);
+    for (int i = 0; i < 8; i++) if (!sTacticalVoices[i].sample) { slot = i; break; }
+    if (slot < 0) slot = 0;
+    sTacticalVoices[slot].sample = sound + 1; sTacticalVoices[slot].cursor = 0;
+    SDL_AtomicUnlock(&sTacticalAudioLock);
+    sysLogPrintf(LOG_NOTE, "tactical audio: play %d", sound);
+}
+
+static void audioTacticalMix(s16 *pcm, u32 samples)
+{
+    unsigned began = 0;
+    SDL_AtomicLock(&sTacticalAudioLock);
+    for (int v = 0; v < 8; v++) if (sTacticalVoices[v].sample) {
+        TacticalAudioVoice *voice = &sTacticalVoices[v];
+        TacticalAudioSample *sample = &sTacticalSamples[voice->sample - 1];
+        if (!voice->cursor) began |= 1u << (voice->sample - 1);
+        for (u32 i = 0; i < samples && voice->cursor < sample->samples; i++, voice->cursor++) {
+            /* Original AK handling clips peak around 9% of full scale. */
+            s32 x = pcm[i] + (s32)sample->pcm[voice->cursor] * (voice->sample <= 4 ? 5 : 1);
+            pcm[i] = x > 32767 ? 32767 : x < -32768 ? -32768 : (s16)x;
+        }
+        if (voice->cursor >= sample->samples) voice->sample = 0;
+    }
+    SDL_AtomicUnlock(&sTacticalAudioLock);
+    if (began && sysArgCheck("--input-script")) sysLogPrintf(LOG_NOTE, "tactical audio: mixed sound mask %u", began);
+}
 #endif
 
 static s32 audioOpen(void)
@@ -91,6 +164,7 @@ s32 audioInit(void)
 #ifdef GEVR
 	sAudioPaused = 0;
 	sAudioStarted = 1;
+	audioTacticalLoad();
 #endif
 	SDL_PauseAudioDevice(dev, 0);
 
@@ -203,6 +277,15 @@ s32 audioIsPaused(void)
 {
 	return sAudioPaused;
 }
+
+s32 audioRequestQueueRefill(s32 targetFrames)
+{
+	if (sAudioPaused || !dev || audioGetSamplesBuffered() >= SDL_min(targetFrames, queueLimit)) {
+		return 0;
+	}
+	sAudioRefills++;
+	return 1;
+}
 #endif
 
 s32 audioGetBytesBuffered(void)
@@ -262,11 +345,12 @@ void audioEndFrame(void)
             extern void gevrSynStats(u32 *, u32 *, u32 *, u32 *, u32 *, u32 *);
             u32 updFree, updLow, updFailed, voices, orphans, longest;
             gevrSynStats(&updFree, &updLow, &updFailed, &voices, &orphans, &longest);
-            sysLogPrintf(LOG_NOTE, "audio queue: frames=%u..%u empty=%u dropped=%u maxgap=%u us clipped=%u"
+            sysLogPrintf(LOG_NOTE, "audio queue: frames=%u..%u empty=%u dropped=%u maxgap=%u us clipped=%u refills=%u"
                          " updates=%u free (low %u, refused %u) voices=%u orphans=%u longest queue=%u",
-                         minQueued, maxQueued, empty, dropped, maxGap, g_gevrMixClips,
+                         minQueued, maxQueued, empty, dropped, maxGap, g_gevrMixClips, sAudioRefills,
                          updFree, updLow, updFailed, voices, orphans, longest);
             g_gevrMixClips = 0;
+            sAudioRefills = 0;
             lastReport = now;
             empty = dropped = maxQueued = maxGap = 0;
             minQueued = ~0u;
@@ -278,6 +362,9 @@ void audioEndFrame(void)
             if (nextSize <= sizeof(mixed) && nextSize % (sizeof(s16) * 2) == 0) {
                 memcpy(mixed, nextBuf, nextSize);
                 netVoiceMix(mixed, nextSize / (sizeof(s16) * 2));
+#ifdef GEVR
+                audioTacticalMix(mixed, nextSize / sizeof(s16));
+#endif
                 out = mixed;
             }
 #ifdef GEVR

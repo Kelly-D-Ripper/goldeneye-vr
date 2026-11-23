@@ -7,6 +7,7 @@ extern "C" {
 struct ChrRecord;
 struct Model;
 struct ShotData;
+struct GevrCoopCorpse;
 
 /* Cosmetic snapshots own their runtime model data and survive actor reuse.
  * Never change authoritative health, position, hitboxes or network messages. */
@@ -16,11 +17,28 @@ int gevrRagdollNeedsPose(struct ChrRecord *chr);
 void gevrRagdollCapture(struct ChrRecord *chr);
 void gevrRagdollCapturePlayer(struct ChrRecord *chr);
 int gevrRagdollSuppress(struct ChrRecord *chr);
+int gevrRagdollHidesHead(const struct Model *model);
 void gevrRagdollForgetChr(struct ChrRecord *chr);
 void gevrRagdollNoteHit(struct ChrRecord *chr, int matrix, int hitpart, const float dir[3], int weapon);
+void gevrRagdollNoteShotDeath(struct ChrRecord *chr, int hitpart, int firearm);
+void gevrRagdollPrepareCoopCorpse(struct ChrRecord *chr, const struct GevrCoopCorpse *corpse);
+int gevrRagdollApplyCoopCuts(unsigned id, unsigned cuts);
+int gevrRagdollReceiveCoopPose(unsigned id, unsigned sequence, int count,
+    const float (*joints)[16], int final);
+int gevrBladeHitRegion(struct ChrRecord *chr, const float from[3], const float to[3],
+    float reach, float contact[3]);
+void gevrRagdollNoteKatanaDeath(struct ChrRecord *chr, int part, const float direction[3]);
+void gevrRagdollNoteRemoteStab(struct ChrRecord *chr, int weapon, int part, const float direction[3]);
+int gevrRagdollBladePose(int controller, int item, const float base[3], const float tip[3]);
+void gevrRagdollReleaseBlade(int controller);
+void gevrRagdollNoteBladeStab(struct ChrRecord *chr, int controller, int weapon, int part,
+    const float direction[3], const float contact[3]);
 void gevrRagdollShot(struct ShotData *shot);
+void gevrRagdollBloodStain(int handle, int part, const float point[3], const float dir[3]);
 void gevrRagdollVolley(int begin);
 struct coord3d;
+/* -1 ends the scan, 0 means no guard body in this slot, 1 returns its torso. */
+int gevrRagdollGuardBody(int slot, int *actorId, struct coord3d *point);
 void gevrRagdollExplosionChr(struct ChrRecord *chr, const struct coord3d *centre, float radius, float damage);
 void gevrRagdollBlast(const struct coord3d *centre, float radius, float damage);
 Gfx *gevrRagdollRender(Gfx *gdl);

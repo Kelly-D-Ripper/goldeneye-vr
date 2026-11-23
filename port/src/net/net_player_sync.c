@@ -10,6 +10,7 @@
 #include "net_voice.h"
 #include "system.h"
 #include "gevr_avatar.h"
+#include "gevr_tactical_mesh.h"
 #include <ultra64.h>
 #include <bondtypes.h>
 #include "game/player.h"
@@ -33,7 +34,7 @@ static StandTile *s_remote_render_tile[GEVR_MAX_PLAYERS];
 static bool s_remote_render_valid[GEVR_MAX_PLAYERS];
 static f32 s_remote_barrel_pitch[GEVR_MAX_PLAYERS];   /* logged only (see netPlayerSyncBeforeTick) */
 static f32 s_remote_barrel_yaw[GEVR_MAX_PLAYERS];
-static s8 s_copy_weapon[GEVR_MAX_PLAYERS][2];         /* the item last given to a copy's hand (netSyncCopyHand) */
+static u8 s_copy_weapon[GEVR_MAX_PLAYERS][2];         /* the item last given to a copy's hand (netSyncCopyHand) */
 static u64 s_copy_dead_since_us[GEVR_MAX_PLAYERS];    /* the copy has been dead since (0: alive) */
 static u64 s_copy_alive_since_us[GEVR_MAX_PLAYERS];   /* the copy has been alive since (0: dead) */
 static u64 s_owner_dead_since_us[GEVR_MAX_PLAYERS];   /* the owner has reported dead since (0: alive) */
@@ -190,13 +191,18 @@ static void netSyncCopyHand(struct player *pl, int slot, int hand, int weapon, i
         chrSetWeaponFlag4(chr, hand);
         if (chr->weapons_held[hand] && chr->weapons_held[hand]->obj) objFreePermanently(chr->weapons_held[hand]->obj, 1);
         if (has_model) {
-            chrGiveWeapon(chr, getPropForHeldItem((ITEM_IDS)weapon), (ITEM_IDS)weapon, hand == GUNLEFT ? PROPFLAG_WEAPON_LEFTHANDED : 0);
+            const s32 model = getPropForHeldItem((ITEM_IDS)weapon);
+            const s32 flags = hand == GUNLEFT ? PROPFLAG_WEAPON_LEFTHANDED : 0;
+            if (netCoopSession() && gevrTacticalCampaignRules())
+                gevrGiveReplicatedGuardWeapon(chr, model, (ITEM_IDS)weapon, flags);
+            else
+                chrGiveWeapon(chr, model, (ITEM_IDS)weapon, flags);
             /* Multiply the newly-created model's native scale once, never the
              * previous hand model's scale on a tick or weapon swap. */
             if (chr->weapons_held[hand] && chr->weapons_held[hand]->obj && chr->weapons_held[hand]->obj->model)
                 chr->weapons_held[hand]->obj->model->scale *= netGunSizeFactor(netActiveGunSize());
         }
-        s_copy_weapon[slot][hand] = (s8)weapon;
+        s_copy_weapon[slot][hand] = (u8)weapon;
     }
     if (pl->hands[hand].weaponnum != weapon) {
         pl->hands[hand].weaponnum = (ITEM_IDS)weapon;
@@ -492,8 +498,8 @@ static void netSyncSendBotMove(int slot) {
     move.movespeed[1] = pl->speedsideways;
     move.angles[0] = pl->vv_theta;
     move.angles[1] = pl->vv_verta;
-    move.weaponnum = (s8)pl->hands[GUNRIGHT].weaponnum;
-    move.weaponnum_left = netActiveDualWield() ? (s8)pl->hands[GUNLEFT].weaponnum : ITEM_UNARMED;
+    move.weaponnum = (u8)pl->hands[GUNRIGHT].weaponnum;
+    move.weaponnum_left = netActiveDualWield() ? (u8)pl->hands[GUNLEFT].weaponnum : ITEM_UNARMED;
     move.crouchpos = (s8)pl->crouchpos;
     move.health = pl->bondhealth;
     move.armour = pl->bondarmour;
@@ -650,14 +656,17 @@ void netPlayerSyncAfterTick(s32 playernum) {
         extern s32 gevrHandChopSwinging(s32 ctrl);
         extern int gevrVrTriggerDown[2];
         extern s32 gevrStereoShotWorld(s32 handnum, coord3d *origin, coord3d *dir);
+        const bool canFire = !pl->bonddead && !pl->mpmenuon && !pl->watch_animation_state && !lvlGetControlsLockedFlag();
         for (int hand = GUNRIGHT; hand <= GUNLEFT; hand++) {
             int item = getCurrentPlayerWeaponId(hand);
             bool enabled = hand == GUNRIGHT || netActiveDualWield();
-            bool fire = enabled && !pl->bonddead && !pl->mpmenuon && !lvlGetControlsLockedFlag() && gevrVrTriggerDown[hand];
-            if (enabled && (item == ITEM_FIST || item == ITEM_KNIFE)) fire |= !pl->mpmenuon && gevrHandChopSwinging(hand == GUNRIGHT ? 1 : 0);
+            bool fire = enabled && canFire && gevrVrTriggerDown[hand];
+            if (enabled && canFire && (item == ITEM_FIST || item == ITEM_KNIFE)) fire |= gevrHandChopSwinging(hand == GUNRIGHT ? 1 : 0);
             else if (item == ITEM_UNARMED || item == ITEM_TRIGGER ||
                      (pl->hands[hand].weapon_ammo_in_magazine <= 0 && !bondwalkItemCheckBitflags(item, WEAPONSTATBITFLAG_CLICKY))) fire = false;
             if (fire) move.ucmd |= hand == GUNLEFT ? UCMD_FIRE_LEFT : UCMD_FIRE;
+            if (enabled && gevrTacticalWeaponSuppressed(item, hand))
+                move.ucmd |= hand == GUNLEFT ? UCMD_SUPPRESSED_LEFT : UCMD_SUPPRESSED_RIGHT;
             if (enabled && gevrStereoShotWorld(hand, hand == GUNLEFT ? &move.aimorigin_l : &move.aimorigin,
                                                 hand == GUNLEFT ? &move.aimdir_l : &move.aimdir))
                 move.ucmd |= hand == GUNLEFT ? UCMD_AIMVALID_LEFT : UCMD_AIMVALID;
@@ -674,8 +683,8 @@ void netPlayerSyncAfterTick(s32 playernum) {
     move.angles[0] = pl->vv_theta;
     move.angles[1] = pl->vv_verta;
     
-    move.weaponnum = (s8)getCurrentPlayerWeaponId(GUNRIGHT);
-    move.weaponnum_left = netActiveDualWield() ? (s8)getCurrentPlayerWeaponId(GUNLEFT) : ITEM_UNARMED;
+    move.weaponnum = (u8)getCurrentPlayerWeaponId(GUNRIGHT);
+    move.weaponnum_left = netActiveDualWield() ? (u8)getCurrentPlayerWeaponId(GUNLEFT) : ITEM_UNARMED;
     move.crouchpos = (s8)pl->crouchpos;
     move.health = pl->bondhealth;
     move.armour = pl->bondarmour;

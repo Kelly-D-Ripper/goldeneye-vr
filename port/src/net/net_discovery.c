@@ -1,6 +1,7 @@
 #include "net_discovery.h"
 #include "net_core.h"
 #include "platform.h"
+#include "system.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -155,6 +156,7 @@ void netDiscoveryAlsoSendTo(const char *ip) {
 
 void netDiscoveryUpdate(uint32_t current_time_ms) {
     if (s_disc_socket == INVALID_SOCKET) return;
+    const uint16_t edition = GEVR_NET_VERSION | (sysArgCheck("--tactical-coop") ? 0x8000u : 0);
     
     /* 1. Broadcast beacon if hosting */
     if (s_broadcasting && (current_time_ms - s_last_broadcast_ms >= 1000)) {
@@ -162,7 +164,7 @@ void netDiscoveryUpdate(uint32_t current_time_ms) {
         
         NetDiscoveryBeacon beacon;
         beacon.magic = PD_LE32(GEVR_NET_MAGIC);
-        beacon.version = PD_LE16(GEVR_NET_VERSION);
+        beacon.version = PD_LE16(edition);
         beacon.port = PD_LE16(s_broadcast_port);
         snprintf(beacon.name, GEVR_MAX_NAME_LEN, "%s", s_broadcast_name);
         beacon.player_count = (uint8_t)netGetHumanPlayerCount();   /* a joiner takes a bot's place */
@@ -207,7 +209,7 @@ void netDiscoveryUpdate(uint32_t current_time_ms) {
         uint32_t magic = PD_LE32(b->magic);
         uint16_t version = PD_LE16(b->version);
         uint16_t port = PD_LE16(b->port);
-        if (magic == GEVR_NET_MAGIC && version == GEVR_NET_VERSION && PD_LE32(b->host_id) != s_self_id) {
+        if (magic == GEVR_NET_MAGIC && version == edition && PD_LE32(b->host_id) != s_self_id) {
             char sender_ip[32];
             inet_ntop(AF_INET, &sender_addr.sin_addr, sender_ip, sizeof(sender_ip));
             

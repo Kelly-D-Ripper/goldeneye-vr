@@ -9,7 +9,8 @@
 #include "game/player.h"
 #include "game/model.h"
 #include "game/stan.h"
-#include "aicommands2.h"
+#include "bondaicommands.h"
+#include "system.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
@@ -159,6 +160,10 @@ static u8 coopWeaponOf(ChrRecord *chr,s32 hand) { return world->guns[chr-g_ChrSl
 static void coopSyncHand(ChrRecord *chr,s32 hand,u8 item,bool dying) { world->guns[chr-g_ChrSlots][hand]=item; }
 PropRecord *chrGetEquippedWeaponProp(ChrRecord *chr,GUNHAND hand) { return NULL; }
 PropRecord *chrGiveWeapon(ChrRecord *chr,s32 model,ITEM_IDS item,s32 flags) { return NULL; }
+PropRecord *gevrCloneGuardWeapon(ChrRecord *chr, const PropRecord *source, s32 flags)
+{
+    return chrGiveWeapon(chr, source->weapon->obj, source->weapon->weaponnum, flags);
+}
 void propweaponSetDual(WeaponObjRecord *left,WeaponObjRecord *right) {}
 PropRecord *hatCreateForChr(ChrRecord *chr,s32 model,u32 flags) { return NULL; }
 AIRecord *ailistFindById(s32 id) { return NULL; }
@@ -172,6 +177,11 @@ void netCoopBroadcast(const unsigned char *data,unsigned int size,int reliable) 
 }
 
 /* INSERT_LOOKUPS */
+s32 sysArgCheck(const char *key) { return 0; }
+f32 lvlGetStageTimeSec(void) { return 0.f; }
+int gevrCampaignGunIsFirearm(int item) { return FALSE; }
+void gevrCampaignFinishGuard(ChrRecord *chr, int equipUnarmed) {}
+#include "gevr_tactical_reinforcements.inc.h"
 /* INSERT_NETWORK */
 
 PropRecord *chrSpawnAtChr(ChrRecord *self,s32 body,s32 head,s32 id,AIRecord *list,s32 flags)

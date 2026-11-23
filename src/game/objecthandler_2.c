@@ -3,6 +3,7 @@
 #include "gevr_model.h"
 #include "gevr_handpatch.h"
 #include "gevr_oddjobhat.h"
+#include "gevr_tactical_mesh.h"
 #include "gevr_bean.h"
 #include "gevr_gexmodel.h"
 #include "system.h"
@@ -145,6 +146,7 @@ void load_object_fill_header(struct ModelFileHeader *objheader, u8 *name, u8* ds
     gevrHandPatchApply(objheader, (const char *)name, buffer);
     /* PORT: Mods, Oddjob's hat in place of the throwing knife (draw time only) */
     gevrHatModelLoaded(objheader, (const char *)name);
+    gevrTacticalMeshLoaded(objheader, (const char *)name);
     /* Clear stale registrations even when GE-X or an unmapped file takes this slot. */
     gevrBeanForgetModel(objheader);
     gevrBeanForgetModelStorage(filedata, (u32)get_pc_remaining_buffer_for_index(fileGetIndex((char *)name)));

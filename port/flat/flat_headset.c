@@ -178,6 +178,7 @@ int gevrVrGripUsable(int hand) { (void)hand; return 0; }
 int gevrVrGripPoseCamera(int hand, float pos[3], float q[4]) { (void)hand; (void)pos; (void)q; return 0; }
 int gevrVrGripPosePlay(int hand, float pos[3], float quat[4]) { (void)hand; (void)pos; (void)quat; return 0; }
 int gevrVrWatchGesture(void) { return 0; }
+int gevrVrCoopWatchPose(void) { return 0; }
 #ifdef GEVR_PC_FLAT
 /* the mouse over the window's picture, where the headset has its laser:
  * front.c's folder cursor follows it (port/src/input.c) */
@@ -245,6 +246,7 @@ const char *gevrVrStatsText(void)
 /* --- Controllers: none ---------------------------------------------------- */
 
 bool get_button_state(int hand_index, const char *button_name) { (void)hand_index; (void)button_name; return false; }
+bool gevrVrGripInputAvailable(int hand_index) { (void)hand_index; return false; }
 float get_analog_value(int hand_index, const char *input_name) { (void)hand_index; (void)input_name; return 0.0f; }
 bool get_2d_input(int hand_index, const char *input_name, XrVector2f *value)
 {
@@ -295,4 +297,5 @@ void vrHapticsGetRumble(int id, float *out_amplitude, float *out_duration, float
 }
 #endif
 void vrRecoilKick(int gunhand, int recoilClass, float strength) { (void)gunhand; (void)recoilClass; (void)strength; }
+void vrTacticalRecoilKick(int gunhand, float strength, float ergonomics) { (void)gunhand; (void)strength; (void)ergonomics; }
 

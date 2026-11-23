@@ -133,7 +133,7 @@ static int rdMoverNear(const Mtxf *pose,const float half[3],const float position
 static void rdMoverWake(RdMover *m,const float dv[3],const float velocity[3],float dt,RdBody *bodies,int count)
 {
     Mtxf inverse;if(!rdInverse(&m->pose,&inverse))return;
-    for(int i=0;i<count;i++)if(bodies[i].used) {
+    for(int i=0;i<count;i++)if(bodies[i].used && bodies[i].handle>=0) {
         RdBody *b=&bodies[i];unsigned supported=0;
         for(int p=0;p<b->count;p++) {
             float pos[3];pdphysRagdollGetPartPos(b->handle,p,pos);rdTransform(&inverse,pos,1);
@@ -157,7 +157,7 @@ void rdMoversUpdate(float dt,RdBody *bodies,int count)
     /* CE ragdollUpdateNearbyProps (props.c:1084): the pelvis and each cut
      * piece, and props whose position is within reach of one of them */
     float positions[RD_BODIES*RD_PARTS][3];int npositions=0;
-    for(int i=0;i<count;i++)if(bodies[i].used)for(int p=0;p<bodies[i].count;p++)
+    for(int i=0;i<count;i++)if(bodies[i].used && bodies[i].handle>=0)for(int p=0;p<bodies[i].count;p++)
         if((p==bodies[i].root || (bodies[i].cuts&(1u<<p))) && npositions<RD_BODIES*RD_PARTS)
             pdphysRagdollGetPartPos(bodies[i].handle,p,positions[npositions++]);
     for(int i=0;i<RD_MOVERS;i++)s_movers[i].seen=0;

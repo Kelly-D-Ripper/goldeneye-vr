@@ -34,6 +34,11 @@ int netGetLocalSlot(void) { return 0; }
 s32 get_cur_playernum(void) { return remote; }
 s32 getPlayerCount(void) { return online ? 3 : 1; }
 s32 gevrSpectating(void) { return spectator; }
+int sysArgCheck(const char *option) { (void)option; return 0; }
+int gevrTacticalCampaignRules(void) { return 0; }
+int gevrTacticalMode(void) { return 0; }
+s32 gevrTacticalHandheldDetonator(s32 item) { (void)item; return 0; }
+s32 gevrTacticalManualOn(s32 hand) { (void)hand; return 0; }
 s32 gevrManualReloadOn(s32 hand) { (void)hand; return 0; }   /* Hand reload (WIP) off: guns reload themselves */
 s32 bondinvCountTotalItemsInInv(void) { return inventoryCount; }
 s32 bondinvGetTextbyInvIndex(s32 i) { return inventoryItems[i]; }

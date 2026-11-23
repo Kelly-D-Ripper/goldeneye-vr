@@ -46,6 +46,19 @@ public class MainActivity extends SDLActivity {
     }
 
     @Override
+    protected String[] getArguments() {
+        if (!BuildConfig.TACTICAL) return super.getArguments();
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.InputStreamReader(
+                getAssets().open("tactical-launch.args"), java.nio.charset.StandardCharsets.UTF_8))) {
+            String args = reader.readLine();
+            if (args == null || args.trim().isEmpty()) throw new java.io.IOException("Empty Tactical launch arguments");
+            return args.trim().split("\\s+");
+        } catch (java.io.IOException error) {
+            throw new IllegalStateException("Could not read the Tactical launch arguments", error);
+        }
+    }
+
+    @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
@@ -60,6 +73,11 @@ public class MainActivity extends SDLActivity {
             Log.w(TAG, "Could not create " + dataDir);
         }
 
+        if (BuildConfig.TACTICAL) {
+            Log.i(TAG, "Starting GEVR Tactical");
+            initializeGame();
+            return;
+        }
         updater = new UpdateChecker(this);
         String version = "0";
         try {
@@ -122,6 +140,7 @@ public class MainActivity extends SDLActivity {
      * gevrFriendsLoadPendingJoin), the way an invite accepted in a mission is.
      */
     private void takeJoinLink(Intent intent) {
+        if (BuildConfig.TACTICAL) return;
         Uri data = intent == null ? null : intent.getData();
         if (data == null || !"goldeneyevr".equals(data.getScheme()) || !"join".equals(data.getHost())) return;
         String code = data.getLastPathSegment();

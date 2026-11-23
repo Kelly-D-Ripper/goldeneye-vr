@@ -2,6 +2,8 @@
 #include <ultra64.h>
 #ifdef GEVR
 #include "net_horde.h"
+#include "gevr_tactical_range.h"
+#include "gevr_tactical_heavy_guards.h"
 #endif
 #include <memp.h>
 #include <bondconstants.h>
@@ -67,6 +69,7 @@ void gevrStageGunsReset(void)
     memset(s_gevrStageGuns, 0, sizeof(s_gevrStageGuns));
     gevrTexpackWarmDl(NULL, NULL);
     gevrHeldGunReset();
+    gevrTacticalGuardIssueReset();
     {
         extern void gevrBodySlotsReset(void);   /* gevr_bodyslots.c: a new stage's slots start empty */
 
@@ -775,6 +778,10 @@ void bondviewLoadSetupIntroSection(void)
     start_pos = default_start_position;
 
     intro_record = (struct SetupIntroEmpty *)g_CurrentSetup.intro;
+#ifdef GEVR
+    PadRecord *rangePad = gevrTacticalRangeStartPad();
+    if (rangePad) intro_record = NULL;
+#endif
     g_isBondKIA = 0;
     g_bondviewForceDisarm = 0;
     resolution = 0;
@@ -1051,6 +1058,12 @@ void bondviewLoadSetupIntroSection(void)
         }
     }
 
+#ifdef GEVR
+    if (rangePad) {
+        g_Startpad[0] = rangePad;
+        startpadcount = 1;
+    }
+#endif
     if (g_CurrentSetupIntroCamera != NULL
 #ifdef GEVR
         /* co-op: picked once, with the first player */

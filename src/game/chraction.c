@@ -6,6 +6,9 @@
 #include <ultra64.h>
 #ifdef GEVR
 #include "gevr_ragdoll.h"
+#include "gevr_tactical_heavy_guards.h"
+#include "gevr_guard_cigarettes.h"
+#include "gevr_tactical_loadouts.h"
 #include "gevr_ally.h"
 #include "net_horde.h"
 #endif
@@ -16,6 +19,9 @@
 #ifdef GEVR
 /* gevr_horde.c: a Horde guard's run speed grows with the waves (user, 2026-10-17) */
 extern f32 gevrHordeGuardSpeed(const ChrRecord *chr);
+static bool tacticalGuardCanFire(ChrRecord *guard);
+static void tacticalGuardDischarge(ChrRecord *guard, bool suppressed);
+static int tacticalGuardCoverShot(ChrRecord *guard, s32 hand, coord3d *muzzle, StandTile **floor);
 extern s32 gevrDisarmedThink(ChrRecord *chr);   /* gevr_disarmed.c */
 #define GEVR_HORDE_RUN(speed) ((speed) * gevrHordeGuardSpeed(self))
 #else
@@ -49,8 +55,11 @@ extern s32 gevrDisarmedThink(ChrRecord *chr);   /* gevr_disarmed.c */
 #include "stan.h"
 #ifdef GEVR
 extern bool netIsActive(void);
+extern _Bool netSlotOccupied(int slot);
+extern _Bool netSlotIsSpectator(int slot);
 #include "net_coop.h"
 #include "net_game.h"
+#include "prop.h"
 #endif
 
 
@@ -322,6 +331,11 @@ void expand_09_characters(s32 stageid, GuardRecord *arg1, s32 arg2)
             ? get_current_random_body()
             : arg1->BodyID;
 
+#ifdef GEVR
+        if (bodyid == BODY_Russian_Soldier && arg1->chrnum == GEVR_DAM_JANUS_GUARD
+            && gevrTacticalHeavyGuards(stageid)) bodyid = BODY_Janus_Special_Forces;
+#endif
+
         cmfr = &c_item_entries[bodyid];
         if (cmfr->hasHead == 0)
         {
@@ -366,6 +380,17 @@ void expand_09_characters(s32 stageid, GuardRecord *arg1, s32 arg2)
                 }
 
                 arg1->Data = temp_v0_5;
+#ifdef GEVR
+                if (gevrTacticalHeavyGuards(stageid)) {
+                    const s32 helmet = gevrTacticalKorundGuard(temp_v0_5) ? PROP_TACTICAL_ALTYN
+                        : gevrTacticalJanusGuard(temp_v0_5) ? PROP_TACTICAL_FAST_TROOPER : -1;
+                    PropRecord *hat = helmet >= 0 ? hatCreateForChr(temp_v0_5, helmet, 0) : NULL;
+                    if (hat) {
+                        hat->obj->damage = 0.f;
+                        sysLogPrintf(LOG_NOTE, "heavy guard: chr %d attached helmet model %d", arg1->chrnum, helmet);
+                    }
+                }
+#endif
             }
         }
     }
@@ -1310,7 +1335,7 @@ void chrlvInitActAttack(ChrRecord *self, struct anim_group_info **arg1, s32 arg2
                 phi_s7 = 1;
             }
 
-            if (((s32)chrlvWeaponNumber(temp_chr) == ITEM_ROCKETLAUNCH) || ((s32)chrlvWeaponNumber(temp_chr) == ITEM_GRENADELAUNCH))
+            if ((GEVR_ITEM_AS(chrlvWeaponNumber(temp_chr)) == ITEM_ROCKETLAUNCH) || (GEVR_ITEM_AS(chrlvWeaponNumber(temp_chr)) == ITEM_GRENADELAUNCH))
             {
                 sp58.p[i] = 1;
             }
@@ -1673,7 +1698,7 @@ void chrlvInitActAttackWalk(ChrRecord *chr, s32 arg1)
                 sp68.p[i] = 1;
             }
 
-            if ((chrlvWeaponNumber(tmp_chr) == ITEM_ROCKETLAUNCH) || (chrlvWeaponNumber(tmp_chr) == ITEM_GRENADELAUNCH))
+            if ((GEVR_ITEM_AS(chrlvWeaponNumber(tmp_chr)) == ITEM_ROCKETLAUNCH) || (GEVR_ITEM_AS(chrlvWeaponNumber(tmp_chr)) == ITEM_GRENADELAUNCH))
             {
                 sp60.p[i] = 1;
             }
@@ -1826,7 +1851,7 @@ void chrlvInitActAttackRoll(ChrRecord *chr, GUNHAND side)
                 sp5C = 1;
             }
 
-            if ((chrlvWeaponNumber(temp_v1_2) == ITEM_ROCKETLAUNCH) || (chrlvWeaponNumber(temp_v1_2) == ITEM_GRENADELAUNCH))
+            if ((GEVR_ITEM_AS(chrlvWeaponNumber(temp_v1_2)) == ITEM_ROCKETLAUNCH) || (GEVR_ITEM_AS(chrlvWeaponNumber(temp_v1_2)) == ITEM_GRENADELAUNCH))
             {
                 sp4C.p[i] = 1;
             }
@@ -2242,6 +2267,11 @@ void triggered_on_shot_hit(ChrRecord *self, coord3d *arg1, f32 arg2, s32 req_ani
                 }
             }
 
+#ifdef GEVR
+            if (self->actiontype == ACT_DIE)
+                gevrRagdollNoteShotDeath(self, req_animation_id,
+                    gevrTacticalIsArmorShot(item) && item != ITEM_ROCKETLAUNCH && item != ITEM_TACTICAL_M32A1);
+#endif
             chrDropItems(self);
             increment_num_kills_display_text_in_MP();
 
@@ -2527,6 +2557,8 @@ coord3d D_80030A44 = {0, 0, 0};
 bool handles_shot_actors(ChrRecord *self, s32 hitpart, coord3d *vector, s32 weaponid, bool isPlayer)
 {
 #ifdef GEVR
+    if ((hitpart == HIT_HEAD || hitpart == HIT_HAT) && gevrTacticalPermanentHelmet(self->handle_positiondata_hat)
+        && gevrTacticalIsArmorShot(weaponid)) return FALSE;
     /* Reject friendly hits before grunts, blood and flinch reactions. */
     extern int netDamageAllowed(int attacker, int target);
     if (self->prop->type == PROP_TYPE_VIEWER &&
@@ -2629,6 +2661,14 @@ bool handles_shot_actors(ChrRecord *self, s32 hitpart, coord3d *vector, s32 weap
 
         damageToCause = gunItemGetDestructionAmount(weaponid);
 #ifdef GEVR
+        if (self->prop->type == PROP_TYPE_CHR && hitpart != HIT_HAT && hitpart != HIT_GUN
+            && gevrTacticalIsArmorShot(weaponid))
+            gevrGuardCigaretteHit(self, vector);
+        if (isPlayer) {
+            extern s32 g_gevrShotHand;
+            extern f32 gevrTacticalShotDamage(int hand, int item, float fallback);
+            damageToCause = gevrTacticalShotDamage(g_gevrShotHand, weaponid, damageToCause);
+        }
         damageToCause *= gevrAllyDamageScale();
         {
             /*
@@ -2749,8 +2789,13 @@ bool handles_shot_actors(ChrRecord *self, s32 hitpart, coord3d *vector, s32 weap
         else
         {
 #ifdef GEVR
-            if (isPlayer && damageToCause>0.0f && gevrHordeInstaKill(self))
-                damageToCause=fmaxf(damageToCause,self->maxdamage-self->damage);
+            extern int gevrTacticalKnifeEnabled(void);
+            if (isPlayer && damageToCause > 0.f) {
+                if (weaponid == ITEM_TACTICAL_KATANA || (weaponid == ITEM_KNIFE && gevrTacticalKnifeEnabled()))
+                    damageToCause = fmaxf(damageToCause, self->maxdamage - self->damage + 1.f);
+                else if (gevrHordeInstaKill(self))
+                    damageToCause = fmaxf(damageToCause, self->maxdamage - self->damage);
+            }
 #endif
             self->chrflags |= CHRFLAG_WAS_DAMAGED;
 #    ifdef XBLA
@@ -3424,21 +3469,20 @@ s32 chrlvPatrolCalculateStep(ChrRecord *self, bool *forward, s32 numsteps)
  * 
  * PD: chrPatrolCalculatePadNum (had some nice finds when searching for "patrol" in "chraction.c" in PD)
 */
+static PadRecord *chrlvPatrolPad(struct patrol_path *path, s32 step)
+{
+#ifdef GEVR
+    if (path->flags & GEVR_PATROL_DIRECT_PADS) return gevrCampaignPatrolPad(path, step);
+#endif
+    const s32 index = path->data[step];
+    return &g_CurrentSetup.pads[g_CurrentSetup.pathwaypoints[index].padID];
+}
+
 PadRecord *chrlvGetPatrolStepPad(ChrRecord *self, s32 numsteps)
 {
-    waypoint *wp;
-    s32 forward;
-    s32 step;
-    s32 *data;
-
-    forward = self->act_patrol.forward;
-    step = chrlvPatrolCalculateStep(self, &forward, numsteps);
-
-    data = &self->act_patrol.path->data[step];
-
-    wp = &g_CurrentSetup.pathwaypoints[*data];
-
-    return &g_CurrentSetup.pads[wp->padID];
+    bool forward = self->act_patrol.forward;
+    const s32 step = chrlvPatrolCalculateStep(self, &forward, numsteps);
+    return chrlvPatrolPad(self->act_patrol.path, step);
 }
 
 
@@ -3868,6 +3912,33 @@ s32 plot_course_for_actor(ChrRecord *self, coord3d *arg1, StandTile *stan, SPEED
 
 
 
+#ifdef GEVR
+static void chrlvDirectRoute(ChrRecord *self, coord3d *point, StandTile *tile, SPEED speed)
+{
+    chrStopFiring(self);
+    self->actiontype = ACT_GOPOS;
+    memset(&self->act_gopos, 0, sizeof(self->act_gopos));
+    self->act_gopos.targetpos = *point;
+    self->act_gopos.target = tile;
+    self->act_gopos.unk59 = speed;
+    self->act_gopos.unk9c = g_GlobalTimer;
+    self->lastmoveok60 = g_GlobalTimer;
+    self->sleep = 0;
+    chrlvActGoposSetTargetPosRelated(self);
+    chrlvSetGoposSegDistTotal(self, &self->act_gopos.waydata, point);
+}
+
+void gevrRangeChrWalk(ChrRecord *self, coord3d *point, StandTile *tile)
+{
+    chrlvDirectRoute(self, point, tile, SPEED_WALK);
+}
+
+void gevrRangeChrStop(ChrRecord *self)
+{
+    chrlvMergeKneelToStand(self, 12.f);
+}
+#endif
+
 /**
  * Address 0x7F028FAC.
 */
@@ -3926,10 +3997,6 @@ void set_actor_on_path(ChrRecord *self, struct patrol_path *path)
     s32 next_step = -1;
     PropRecord *prop = self->prop;
     s32 count = 0;
-    PadRecord *new_var;
-    waypoint *pta;
-    StandTile *stan;
-    s32 *dataptr;
     f32 dx;
     f32 dz;
 
@@ -3937,10 +4004,7 @@ void set_actor_on_path(ChrRecord *self, struct patrol_path *path)
     {
         do
         {
-            dataptr = &path->data[count];
-            pta = &g_CurrentSetup.pathwaypoints[*dataptr];
-            new_var = &g_CurrentSetup.pads[pta->padID];
-            pad = new_var;
+            pad = chrlvPatrolPad(path, count);
 
             if ((pad->stan != NULL) && (pad->stan == prop->stan))
             {
@@ -5400,7 +5464,8 @@ extern int VrFastReinforcements;
 extern bool netIsActive(void);
 /* 48 until a pile of 41 Bean ragdolls held the Quest GPU near its limit
  * (89-109 fps of 120; 120 up to about 25 - Bunker II, 2026-10-30) */
-#define GEVR_BODIES_MAX 24
+#define GEVR_BODIES_MAX 160
+#define GEVR_BODIES_NORMAL_MAX 24
 #define GEVR_BODY_SLOT_RESERVE 4
 static ChrRecord *s_gevrBodies[GEVR_BODIES_MAX];   /* kept, oldest first */
 static s32 s_gevrBodyAge[GEVR_BODIES_MAX];       /* original fade clock, not visible alpha */
@@ -5445,6 +5510,10 @@ s32 gevrBodyRetireForAi(ChrRecord *chr)
     {
         if (s_gevrBodies[i] == chr && s_gevrBodyAge[i] >= CHRLV_TICK_DEAD_CHECK)
         {
+            /* Keep physical rig contents associated with this exact corpse
+             * when its AI identity is retired for mission scripts. */
+            extern void gevrEnemyRigRetireChr(ChrRecord *chr);
+            gevrEnemyRigRetireChr(chr);
             chr->chrnum = -1;
             return TRUE;
         }
@@ -5485,8 +5554,11 @@ static void gevrBodyRelease(s32 i)
 /* chrlvTickDead: TRUE while the body is kept */
 static s32 gevrBodyKeepTick(ChrRecord *self)
 {
-    s32 keep = VrBodiesStay > 0 && !netIsActive() && getPlayerCount() == 1;
-    s32 limit = VrBodiesStay > GEVR_BODIES_MAX ? GEVR_BODIES_MAX : VrBodiesStay;
+    s32 physical = sysArgCheck("--tactical-physical");
+    s32 coop = gevrCoopHostGuards() && gevrCoopGuardGore(self);
+    s32 keep = coop || ((physical || VrBodiesStay > 0) && !netIsActive() && getPlayerCount() == 1);
+    s32 limit = coop ? 12 : physical ? GEVR_BODIES_MAX
+        : VrBodiesStay > GEVR_BODIES_NORMAL_MAX ? GEVR_BODIES_NORMAL_MAX : VrBodiesStay;
     s32 i;
 
     /* forget any that are no longer dead bodies (a cutscene's removal) */
@@ -5891,7 +5963,13 @@ void sub_GAME_7F02BFE4(ChrRecord *self, s32 arg1, s32 arg2)
     phi_a1 = 0;
 
     sp33 = bondwalkItemGetSoundTriggerRate((s32) chrlvWeaponNumber(temp_v1));
+#ifdef GEVR
+    const s32 suppressed = gevrTacticalGuardWeaponSuppressed(prop);
+    sp30 = gevrTacticalShotSound(chrlvWeaponNumber(temp_v1), suppressed);
+    if (suppressed) sp33 = 0;
+#else
     sp30 = bondwalkItemGetSound((s32) chrlvWeaponNumber(temp_v1));
+#endif
 
     if (arg2 != 0)
     {
@@ -6989,7 +7067,12 @@ void chrlvFireWeaponRelated(ChrRecord *self, s32 hand)
                 self_stan = self_prop->stan;
                 sp27C = 1;
 
-                if (sub_GAME_7F02D630(self, hand, (coord3d *) &sp240) == 0)
+#ifdef GEVR
+                const int coverShot = tacticalGuardCoverShot(self, hand, &sp240, &self_stan);
+#else
+                const int coverShot = -1;
+#endif
+                if (coverShot < 0 && sub_GAME_7F02D630(self, hand, (coord3d *) &sp240) == 0)
                 {
                     sp240.f[0] = self_prop->pos.f[0];
                     sp240.f[1] = self_prop->pos.f[1] + 30.0f;
@@ -7007,7 +7090,9 @@ void chrlvFireWeaponRelated(ChrRecord *self, s32 hand)
                     }
                 }
 
-                if (stanTestLineUnobstructed(&self_stan, self_prop->pos.x, self_prop->pos.f[2], sp240.f[0], sp240.f[2], CDTYPE_DOORS, sp240.f[1] - self->ground, sp240.f[1] - self->ground, 0.0f, 1.0f) != 0)
+                if (coverShot > 0 || (coverShot < 0 && stanTestLineUnobstructed(&self_stan,
+                    self_prop->pos.x, self_prop->pos.f[2], sp240.f[0], sp240.f[2], CDTYPE_DOORS,
+                    sp240.f[1] - self->ground, sp240.f[1] - self->ground, 0.0f, 1.0f) != 0))
                 {
                     sp238 = self_stan;
                 }
@@ -7054,7 +7139,7 @@ void chrlvFireWeaponRelated(ChrRecord *self, s32 hand)
 
                     sp20C = (dx * dx) + (dy * dy) + (dz * dz);
 
-                    if (chrlvWeaponNumber(prop_selfchr) == ITEM_ROCKETLAUNCH)
+                    if (GEVR_ITEM_AS(chrlvWeaponNumber(prop_selfchr)) == ITEM_ROCKETLAUNCH)
                     {
                         if (((dx * dx) + (dy * dy) + (dz * dz)) > 160000.0f)
                         {
@@ -7117,7 +7202,7 @@ void chrlvFireWeaponRelated(ChrRecord *self, s32 hand)
                             sp27C = 0;
                         }
                     }
-                    else if (chrlvWeaponNumber(prop_selfchr) == ITEM_GRENADELAUNCH)
+                    else if (GEVR_ITEM_AS(chrlvWeaponNumber(prop_selfchr)) == ITEM_GRENADELAUNCH)
                     {
                         if (((dx * dx) + (dy * dy) + (dz * dz)) >
 #ifdef GEVR
@@ -7247,7 +7332,7 @@ void chrlvFireWeaponRelated(ChrRecord *self, s32 hand)
 
                         if (sp264 != 0)
                         {
-                            switch (chrlvWeaponNumber(prop_selfchr))
+                            switch (GEVR_ITEM_AS(chrlvWeaponNumber(prop_selfchr)))
                             {
                                 case ITEM_WPPK:
                                 case ITEM_WPPKSIL:
@@ -7284,6 +7369,9 @@ void chrlvFireWeaponRelated(ChrRecord *self, s32 hand)
 
             phi_a2 = (sp27C != 0) || (sp278 != 0);
 
+#ifdef GEVR
+            if (sp27C != 0) tacticalGuardDischarge(self, gevrTacticalGuardWeaponSuppressed(weapon_prop));
+#endif
             sub_GAME_7F02BFE4(self, hand, phi_a2);
         }
 
@@ -7299,7 +7387,9 @@ void chrlvTriggerFireWeapon(ChrRecord *self)
 {
     self->hidden &= ~CHRHIDDEN_FIRE_TRACER;
 #ifdef GEVR
-    if (!gevrHordeXeniaWeapon(self)) {
+    if (!gevrHordeXeniaWeapon(self)
+        || ((self->hidden & (CHRHIDDEN_FIRE_WEAPON_RIGHT | CHRHIDDEN_FIRE_WEAPON_LEFT))
+            && !tacticalGuardCanFire(self))) {
         self->hidden &= ~(CHRHIDDEN_FIRE_WEAPON_RIGHT | CHRHIDDEN_FIRE_WEAPON_LEFT);
         return;
     }
@@ -9765,6 +9855,10 @@ void chrlvTickPatrol(ChrRecord *self)
 /**
  * Address 0x7F0326BC.
 */
+#ifdef GEVR
+#include "gevr_tactical_guard_ai.inc.h"
+#endif
+
 void chrlvActionTick(ChrRecord *self)
 {
     if (g_ClockTimer > 0)
@@ -9788,7 +9882,7 @@ void chrlvActionTick(ChrRecord *self)
             self->sleep = 0;
 #ifdef GEVR
             /* a guard force pull disarmed goes for a gun or his fists (gevr_disarmed.c) */
-            if (!gevrAllyThink(self) && !gevrDisarmedThink(self))
+            if (!gevrAllyThink(self) && !gevrDisarmedThink(self) && !tacticalGuardThink(self))
 #endif
             ai(self, PROP_TYPE_CHR);
 
@@ -9883,6 +9977,9 @@ void chrlvAllChrTick(void)
     ChrRecord *guard;
 
     max = get_numguards();
+#ifdef GEVR
+    if (g_ClockTimer > 0) gevrTacticalReinforcementsTick();
+#endif
 
     for (i=0; i<g_ActiveChrsCount; i++)
     {
@@ -11107,11 +11204,142 @@ bool chrAdjustPosForSpawn(coord3d *pos, StandTile **arg1, f32 facing, bool allow
 }
 
 
+#ifdef GEVR
+static f32 campaignSpawnDistanceSquared(const coord3d *pos, const coord3d *start)
+{
+    const f32 dx = pos->x - start->x, dz = pos->z - start->z;
+    return dx * dx + dz * dz;
+}
+
+static bool prepareCampaignGuardSpawn(coord3d *pos, StandTile **stan)
+{
+    if (!*stan) return FALSE;
+    for (s32 i = 0; i < startpadcount; i++) {
+        if (g_Startpad[i] && campaignSpawnDistanceSquared(pos, &g_Startpad[i]->pos) < SQR(1200.0f)) return FALSE;
+    }
+    for (s32 i = 0; i < getPlayerCount() && i < MAX_PLAYER_COUNT; i++) {
+        const struct player *player = g_playerPointers[i];
+        if (player && player->prop && player->prop->stan &&
+            campaignSpawnDistanceSquared(pos, &player->prop->pos) < SQR(1200.0f)) return FALSE;
+    }
+
+    const f32 floor = stanGetPositionYValue(*stan, pos->x, pos->z);
+    f32 resolved;
+    pos->y = floor + 1.0f;
+    /* Use the same floor lookup as the other headset's spawn packet. */
+    StandTile *const ground = stanFindTileBelowPos(pos, NULL, &resolved);
+    if (!ground || fabsf(resolved - floor) > 1.0f || ground->room != (*stan)->room) return FALSE;
+
+    const s32 obstacles = CDTYPE_OBJS | CDTYPE_DOORS | CDTYPE_PATHBLOCKER;
+    StandTile *clearance = ground;
+    if (stanTestVolume(&clearance, pos->x, pos->z, 28.0f,
+                       obstacles | CDTYPE_CHRS | CDTYPE_PLAYERS, 185.0f, 2.0f) >= 0) return FALSE;
+    /* A circle fully inside a prop can miss every polygon edge. Reject
+     * solid interiors in the same room list the volume check just filled. */
+    for (const s16 *index = ptr_list_object_lookup_indices; *index >= 0; index++) {
+        PropRecord *prop = &g_Props[*index];
+        if (!propIsOfCdType(prop, obstacles)) continue;
+        rect4f *polygon;
+        s32 edges;
+        f32 top, bottom;
+        chraiGetCollisionBounds(prop, &polygon, &edges, &top, &bottom);
+        if (edges > 0 && bottom <= floor + 185.0f && top >= floor + 2.0f
+            && chrpropTestPointInPolygon(pos, polygon, edges)) return FALSE;
+    }
+    coord3d headSpace = *pos;
+    headSpace.y = floor + 185.0f;
+    if (stanFindTileBelowPos(&headSpace, NULL, &resolved) && resolved > floor + 5.0f) return FALSE;
+    *stan = ground;
+    return TRUE;
+}
+
+s32 gevrCampaignSpawnPointClear(const PadRecord *pad)
+{
+    if (!pad || !pad->stan) return FALSE;
+    coord3d pos = pad->pos;
+    StandTile *stan = pad->stan;
+    return prepareCampaignGuardSpawn(&pos, &stan);
+}
+
+static const struct player *campaignSpawnObserver(s32 slot)
+{
+    const struct player *player = g_playerPointers[slot];
+    if (!player || !player->prop || !player->prop->stan || player->bonddead) return NULL;
+    if (netIsActive() && (!netSlotOccupied(slot) || netSlotIsSpectator(slot))) return NULL;
+    return player;
+}
+
+static bool campaignSpawnVisible(const PadRecord *pad, const coord3d *eye, StandTile *stan)
+{
+    const f32 floor = stanGetPositionYValue(pad->stan, pad->pos.x, pad->pos.z);
+    const f32 heights[] = {145.0f, 80.0f};
+    const s32 blockers = CDTYPE_DOORS | CDTYPE_OBJS | CDTYPE_PATHBLOCKER | CDTYPE_AIOPAQUE;
+    for (size_t i = 0; i < ARRAYCOUNT(heights); i++) {
+        const f32 target = floor + heights[i];
+        StandTile *tile = stan;
+        if (stanTestLineUnobstructed(&tile, eye->x, eye->z, pad->pos.x, pad->pos.z,
+                blockers, eye->y + 1.0f, eye->y - 1.0f, target + 1.0f, target - 1.0f)) return TRUE;
+    }
+    return FALSE;
+}
+
+static bool campaignOpeningObserverClear(const PadRecord *pad, const coord3d *eye,
+                                         StandTile *stan, f32 forwardX, f32 forwardZ)
+{
+    const f32 d2 = campaignSpawnDistanceSquared(&pad->pos, eye);
+    if (d2 < SQR(1700.0f)) return FALSE;
+    if (d2 > SQR(3200.0f)) return TRUE;
+    const f32 ahead = (pad->pos.x - eye->x) * forwardX + (pad->pos.z - eye->z) * forwardZ;
+    if (d2 > SQR(2300.0f) && ahead < 0.25f * sqrtf(d2)) return TRUE;
+    return !campaignSpawnVisible(pad, eye, stan);
+}
+
+bool gevrCampaignOpeningPointClear(const PadRecord *pad)
+{
+    if (!pad || !pad->stan) return FALSE;
+    for (s32 i = 0; i < startpadcount; i++) {
+        const PadRecord *start = g_Startpad[i];
+        if (!start || !start->stan) continue;
+        coord3d eye = start->pos;
+        eye.y = stanGetPositionYValue(start->stan, eye.x, eye.z) + 155.0f;
+        if (!campaignOpeningObserverClear(pad, &eye, start->stan, start->look.x, start->look.z)) return FALSE;
+    }
+    for (s32 i = 0; i < MAX_PLAYER_COUNT; i++) {
+        const struct player *player = campaignSpawnObserver(i);
+        if (!player) continue;
+        const f32 yaw = player->vv_theta * (M_TAU_F / 360.0f);
+        if (!campaignOpeningObserverClear(pad, &player->prop->pos, player->prop->stan,
+                                          -sinf(yaw), cosf(yaw))) return FALSE;
+    }
+    return gevrCampaignSpawnPointClear(pad);
+}
+
+bool gevrCampaignReinforcementEntryClear(const PadRecord *pad, bool protectStart)
+{
+    if (!pad || !pad->stan) return FALSE;
+    if (protectStart) {
+        for (s32 i = 0; i < startpadcount; i++) {
+            const PadRecord *start = g_Startpad[i];
+            if (start && campaignSpawnDistanceSquared(&pad->pos, &start->pos) < SQR(2500.0f)) return FALSE;
+        }
+    }
+    for (s32 i = 0; i < MAX_PLAYER_COUNT; i++) {
+        const struct player *player = campaignSpawnObserver(i);
+        if (!player) continue;
+        const PropRecord *prop = player->prop;
+        if (campaignSpawnDistanceSquared(&pad->pos, &prop->pos) < SQR(2000.0f)
+            || campaignSpawnVisible(pad, &prop->pos, prop->stan)) return FALSE;
+    }
+    return gevrCampaignSpawnPointClear(pad);
+}
+#endif
+
 /**
  * Address 0x7F03415C.
  * PD: chrSpawnAtCoord
 */
-PropRecord *chrSpawnAtCoord(s32 bodynum, s32 headnum, coord3d *pos, StandTile *stan, f32 angle, AIRecord *ailist, s32 spawnflags)
+static PropRecord *chrSpawnAtCoordInternal(s32 bodynum, s32 headnum, coord3d *pos, StandTile *stan,
+                                           f32 angle, AIRecord *ailist, s32 spawnflags, s32 spawnId)
 {
     PropRecord *chrprop;
     coord3d newpos; //struct copy here would have been more efficient
@@ -11119,6 +11347,7 @@ PropRecord *chrSpawnAtCoord(s32 bodynum, s32 headnum, coord3d *pos, StandTile *s
     StandTile *stancopy;
     Model *chrHeader;
 
+    if (spawnId >= 0 && (spawnId > 0x7fff || chrFindByLiteralId(spawnId))) return NULL;
     if (chrGetNumFree() >= 3)
     {
         if (headnum < 0)
@@ -11135,7 +11364,14 @@ PropRecord *chrSpawnAtCoord(s32 bodynum, s32 headnum, coord3d *pos, StandTile *s
         newpos.z = pos->z;
         stancopy = stan;
 
-        if (chrAdjustPosForSpawn(&newpos, &stancopy, angle, ((spawnflags & 0x10) != 0)))
+        bool clear;
+#ifdef GEVR
+        if (spawnId >= 0)
+            clear = prepareCampaignGuardSpawn(&newpos, &stancopy);
+        else
+#endif
+            clear = chrAdjustPosForSpawn(&newpos, &stancopy, angle, ((spawnflags & 0x10) != 0));
+        if (clear)
         {
             chrHeader = retrieve_header_for_body_and_head(bodynum, headnum, spawnflags);
 
@@ -11150,9 +11386,11 @@ PropRecord *chrSpawnAtCoord(s32 bodynum, s32 headnum, coord3d *pos, StandTile *s
                     chr          = chrprop->chr;
                     chr->headnum = headnum;
                     chr->bodynum = bodynum;
+                    if (spawnId >= 0) chr->chrnum = (s16)spawnId;
 #ifdef GEVR
                     /* co-op (#94): the host's spawn, made on every headset */
                     gevrCoopChrSpawned(chr, ailist, spawnflags);
+                    gevrCampaignFinishGuard(chr, FALSE);
 #endif
 
                     return chrprop;
@@ -11163,6 +11401,20 @@ PropRecord *chrSpawnAtCoord(s32 bodynum, s32 headnum, coord3d *pos, StandTile *s
 
     return NULL;
 }
+
+PropRecord *chrSpawnAtCoord(s32 bodynum, s32 headnum, coord3d *pos, StandTile *stan, f32 angle,
+                           AIRecord *ailist, s32 spawnflags)
+{
+    return chrSpawnAtCoordInternal(bodynum, headnum, pos, stan, angle, ailist, spawnflags, -1);
+}
+
+#ifdef GEVR
+PropRecord *gevrSpawnCampaignGuard(s32 bodynum, const PadRecord *pad, f32 angle, AIRecord *ailist, s32 id)
+{
+    coord3d pos = pad->pos;
+    return chrSpawnAtCoordInternal(bodynum, -1, &pos, pad->stan, angle, ailist, 0x10, id);
+}
+#endif
 
 
 /**

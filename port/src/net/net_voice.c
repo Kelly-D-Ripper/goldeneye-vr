@@ -64,7 +64,7 @@ static OpusEncoder *encoder;
  */
 static struct {
     uint32_t since;
-    unsigned taken, sent, cleared;
+    unsigned taken, sent, cleared, trimmed;
     int peak;
     FILE *wav;
     uint32_t wavFrames;
@@ -158,10 +158,11 @@ static void micStatsTick(void) {
     const uint32_t now = SDL_GetTicks();
     if (!s_micStats.since) s_micStats.since = now;
     if (now - s_micStats.since < 10000) return;
-    sysLogPrintf(LOG_NOTE, "voice: mic %u frames encoded, %u sent, %u queue clears, peak %d in %u ms (50 a second expected)",
-                 s_micStats.taken, s_micStats.sent, s_micStats.cleared, s_micStats.peak, (unsigned)(now - s_micStats.since));
+    sysLogPrintf(LOG_NOTE, "voice: mic %u frames encoded, %u sent, %u queue clears, %u queue trims, peak %d in %u ms (50 a second expected)",
+                 s_micStats.taken, s_micStats.sent, s_micStats.cleared, s_micStats.trimmed,
+                 s_micStats.peak, (unsigned)(now - s_micStats.since));
     s_micStats.since = now;
-    s_micStats.taken = s_micStats.sent = s_micStats.cleared = 0;
+    s_micStats.taken = s_micStats.sent = s_micStats.cleared = s_micStats.trimmed = 0;
     s_micStats.peak = 0;
 }
 static SDL_atomic_t permission;
@@ -319,16 +320,27 @@ void netVoiceTick(void) {
             }
         }
         if (capture && s_micConv) {
-            /* Never transmit stale speech after a render or network stall:
-             * more than 160 ms waiting (eight frames at the mic's own rate). */
-            const Uint32 stale = (Uint32)(s_micRate / 50) * sizeof(int16_t) * 8;
-            if (SDL_GetQueuedAudioSize(capture) > stale) {
-                SDL_ClearQueuedAudio(capture);
-                SDL_AudioStreamClear(s_micConv);
-                s_micStats.cleared++;
-            }
             int16_t raw[2048];
             Uint32 got;
+            const Uint32 frameBytes = (Uint32)(s_micRate / 50) * sizeof(int16_t);
+            const Uint32 queued = SDL_GetQueuedAudioSize(capture);
+            /* Keep the newest four frames after a hitch. Discard the entire
+             * queue if it has more than a second of audio to bound catch-up. */
+            if (queued > frameBytes * 50) {
+                SDL_ClearQueuedAudio(capture);
+                SDL_AudioStreamClear(s_micConv);
+                micMeasure(queued / sizeof(int16_t));
+                s_micStats.cleared++;
+            } else if (queued > frameBytes * 8) {
+                Uint32 left = queued - frameBytes * 4;
+                const Uint32 discard = left;
+                while (left && (got = SDL_DequeueAudio(capture, raw, SDL_min(left, (Uint32)sizeof(raw)))) != 0) {
+                    left -= got;
+                }
+                SDL_AudioStreamClear(s_micConv);
+                micMeasure((discard - left) / sizeof(int16_t));
+                s_micStats.trimmed++;
+            }
             while ((got = SDL_DequeueAudio(capture, raw, sizeof(raw))) > 0) {
                 micMeasure(got / sizeof(int16_t));
                 SDL_AudioStreamPut(s_micConv, raw, (int)got);

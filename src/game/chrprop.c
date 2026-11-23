@@ -11,6 +11,8 @@
 #include <ultra64.h>
 #ifdef GEVR
 #include "gevr_ragdoll.h"
+#include "gevr_tactical_loadouts.h"
+#include "gevr_hollywood_fx.h"
 #endif
 #include <assert.h>
 #include <bondgame.h>
@@ -318,6 +320,9 @@ PropRecord* chrpropAllocate(void)
 
 void chrpropFree(PropRecord *prop)
 {
+#ifdef GEVR
+    gevrTacticalForgetIssuedGear(prop);
+#endif
     prop->prev = g_FreeProps;
     prop->next = 0x0;
     prop->stan = 0x0;
@@ -1001,7 +1006,7 @@ s32 gevrStereoAimCached(s32 hand, coord3d *out)
 }
 
 /* chrTestHit records a joint's depth for damage, not the body's front face. */
-static f32 gevrStereoAimChrDepth(ShotData *shot, BulletHit *hit)
+f32 gevrChrBulletSurfaceDepth(ShotData *shot, Model *model, ModelNode *hitNode, f32 fallback)
 {
     HitThing surface;
     ModelNode *node;
@@ -1012,22 +1017,22 @@ static f32 gevrStereoAimChrDepth(ShotData *shot, BulletHit *hit)
     s32 mtxindex;
     s32 axis;
 
-    if (hit->model == NULL || hit->node == NULL || hit->model->render_pos == NULL)
+    if (model == NULL || hitNode == NULL || model->render_pos == NULL)
     {
-        return hit->dist;
+        return fallback;
     }
-    if (propobjFindHit(hit->model, hit->node, &shot->viewOrigin, &shot->viewDir, &surface, &mtxindex, &node))
+    if (propobjFindHit(model, hitNode, &shot->viewOrigin, &shot->viewDir, &surface, &mtxindex, &node))
     {
         pos = surface.hitpos;
-        mtx4TransformVecInPlace(&hit->model->render_pos[mtxindex].pos, &pos);
+        mtx4TransformVecInPlace(&model->render_pos[mtxindex].pos, &pos);
         return -pos.z;
     }
     /* Models without hittable triangles still have the game's body hitbox. */
-    if ((hit->node->Opcode & 0xff) != MODELNODE_OPCODE_BBOX)
+    if ((hitNode->Opcode & 0xff) != MODELNODE_OPCODE_BBOX)
     {
-        return hit->dist;
+        return fallback;
     }
-    mtx = modelFindNodeMtx(hit->model, hit->node, 0);
+    mtx = modelFindNodeMtx(model, hitNode, 0);
     matrix_4x4_invert_affine(mtx, &inverse);
     pos = shot->viewOrigin;
     dir = shot->viewDir;
@@ -1035,15 +1040,15 @@ static f32 gevrStereoAimChrDepth(ShotData *shot, BulletHit *hit)
     mtx4RotateVecInPlace(&inverse, &dir);
     for (axis = 0; axis < 3; axis++)
     {
-        f32 min = hit->node->Data->BoundingBox.Bounds.f[axis][0];
-        f32 max = hit->node->Data->BoundingBox.Bounds.f[axis][1];
+        f32 min = hitNode->Data->BoundingBox.Bounds.f[axis][0];
+        f32 max = hitNode->Data->BoundingBox.Bounds.f[axis][1];
         f32 near, far;
 
         if (fabsf(dir.f[axis]) < 1e-6f)
         {
             if (pos.f[axis] < min || pos.f[axis] > max)
             {
-                return hit->dist;
+                return fallback;
             }
             continue;
         }
@@ -1059,7 +1064,7 @@ static f32 gevrStereoAimChrDepth(ShotData *shot, BulletHit *hit)
         if (far < leave) leave = far;
         if (enter > leave)
         {
-            return hit->dist;
+            return fallback;
         }
     }
     return -(shot->viewOrigin.z + shot->viewDir.z * enter);
@@ -1254,9 +1259,10 @@ static s32 gevrStereoAimTrace(s32 hand, PropRecord *tankprop, const coord3d *vor
         if (hit->prop != NULL)
         {
             f32 hitdepth = hit->dist;
-            if (hit->prop->type == PROP_TYPE_CHR || hit->prop->type == PROP_TYPE_VIEWER)
+            if (!gevrChrArmorHitPart(hit->hitpart)
+                && (hit->prop->type == PROP_TYPE_CHR || hit->prop->type == PROP_TYPE_VIEWER))
             {
-                hitdepth = gevrStereoAimChrDepth(&shotdata, hit);
+                hitdepth = gevrChrBulletSurfaceDepth(&shotdata, hit->model, hit->node, hit->dist);
             }
             if (hitdepth > 0.0f && hitdepth < depth)
             {
@@ -1612,6 +1618,12 @@ void chraiDefaultWeaponFireHandler(s32 hand)
     {
         if (shotdata.hits[k].prop != 0)
         {
+#ifdef GEVR
+            if (gevrChrArmorHitPart(shotdata.hits[k].hitpart)) {
+                if (shotdata.hits[k].dist > shotdata.maxdist) continue;
+                gotbghit = hitbgstan = 0;
+            }
+#endif
 #ifdef DEBUG
         assert(!IsBadVec3d((vec3d *)&shotdata.hits[k].hit.hitpos));
 #endif
@@ -1722,12 +1734,20 @@ void chraiDefaultWeaponFireHandler(s32 hand)
 
         if (finalpos != 0)
         {
+#ifdef GEVR
+            const int hollywoodImpact = gotbghit && createSpark
+                && gevrHollywoodImpact(shotdata.weapon, bghit.texturenum, finalpos->f, bghit.normal.f, shotdata.dir.f);
+#endif
             if (createSpark)
             {
                 recall_joy2_hits_edit_flag(shotdata.weapon, finalpos, besttexture);
 
-                if (besttexture < 0 || besttexture >= gevrTextureCount()
-                    || (g_Textures[besttexture].hitTexture != 5 && g_Textures[besttexture].hitTexture != 6))
+                if (
+#ifdef GEVR
+                    !hollywoodImpact &&
+#endif
+                    (besttexture < 0 || besttexture >= gevrTextureCount()
+                    || (g_Textures[besttexture].hitTexture != 5 && g_Textures[besttexture].hitTexture != 6)))
                 {
                     rooms[0] = bestroom;
                     rooms[1] = 255;
@@ -1769,7 +1789,11 @@ void chraiDefaultWeaponFireHandler(s32 hand)
 
             gunSetTracerTarget(finalpos);
 
-            if (createSpark)
+            if (createSpark
+#ifdef GEVR
+                && !hollywoodImpact
+#endif
+            )
             {
                 bullet_spark_create(finalpos, 1, 26.0f, bestroom);
             }
@@ -1870,7 +1894,8 @@ void chrpropAddBulletHit(struct ShotData *shotdata, PropRecord *prop, f32 dist, 
     {
 #ifdef GEVR
         /* Goldfinger's glass stops all but its Ruger- and Spectre-file guns */
-        if (shotdata->weapon != gevrRomGlassPen(0) && shotdata->weapon != gevrRomGlassPen(1))
+        if (gevrChrArmorHitPart(hitpart)
+            || (shotdata->weapon != gevrRomGlassPen(0) && shotdata->weapon != gevrRomGlassPen(1)))
 #else
         if (shotdata->weapon != ITEM_RUGER && shotdata->weapon != ITEM_SILVERWPPK)
 #endif
@@ -2134,7 +2159,7 @@ void chraiFistAttackHandler(s32 hand, s32 item_id)
 static f32 gevrHandViewScale(void);
 
 s32 gevrChopHit(const f32 fromview[3], const f32 toview[3], f32 touchview, const f32 dir[3], s32 item_id,
-                const f32 vel[3], f32 need, s32 land, f32 *into)
+                const f32 vel[3], f32 need, s32 land, s32 piercer, f32 *into)
 {
     PropRecord *playerprop = getCurrentPlayerProp();
     f32 ducking = bondviewGetPlayerDuckingHeightRelated(g_CurrentPlayer);
@@ -2152,6 +2177,9 @@ s32 gevrChopHit(const f32 fromview[3], const f32 toview[3], f32 touchview, const
     }
 
     *into = 0.0f;
+    extern int gevrTacticalKnifeEnabled(void);
+    const s32 huntsman = item_id == ITEM_KNIFE && gevrTacticalKnifeEnabled();
+    const s32 katana = item_id == ITEM_TACTICAL_KATANA;
 
     for (propptr = g_LastOnScreenProp - 1; propptr >= g_OnScreenPropList; propptr--)
     {
@@ -2179,6 +2207,7 @@ s32 gevrChopHit(const f32 fromview[3], const f32 toview[3], f32 touchview, const
         }
 
         chr = prop->chr;
+        if ((huntsman || katana) && (chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD)) continue;
         modelGetAxisExtents(chr->model, &max0, &min0, 0);
         modelGetAxisExtents(chr->model, &max1, &min1, 1);
         modelGetAxisExtents(chr->model, &max2, &min2, 2);
@@ -2262,7 +2291,7 @@ s32 gevrChopHit(const f32 fromview[3], const f32 toview[3], f32 touchview, const
             {
                 *into = speed;
             }
-            if (speed < need)
+            if (!katana && speed < need)
             {
                 if (hit == 0)
                 {
@@ -2288,15 +2317,32 @@ s32 gevrChopHit(const f32 fromview[3], const f32 toview[3], f32 touchview, const
         {
             hitpart = HIT_GENERALHALF;
         }
+        coord3d contact;
+        if (katana || piercer) {
+            hitpart = gevrBladeHitRegion(chr, from, to, touch, contact.f);
+            if (hitpart == HIT_NULL_PART) continue;
+        }
 
         vector.x = dir[0];
         vector.y = dir[1];
         vector.z = dir[2];
         mtx4RotateVecInPlace(currentPlayerGetViewToWorldMtxf(), &vector);
 
-        if (handles_shot_actors(chr, hitpart, &vector, item_id, 1))
+        if (piercer || katana) {
+            mtx4TransformVecInPlace(currentPlayerGetViewToWorldMtxf(), &contact);
+            gevrCoopGuardImpactPoint(chr, &contact, -1, piercer != 0);
+        }
+        const int applied = handles_shot_actors(chr, hitpart, &vector, item_id, 1);
+        if (piercer || katana) gevrCoopGuardImpactPoint(NULL, NULL, -1, FALSE);
+        if (applied)
         {
             recall_joy2_hits_edit_detail_edit_flag(item_id, prop, -1);
+            if (piercer) {
+                gevrRagdollNoteBladeStab(chr, piercer - 1, item_id, hitpart, vector.f, contact.f);
+            } else if (katana) {
+                gevrRagdollNoteKatanaDeath(chr, hitpart, vector.f);
+            }
+            if (huntsman || katana) return 2;
             hit = 2;
         }
     }
@@ -2445,6 +2491,7 @@ PropRecord *gevrHandFindProp(const f32 p[3], f32 reach, s32 kind)
 {
     PropRecord **ptr;
     PropRecord *best = NULL;
+    const s32 pickup = kind == GEVR_HAND_PICKUP || kind == GEVR_HAND_PICKUP_CONTACT;
     f32 bestdist = kind == GEVR_HAND_PICKUP ? 1.4f * reach : reach;   /* a pickup may be under the hand (below) */
     coord3d up = { 0.0f, 1.0f, 0.0f };
     f32 len;
@@ -2563,7 +2610,7 @@ PropRecord *gevrHandFindProp(const f32 p[3], f32 reach, s32 kind)
                 dist = horiz;
             }
         }
-        if (dist < bestdist && kind == GEVR_HAND_PICKUP && !gevrPullSightClear(prop->pos.x, prop->pos.y, prop->pos.z, NULL))
+        if (dist < bestdist && pickup && !gevrPullSightClear(prop->pos.x, prop->pos.y, prop->pos.z, NULL))
         {
             continue;   /* the hand through a window or a wall: the player can't see it (gevr_forcepull.c) */
         }
@@ -2685,7 +2732,7 @@ s32 gevrHandInteract(PropRecord *prop)
  * propobj.c lets g_gevrHandGrabProp through those, and with mine set also
  * through the thrown-mine rule. Returns whether it was collected.
  */
-s32 gevrHandPickup(PropRecord *prop, s32 mine)
+static s32 gevrHandPickupInternal(PropRecord *prop, s32 mine, s32 ctrl)
 {
     extern PropRecord *g_gevrHandGrabProp;
     extern s32 g_gevrHandGrabMine;
@@ -2697,6 +2744,8 @@ s32 gevrHandPickup(PropRecord *prop, s32 mine)
     {
         return FALSE;
     }
+    extern uint32_t gevrTacticalLootPropId(const PropRecord *prop);
+    if (gevrTacticalLootPropId(prop)) return FALSE;
     g_gevrHandGrabProp = prop;
     g_gevrHandGrabMine = mine;
     op = prop->type == PROP_TYPE_WEAPON ? weaponTickPlayer(prop) : objTickPlayer(prop);
@@ -2711,9 +2760,21 @@ s32 gevrHandPickup(PropRecord *prop, s32 mine)
     if (prop->type == PROP_TYPE_WEAPON && prop->weapon != NULL)
     {
         netSendSpecialTaken(prop->weapon->weaponnum);
+        /* The successful pickup can free the world prop and its gear record. */
+        if (ctrl >= 0) gevrTacticalAcceptWeaponPickup(prop, ctrl, prop->weapon->weaponnum);
     }
     propExecuteTickOperation(prop, op);
     return TRUE;
+}
+
+s32 gevrHandPickup(PropRecord *prop, s32 mine)
+{
+    return gevrHandPickupInternal(prop, mine, -1);
+}
+
+s32 gevrHandPickupIntoHand(PropRecord *prop, s32 ctrl)
+{
+    return gevrHandPickupInternal(prop, FALSE, ctrl);
 }
 
 #endif
@@ -2786,7 +2847,7 @@ void chraiCheckUseHeldItem(s32 hand)
             }
         }
 #endif
-        else if (item_id == ITEM_SHOTGUN || item_id == ITEM_AUTOSHOT)
+        else if (GEVR_ITEM_AS(item_id) == ITEM_SHOTGUN || GEVR_ITEM_AS(item_id) == ITEM_AUTOSHOT)
         {
             inc_curplayer_hitcount_with_weapon(item_id, SHOT_REGISTER_TOTAL);
 
@@ -3909,12 +3970,17 @@ s32 propDoorGetCdTypes(PropRecord* prop)
 * Address: 7F03DA50
 * PD: prop_is_of_cd_type
 */
+#ifdef GEVR
+/* Set only while the truck probes its next position, never for player/AI movement. */
+s32 g_gevrVehicleIgnoreDead;
+#endif
 s32 propIsOfCdType(PropRecord* prop, s32 cdtypes) {
     s32 ret;
     ObjectRecord *obj;
     ret = 1;
 
 #ifdef GEVR
+    if (g_gevrVehicleIgnoreDead && prop->type == PROP_TYPE_CHR && prop->chr && chrIsDead(prop->chr)) return 0;
     /* the race's ghost (gevr_ghost.c) is a picture of a run: nothing walks into it */
     {
         extern s32 gevrGhostIsChr(ChrRecord *chr);

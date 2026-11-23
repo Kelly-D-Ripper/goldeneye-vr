@@ -75,6 +75,7 @@ void lvlSetControlsLockedFlag(s32 arg0);
 s32 lvlGetControlsLockedFlag(void);
 void lvlSetMultipliersForDifficulty(void);
 s32 lvlGetCurrentStageToLoad(void);
+f32 lvlGetStageTimeSec(void);
 s32        sub_GAME_7F0BD8F0(void);
 f32        lvlGetCurrentMultiPlayerSec(void);
 f32        lvlGetCurrentMultiPlayerMin(void);

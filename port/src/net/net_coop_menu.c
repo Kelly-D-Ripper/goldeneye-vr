@@ -23,6 +23,7 @@
 #include "system.h"
 #include "bondconstants.h"
 #include "boss.h"
+#include "gevr_tactical_gear.h"
 #include "game/front.h"
 
 #define COOP_MENU_SEND_US 100000ull     /* the host's cursor, ten times a second */
@@ -42,6 +43,10 @@ typedef struct {
 static CoopMenuState s_sent, s_host;
 static bool s_sent_valid, s_host_valid;
 static u64 s_sent_us;
+static u64 s_kit_sent_us;
+static u32 s_kit_epoch;
+static unsigned s_kit_ready;
+static int s_local_kit_ready;
 
 /*
  * Before each co-op stage load. A host can start while a teammate is still
@@ -79,6 +84,74 @@ static bool coopInMenus(void)
     return netCoopSession() && bossGetStageNum() == LEVELID_TITLE;
 }
 
+int gevrCoopTacticalKitMenu(void)
+{
+    return coopInMenus() && sysArgCheck("--tactical-coop") && gevrTacticalGearEnabled();
+}
+
+int gevrCoopTacticalKitGuest(void)
+{
+    return gevrCoopTacticalKitMenu() && !netIsHost() && !netSlotIsSpectator(netGetLocalSlot());
+}
+
+int gevrCoopTacticalKitReady(void) { return s_local_kit_ready; }
+
+int gevrCoopTacticalKitCount(int *total)
+{
+    int ready = 0;
+    *total = 0;
+    if (!gevrCoopTacticalKitMenu() || !netIsHost()) return 0;
+    for (int slot = 0; slot < GEVR_MAX_PLAYERS; ++slot) {
+        if (slot == netGetLocalSlot() || !netLobbySlotConnected(slot) || netSlotIsSpectator(slot)) continue;
+        ++*total;
+        if (s_kit_ready & (1u << slot)) ++ready;
+    }
+    return ready;
+}
+
+void netCoopKitForgetSlot(int slot)
+{
+    if (slot >= 0 && slot < GEVR_MAX_PLAYERS) s_kit_ready &= ~(1u << slot);
+}
+
+static void coopSendKitReady(void)
+{
+    u8 raw[16];
+    struct netbuf buf = { .data = raw, .size = sizeof(raw) };
+    netbufStartWrite(&buf);
+    netbufWriteU32(&buf, GEVR_NET_MAGIC);
+    netbufWriteU16(&buf, GEVR_NET_VERSION);
+    netbufWriteU8(&buf, NET_MSG_TACTICAL_KIT_READY);
+    netbufWriteU8(&buf, netGetLocalSlot());
+    netbufWriteU32(&buf, netGetWorldEpoch());
+    netbufWriteU8(&buf, !!s_local_kit_ready);
+    netCoopBroadcast(raw, buf.wp, true);
+    s_kit_sent_us = sysGetMicroseconds();
+}
+
+void gevrCoopTacticalKitSetReady(int ready)
+{
+    if (!gevrCoopTacticalKitGuest()) return;
+    s_local_kit_ready = !!ready;
+    s_kit_epoch = netGetWorldEpoch();
+    coopSendKitReady();
+    sysLogPrintf(LOG_NOTE, "tactical co-op kit: local %s", ready ? "ready" : "editing");
+}
+
+void netCoopReceiveKitReady(int slot, struct netbuf *b)
+{
+    const u32 epoch = netbufReadU32(b);
+    const u8 ready = netbufReadU8(b);
+    if (b->error || netbufReadLeft(b) || ready > 1 || epoch != netGetWorldEpoch() ||
+        !gevrCoopTacticalKitMenu() || !netIsHost() || slot < 0 || slot >= GEVR_MAX_PLAYERS ||
+        slot == netGetLocalSlot() || !netLobbySlotConnected(slot) || netSlotIsSpectator(slot)) return;
+    const unsigned mask = 1u << slot;
+    if (!!(s_kit_ready & mask) == ready) return;
+    if (ready) s_kit_ready |= mask;
+    else s_kit_ready &= ~mask;
+    sysLogPrintf(LOG_NOTE, "tactical co-op kit: guest %d %s", slot, ready ? "ready" : "editing");
+}
+
 int gevrCoopIsHost(void)
 {
     return netCoopSession() && netIsHost();
@@ -93,7 +166,8 @@ int gevrWatchController(void)
 /* This headset follows the host's menus: past its own folder screen, on one the host drives */
 int gevrCoopMenuFollowing(void)
 {
-    return coopInMenus() && !netIsHost() && coopMenuFollowable(coopMenuTarget());
+    return coopInMenus() && !netIsHost() && !gevrCoopTacticalKitGuest()
+        && coopMenuFollowable(coopMenuTarget());
 }
 
 /* The host's choices, as the screens read them */
@@ -230,7 +304,14 @@ void gevrCoopMenuTick(void)
         s_sent_valid = false;
         return;
     }
-    if (netIsHost()) coopMenuSend();
+    if (gevrCoopTacticalKitGuest()) {
+        gevrCoopPrepareSaveFolder();
+        if (gevrCoopMenuMissionAction(MENU_MODE_SELECT) == 0)
+            frontChangeMenu(MENU_MODE_SELECT, TRUE);
+        if (s_local_kit_ready && s_kit_epoch == netGetWorldEpoch()
+            && sysGetMicroseconds() - s_kit_sent_us > 1000000ull) coopSendKitReady();
+    }
+    else if (netIsHost()) coopMenuSend();
     else coopMenuFollow();
 }
 
@@ -239,4 +320,7 @@ void netCoopMenuReset(void)
 {
     s_host_valid = false;
     s_sent_valid = false;
+    s_kit_ready = 0;
+    s_local_kit_ready = 0;
+    s_kit_sent_us = 0;
 }

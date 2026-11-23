@@ -29,6 +29,7 @@ static struct {struct {unsigned char r,g,b,a;} fog_color;} rdp;
 static bool s_gevrMeshOn=true, s_gevrSkinOn=true, gevrCullOff, gevrCullMirror; static uint8_t s_beanFadeAlpha=255;
 static bool fbActive=true, s_gevrMeshProbe, s_beanRoomFogLinear, s_beanRoomFogRadial, gevrRoomDl;
 static void gevr_fog_radial_scale(float k[2]){k[0]=k[1]=0;}   /* GEVR_ROOM_RADIAL: not in these draws */
+static bool s_editorCapture;
 static float s_beanRoomFogLine[2];
 static unsigned s_gevrMeshCulled, s_gevrMeshCulledTris, s_gevrMeshFallbacks;
 static unsigned s_gevrMeshDraws, s_gevrMeshTris, s_gevrSkinDraws, s_gevrSkinTris;
@@ -88,6 +89,9 @@ int main(){
     // A fading body (G_GEVR_BEAN_FADE) draws on the CPU, which scales its alpha.
     reset();s_beanFadeAlpha=128;
     assert(!gevr_mesh_draw_run(&mesh,&run,&skin));assert(!draws && !probes);
+    assert(!gevr_mesh_draw_run(&mesh,&run,nullptr));assert(!draws && !probes);
+    // Editor model export still sees the original triangles.
+    reset();s_editorCapture=true;mesh.tacticalGear=1;
     assert(!gevr_mesh_draw_run(&mesh,&run,nullptr));assert(!draws && !probes);
     puts("PASS: hidden runs bypass CPU posing and draw setup; mirrored skin winding matches CPU semantics; special fallbacks and fading bodies preserved");
 }

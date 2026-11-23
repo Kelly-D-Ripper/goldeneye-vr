@@ -17,7 +17,8 @@ static int fileGetSaveStageCompletedForDifficulty(save_data *save, int mission, 
     return save->complete[mission][difficulty];
 }
 static int get_debug_enable_agent_levels_flag(void) { return 0; }
-static int get_debug_enable_all_levels_flag(void) { return 0; }
+static int unlock_for_testing;
+static int get_debug_enable_all_levels_flag(void) { return unlock_for_testing; }
 /* INSERT_FILE */
 
 static struct { int mission_num, stage_id, folder_text_preset; } mission_folder_setup_entries[48];
@@ -59,6 +60,16 @@ static void unlocks(void)
             assert(fileIsStageUnlockedAtDifficulty(0, 0, d) == STAGESTATUS_UNLOCKED);
             assert(fileIsStageUnlockedAtDifficulty(0, 1, d) == STAGESTATUS_LOCKED);
         }
+        unlock_for_testing = 1;
+        for (int stage = 0; stage < count; ++stage)
+            for (int d = DIFFICULTY_AGENT; d <= DIFFICULTY_00; ++d)
+                assert(fileIsStageUnlockedAtDifficulty(0, stage, d) == STAGESTATUS_UNLOCKED);
+        assert(fileIsStageUnlockedAtDifficulty(0, count, DIFFICULTY_AGENT) == STAGESTATUS_LOCKED);
+        assert(!fileIs007ModeUnlocked(0));
+        assert(fileIsEgyptCompletedOn00ForFolder(0) == open);
+        unlock_for_testing = 0;
+        assert(fileIsStageUnlockedAtDifficulty(0, 1, DIFFICULTY_AGENT) == STAGESTATUS_LOCKED);
+
         completed_through(first_bonus - 1, DIFFICULTY_AGENT);
         assert(fileIsStageUnlockedAtDifficulty(0, first_bonus, DIFFICULTY_AGENT) == STAGESTATUS_LOCKED);
         assert(fileIsStageUnlockedAtDifficulty(0, second_bonus, DIFFICULTY_AGENT) == STAGESTATUS_LOCKED);

@@ -130,6 +130,7 @@ bool get_controller_pose(int hand_index, XrPosef* pose);
 
 
 bool get_button_state(int hand_index, const char* button_name);
+bool gevrVrGripInputAvailable(int hand_index);
 
 /**
  * @brief Gets the 2D value of an input (joystick, trackpad)

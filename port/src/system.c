@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
+#include <ctype.h>
 #include <time.h>
 #include <errno.h>
 #include <sys/time.h>
@@ -113,6 +114,27 @@ static char logPath[2048];
 
 static s32 sysArgc;
 static const char **sysArgv;
+static s32 sysArgIndex[128];
+
+static unsigned sysArgKey(const char *arg)
+{
+    u32 hash = 2166136261u;
+    for (; *arg; ++arg) hash = (hash ^ (u32)tolower((unsigned char)*arg)) * 16777619u;
+    return hash & (sizeof(sysArgIndex) / sizeof(sysArgIndex[0]) - 1);
+}
+
+static s32 sysFindArg(const char *arg)
+{
+    if (sysArgc < (s32)(sizeof(sysArgIndex) / sizeof(sysArgIndex[0]))) {
+        const unsigned mask = sizeof(sysArgIndex) / sizeof(sysArgIndex[0]) - 1;
+        for (unsigned at = sysArgKey(arg); sysArgIndex[at]; at = (at + 1) & mask)
+            if (!strcasecmp(sysArgv[sysArgIndex[at]], arg)) return sysArgIndex[at];
+        return 0;
+    }
+    for (s32 i = 1; i < sysArgc; ++i)
+        if (!strcasecmp(sysArgv[i], arg)) return i;
+    return 0;
+}
 
 static inline void sysLogSetPath(const char *fname)
 {
@@ -136,6 +158,15 @@ void sysInitArgs(s32 argc, const char **argv)
 {
     sysArgc = argc;
     sysArgv = argv;
+    memset(sysArgIndex, 0, sizeof(sysArgIndex));
+    const unsigned mask = sizeof(sysArgIndex) / sizeof(sysArgIndex[0]) - 1;
+    if (argc > (s32)mask) return;
+    for (s32 i = 1; i < argc; ++i) {
+        if (sysFindArg(argv[i])) continue;
+        unsigned at = sysArgKey(argv[i]);
+        while (sysArgIndex[at]) at = (at + 1) & mask;
+        sysArgIndex[at] = i;
+    }
 }
 
 void sysInit(void)
@@ -182,36 +213,19 @@ void sysInit(void)
 
 s32 sysArgCheck(const char *arg)
 {
-    for (s32 i = 1; i < sysArgc; ++i) {
-        if (!strcasecmp(sysArgv[i], arg)) {
-            return 1;
-        }
-    }
-    return 0;
+    return sysFindArg(arg) != 0;
 }
 
 const char *sysArgGetString(const char *arg)
 {
-    for (s32 i = 1; i < sysArgc; ++i) {
-        if (!strcasecmp(sysArgv[i], arg)) {
-            if (i < sysArgc - 1) {
-                return sysArgv[i + 1];
-            }
-        }
-    }
-    return NULL;
+    const s32 index = sysFindArg(arg);
+    return index > 0 && index < sysArgc - 1 ? sysArgv[index + 1] : NULL;
 }
 
 s32 sysArgGetInt(const char *arg, s32 defval)
 {
-    for (s32 i = 1; i < sysArgc; ++i) {
-        if (!strcasecmp(sysArgv[i], arg)) {
-            if (i < sysArgc - 1) {
-                return strtol(sysArgv[i + 1], NULL, 0);
-            }
-        }
-    }
-    return defval;
+    const char *value = sysArgGetString(arg);
+    return value ? strtol(value, NULL, 0) : defval;
 }
 
 /*

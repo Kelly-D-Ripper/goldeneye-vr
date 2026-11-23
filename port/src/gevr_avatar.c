@@ -3,8 +3,15 @@
  * See docs/multiplayer-ik.md and port/licenses/{perfect-dark-ce,perfect-dark-vr}.txt. */
 #include <stdbool.h>
 #include "gevr_avatar.h"
+#include "gevr_guard_cigarettes.h"
+#include "gevr_guard_cover.h"
+#include "chr.h"
+#include "lv.h"
+#include "gevr_tactical_mesh.h"
+#include "gevr_tactical_net.h"
 #include "net/net_core.h"
 #include "model.h"
+#include "game/prop.h"
 #include "objecthandler.h"
 #include "player.h"
 #include "bondview.h"
@@ -94,6 +101,7 @@ typedef struct AvatarBuild {
 static AvatarBuild s_build;
 typedef struct AvatarCollision {Model *model;RenderPosView *posed,*base;} AvatarCollision;
 static AvatarCollision s_collision[GEVR_MAX_PLAYERS];
+static AvatarCollision s_guardCollision[256];
 
 static ModelNode *nextNode(ModelNode *n) {
     if(n->Child)return n->Child;
@@ -239,8 +247,380 @@ void gevrAvatarApply(ChrRecord *chr,ModelRenderData *data) {
     s_build.model=NULL;g_ModelJointPositionedFunc=jointCallback;*root=savedRoot;
 }
 
+void gevrAvatarGuardForget(ChrRecord *chr) {
+    if (!chr || !chr->model) return;
+    for (int i=0;i<256;i++) if (s_guardCollision[i].model==chr->model) s_guardCollision[i].model=NULL;
+}
+void gevrAvatarGuardReset(void) { memset(s_guardCollision,0,sizeof(s_guardCollision)); }
+
+void gevrAvatarGuardApply(ChrRecord *chr, ModelRenderData *data) {
+    ModelNode *nodes[16];
+    Mtxf sm,em,wm,rm,gunWorld;
+    float shoulder[3],a[3],b[3],target[3],pole[3],elbow[3],wrist[3],dir[3],orig[3][3],aim[3][3];
+    int slot=-1;
+    const bool online = netIsActive();
+    if (!chr || !data || !chr->prop || chr->prop->type!=PROP_TYPE_CHR || !chr->model || !chr->model->anim
+        || chr->actiontype==ACT_DIE || chr->actiontype==ACT_DEAD || g_gevrExtraPass
+        || !sysArgCheck("--tactical-enemy-rigs") || !sysArgCheck("--tactical-mesh")
+        || !currentPlayerGetViewToWorldMtxf()) return;
+    const bool grouped = gevrCampaignGuardIsIdleGroupMember(chr);
+    if (online && !grouped) return;
+    if (chr->weapons_held[GUNLEFT]) {
+        if (grouped) gevrGuardCigarettePose(chr, NULL);
+        return;
+    }
+    const PropRecord *held = chr->weapons_held[GUNRIGHT];
+    if (!held || !held->weapon) return;
+    Model *gun = held->weapon->model;
+    float contact[3];
+    const bool supportGrip = (held->flags & PROPFLAG_ONSCREEN) && gun && gun->render_pos && gun->attachedto
+        && gevrTacticalGuardSupportContact(gun, held->weapon->weaponnum, contact);
+    if (!grouped && !supportGrip) return;
+    Model *m = chr->model;
+    if (!findRig(m,nodes)) {
+        if (grouped) gevrGuardCigarettePose(chr, NULL);
+        return;
+    }
+    worldMatrix(m,nodes[4],&sm); worldMatrix(m,nodes[6],&em); worldMatrix(m,nodes[8],&wm);
+    if (supportGrip) matrix_4x4_multiply(currentPlayerGetViewToWorldMtxf(),&gun->render_pos[0].pos,&gunWorld);
+    for(int k=0;k<3;k++) {
+        shoulder[k]=sm.m[3][k]; a[k]=em.m[3][k]-shoulder[k]; b[k]=wm.m[3][k]-em.m[3][k];
+        target[k]=supportGrip ? gunWorld.m[3][k]+contact[0]*gunWorld.m[0][k]
+            +contact[1]*gunWorld.m[1][k]+contact[2]*gunWorld.m[2][k] : wm.m[3][k];
+        pole[k]=a[k];
+    }
+    const float smoking = gevrGuardCigarettePose(chr, target);
+    if ((online || !supportGrip) && smoking <= 0.f) return;
+    if(!gevrArmSolve(shoulder,target,sqrtf(dot(a,a)),sqrtf(dot(b,b)),pole,a,elbow,wrist)) return;
+    for (int i=0;i<256;i++) if (!s_guardCollision[i].model) {slot=i;break;}
+    if(slot<0)return;
+    memset(&s_build,0,sizeof(s_build)); memcpy(s_build.node,nodes,sizeof(nodes));
+    for(int k=0;k<3;k++)dir[k]=elbow[k]-shoulder[k];
+    basis(&sm,orig); aimBone(a,dir,orig,aim); desired(4,aim,orig,1.0f);
+    for(int k=0;k<3;k++)dir[k]=wrist[k]-elbow[k];
+    basis(&em,orig); aimBone(b,dir,orig,aim); desired(6,aim,orig,1.0f);
+    /* Keep the support palm oriented along the weapon, with the left wrist's
+     * 180-degree hand-frame convention used by native weapon attachments. */
+    worldMatrix(m,nodes[9],&rm);
+    basis(&rm,aim);
+    for(int k=0;k<3;k++) {aim[0][k]=-aim[0][k];aim[1][k]=-aim[1][k];}
+    if (smoking > 0.f) {
+        float relaxed[3][3];
+        basis(&wm,orig);
+        aimBone(b,dir,orig,relaxed);
+        desired(8,relaxed,aim,smoking);
+    } else {
+        basis(&wm,orig);
+        desired(8,aim,orig,1.f);
+    }
+    RenderPosView *baseline=m->render_pos;
+    RenderPosView *posed=dynAllocate(m->obj->numMatrices*sizeof(*posed));
+    if(!posed)return;
+    m->render_pos=posed;
+    s_guardCollision[slot]=(AvatarCollision){m,posed,baseline};
+    void (*callback)(s32,Mtxf *)=g_ModelJointPositionedFunc;
+    g_ModelJointPositionedFunc=NULL; s_build.model=m;
+    modelUpdateMatrices(data,m);
+    s_build.model=NULL; g_ModelJointPositionedFunc=callback;
+    if (smoking > 0.f) {
+        Mtxf posedWrist;
+        worldMatrix(m,nodes[8],&posedWrist);
+        gevrGuardCigaretteGrip(chr,target,posedWrist.m[3]);
+    }
+    if (sysArgCheck("--input-script") && sysArgCheck("--tactical-grip-debug") && chr->chrnum>=5000) {
+        static int n;
+        if(n==0 || n==500 || n==1500) {
+            Mtxf after; float pre[3],post[3];
+            worldMatrix(m,nodes[8],&after);
+            for(int k=0;k<3;k++) {pre[k]=target[k]-wm.m[3][k];post[k]=target[k]-after.m[3][k];}
+            sysLogPrintf(LOG_NOTE,"guard support IK: item %d sample %d before %.1f after %.1f",
+                held->weapon->weaponnum,n,(double)sqrtf(dot(pre,pre)),(double)sqrtf(dot(post,post)));
+        }
+        n++;
+    }
+}
+
+/* A cover animation is relative to the native pelvis. Keeps feet planted
+ * and moves the original attachment and hittable matrices together. */
+#define GUARD_COVER_BLEND_TICKS 8
+
+static float guardCoverProgress(const ChrRecord *chr)
+{
+    const int elapsed = g_GlobalTimer - chr->tacticalCover.started;
+    const float t = fmaxf(0.f, fminf(1.f, elapsed / (float)GUARD_COVER_BLEND_TICKS));
+    return t * t * (3.f - 2.f * t);
+}
+
+static void guardCoverEvaluate(const ChrRecord *chr, float offset[2], float *blind, float t)
+{
+    for (int i = 0; i < 2; ++i)
+        offset[i] = chr->tacticalCover.from[i] + (chr->tacticalCover.target[i] - chr->tacticalCover.from[i]) * t;
+    const float target = chr->tacticalCover.kind >= GEVR_GUARD_COVER_BLIND_LEFT ? 1.f : 0.f;
+    *blind = chr->tacticalCover.blindFrom + (target - chr->tacticalCover.blindFrom) * t;
+}
+
+void gevrGuardCoverPoseSet(ChrRecord *chr, int pose, float offsetX, float offsetZ)
+{
+    if (!chr) return;
+    if (pose < GEVR_GUARD_COVER_NONE || pose > GEVR_GUARD_COVER_BLIND_RIGHT
+        || !isfinite(offsetX) || !isfinite(offsetZ)) pose = GEVR_GUARD_COVER_NONE;
+    if (pose < GEVR_GUARD_COVER_LEAN_LEFT) offsetX = offsetZ = 0.f;
+    const float scale = fmaxf(1.f, hypotf(offsetX, offsetZ) / GEVR_GUARD_COVER_MAX_OFFSET);
+    const s8 target[2] = {(s8)lroundf(offsetX / scale), (s8)lroundf(offsetZ / scale)};
+    if (chr->tacticalCover.kind == pose && !memcmp(chr->tacticalCover.target, target, sizeof(target))) return;
+    const float progress = guardCoverProgress(chr);
+    guardCoverEvaluate(chr, chr->tacticalCover.from, &chr->tacticalCover.blindFrom, progress);
+    memcpy(chr->tacticalCover.target, target, sizeof(target));
+    chr->tacticalCover.kind = pose;
+    chr->tacticalCover.started = g_GlobalTimer;
+    chr->tacticalCover.muzzleMask = 0;
+}
+
+int gevrGuardCoverPoseGet(const ChrRecord *chr, float offset[2], float *blend)
+{
+    if (offset) offset[0] = offset[1] = 0.f;
+    if (blend) *blend = 1.f;
+    if (!chr || chr->actiontype == ACT_DEAD || chr->actiontype == ACT_DIE) return GEVR_GUARD_COVER_NONE;
+    const float progress = guardCoverProgress(chr);
+    if (offset) {
+        float blind;
+        guardCoverEvaluate(chr, offset, &blind, progress);
+    }
+    if (blend) *blend = progress;
+    return chr->tacticalCover.kind;
+}
+
+int gevrGuardCoverMuzzle(const ChrRecord *chr, int hand, coord3d *muzzle)
+{
+    if (!chr || !muzzle || (hand != GUNRIGHT && hand != GUNLEFT)
+        || chr->actiontype == ACT_DEAD || chr->actiontype == ACT_DIE
+        || chr->tacticalCover.kind < GEVR_GUARD_COVER_LEAN_LEFT || !(chr->tacticalCover.muzzleMask & (1u << hand))) return false;
+    const int age = g_GlobalTimer - chr->tacticalCover.muzzleTick;
+    if (age < 0 || age > 5 || guardCoverProgress(chr) < 1.f) return false;
+    *muzzle = chr->tacticalCover.muzzle[hand];
+    return true;
+}
+
+static void coverRotate(const float axis[3], const float v[3], float sine, float cosine, float out[3])
+{
+    float tangent[3];
+    cross(axis, v, tangent);
+    const float parallel = dot(axis, v) * (1.f - cosine);
+    for (int k = 0; k < 3; ++k) out[k] = v[k] * cosine + tangent[k] * sine + axis[k] * parallel;
+}
+
+static void coverBendMatrices(Model *model, RenderPosView *matrices, ModelNode *nodes[16],
+                              const float shift[3], const float up[3], const float axis[3], float distance, float blind)
+{
+    const int pivotIndex = nodes[2]->Data->Group.MatrixID0;
+    float pivot[3];
+    memcpy(pivot, matrices[pivotIndex].pos.m[3], sizeof(pivot));
+    const float leanAngle = fminf(.31f, distance * .0046f);
+    const float sine[2] = {sinf(leanAngle * (1.f - .83f * blind)), sinf(leanAngle)};
+    const float cosine[2] = {cosf(leanAngle * (1.f - .83f * blind)), cosf(leanAngle)};
+    const float reach[2] = {.72f * (1.f - .78f * blind), .72f};
+    const float lower[2] = {-distance * (.10f + .14f * blind), -distance * .10f};
+    /* Group nodes identify the auxiliary skinning matrices as well as the
+     * main joint. The same original subtree also feeds helmets and rigs. */
+    int visits = 0;
+    for (ModelNode *node = nodes[2]; node && visits++ < 512; node = nextNode(node)) {
+        int upper = 0, arm = 0;
+        for (ModelNode *parent = node; parent; parent = parent->Parent) {
+            if (parent == nodes[4] || parent == nodes[5]) arm = 1;
+            if (parent == nodes[2]) { upper = 1; break; }
+        }
+        if (!upper) break;
+        if ((node->Opcode & 255) != MODELNODE_OPCODE_GROUP) continue;
+        for (int j = 0; j < 3; ++j) {
+            if (j && !(node->Opcode & (j == 1 ? 0x100 : 0x200))) continue;
+            const int index = node->Data->Group.MatrixIDs[j];
+            if (index < 0 || index >= model->obj->numMatrices) continue;
+            Mtxf *matrix = &matrices[index].pos;
+            float relative[3], shifted[3];
+            for (int k = 0; k < 3; ++k) relative[k] = matrix->m[3][k] - pivot[k];
+            coverRotate(axis, relative, sine[arm], cosine[arm], shifted);
+            for (int k = 0; k < 3; ++k)
+                matrix->m[3][k] = pivot[k] + shifted[k] + reach[arm] * shift[k] + lower[arm] * up[k];
+            for (int j = 0; j < 3; ++j) {
+                coverRotate(axis, matrix->m[j], sine[arm], cosine[arm], shifted);
+                memcpy(matrix->m[j], shifted, sizeof(shifted));
+            }
+        }
+    }
+}
+
+int gevrGuardCoverApply(ChrRecord *chr)
+{
+    if (!chr || !chr->model || !chr->model->render_pos || !chr->prop
+        || chr->prop->type != PROP_TYPE_CHR || chr->actiontype == ACT_DEAD || chr->actiontype == ACT_DIE) return FALSE;
+    if (chr->tacticalCover.kind < GEVR_GUARD_COVER_LEAN_LEFT && guardCoverProgress(chr) >= 1.f) return FALSE;
+    if (chr->tacticalCover.kind < GEVR_GUARD_COVER_LEAN_LEFT
+        && chr->tacticalCover.from[0] == 0.f && chr->tacticalCover.from[1] == 0.f) return FALSE;
+    float offset[2], blind;
+    guardCoverEvaluate(chr, offset, &blind, guardCoverProgress(chr));
+    const float distance = hypotf(offset[0], offset[1]);
+    if (distance < .1f) return FALSE;
+    Model *model = chr->model;
+    ModelNode *nodes[16];
+    const Mtxf *view = camGetWorldToScreenMtxf();
+    if (!view || !findRig(model, nodes)) return FALSE;
+    float shift[3], up[3], axis[3];
+    for (int k = 0; k < 3; ++k) {
+        shift[k] = offset[0] * view->m[0][k] + offset[1] * view->m[2][k];
+        up[k] = view->m[1][k];
+    }
+    cross(up, shift, axis);
+    if (!unit(axis) || !unit(up)) return FALSE;
+    coverBendMatrices(model, model->render_pos, nodes, shift, up, axis, distance, blind);
+    RenderPosView *collision = gevrAvatarCollisionPose(model);
+    if (collision && collision != model->render_pos)
+        coverBendMatrices(model, collision, nodes, shift, up, axis, distance, blind);
+    return TRUE;
+}
+
+void gevrGuardCoverCaptureMuzzles(ChrRecord *chr)
+{
+    if (g_gevrExtraPass || chr->tacticalCover.kind < GEVR_GUARD_COVER_LEAN_LEFT
+        || chr->actiontype == ACT_DEAD || chr->actiontype == ACT_DIE || guardCoverProgress(chr) < 1.f) return;
+    Mtxf *view = currentPlayerGetViewToWorldMtxf();
+    if (!view) return;
+    chr->tacticalCover.muzzleMask = 0;
+    for (int hand = GUNRIGHT; hand <= GUNLEFT; ++hand) {
+        const PropRecord *prop = chrGetEquippedWeaponProp(chr, hand);
+        if (!prop || !prop->weapon || !(prop->flags & PROPFLAG_ONSCREEN)) continue;
+        Mtxf muzzle;
+        const GevrGearAssembly *assembly = NULL;
+        if (!gevrTacticalMeshMuzzleFrame(prop->weapon->model, prop->weapon->weaponnum, muzzle.m, &assembly)) continue;
+        coord3d point = {{muzzle.m[3][0], muzzle.m[3][1], muzzle.m[3][2]}};
+        mtx4TransformVecInPlace(view, &point);
+        if (!isfinite(point.x) || !isfinite(point.y) || !isfinite(point.z)
+            || SQR(point.x - chr->prop->pos.x) + SQR(point.z - chr->prop->pos.z) > SQR(235.f)) continue;
+        chr->tacticalCover.muzzle[hand] = point;
+        chr->tacticalCover.muzzleMask |= 1u << hand;
+    }
+    chr->tacticalCover.muzzleTick = g_GlobalTimer;
+}
+
+static Gfx *drawTacticalGear(Gfx *gdl, ModelRenderData *body, Gfx *list, const Mtxf *pose)
+{
+    if (!list) return gdl;
+    Mtx *fixed = dynAllocateMatrix();
+    if (!fixed) return gdl;
+    guMtxF2L(pose->m, fixed);
+    body->gdl = gdl;
+    modelApplyRenderModeType3(body, TRUE);
+    gdl = body->gdl;
+    gSPMatrix(gdl++, osVirtualToPhysical(fixed), G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_NOPUSH);
+    gSPDisplayList(gdl++, list);
+    return gdl;
+}
+
+static Mtxf tacticalBodyFit(const float axes[3][3], const Mtxf *joint, const float offset[3])
+{
+    Mtxf pose;
+    matrix_4x4_set_identity(&pose);
+    const float scale = .085f * D_800364CC;  /* gear in mm, body in world cm */
+    for (int i = 0; i < 3; ++i) {
+        pose.m[3][i] = joint->m[3][i] + D_800364CC
+            * (offset[0] * axes[0][i] + offset[1] * axes[1][i] + offset[2] * axes[2][i]);
+        for (int axis = 0; axis < 3; ++axis) pose.m[axis][i] = axes[axis][i] * scale;
+    }
+    return pose;
+}
+
+Gfx *gevrAvatarTacticalDraw(ChrRecord *chr, ModelRenderData *body, Gfx *gdl)
+{
+    if (g_gevrExtraPass || !chr || chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD) return gdl;
+    const GevrTacticalVisual *look = gevrTacticalRemoteBody(chr);
+    if (!look) return gdl;
+
+    Model *model = chr->model;
+    ModelNode *nodes[16];
+    if (!model || !model->render_pos || !findRig(model, nodes)) return gdl;
+    const Mtxf *chest = modelFindNodeMtx(model, nodes[2], 0);
+    const Mtxf *head = modelFindNodeMtx(model, nodes[3], 0);
+    const Mtxf *left = modelFindNodeMtx(model, nodes[4], 0);
+    const Mtxf *right = modelFindNodeMtx(model, nodes[5], 0);
+    float axes[3][3];
+    for (int i = 0; i < 3; ++i) {
+        axes[0][i] = right->m[3][i] - left->m[3][i];
+        axes[1][i] = head->m[3][i] - chest->m[3][i];
+    }
+    if (!unit(axes[0]) || !unit(axes[1])) return gdl;
+    cross(axes[1], axes[0], axes[2]); /* front of the chest */
+    if (!unit(axes[2])) return gdl;
+    cross(axes[0], axes[2], axes[1]);
+
+    const int leftHanded = (look->body & GEVR_VIS_LEFT_HANDED) != 0;
+    const float mirror = leftHanded ? -1.f : 1.f;
+    for (int i = GEVR_VIS_SHOULDER; i < GEVR_VIS_GUNS; ++i) {
+        const GevrVisualWeapon *gun = &look->weapons[i];
+        const int kind = gevrTacticalItem(gun->item);
+        if (kind < 0) continue;
+        const int shoulder = i == GEVR_VIS_SHOULDER;
+        const float at[3] = {shoulder ? 16.f * mirror : (i == GEVR_VIS_HIP_LEFT ? -22.f : 22.f),
+            shoulder ? -12.f : -38.f, shoulder ? -15.f : -2.f};
+        Mtxf pose = tacticalBodyFit(axes, chest, at);
+        for (int col = 0; col < 3; ++col) {
+            const float up = pose.m[1][col], front = pose.m[2][col];
+            pose.m[1][col] = front;
+            pose.m[2][col] = -up;
+            pose.m[0][col] = -pose.m[0][col];
+        }
+        const TacticalMagazine round = {.id = (gun->flags & GEVR_VIS_CHAMBER) != 0};
+        Gfx *list = gevrTacticalMountedGearList(kind, gun->build, (gun->flags & GEVR_VIS_SUPPRESSED) != 0,
+            kind == TACTICAL_GUN_RPG ? &round : &gun->magazine);
+        gdl = drawTacticalGear(gdl, body, list, &pose);
+    }
+    for (int katana = 0; katana < 2; ++katana) {
+        if (!(look->body & (katana ? GEVR_VIS_KATANA : GEVR_VIS_KNIFE))) continue;
+        const float at[3] = {(katana ? -17.f : 24.f) * mirror, katana ? -18.f : -51.f, katana ? -16.f : 0.f};
+        Mtxf pose = tacticalBodyFit(axes, chest, at);
+        for (int col = 0; col < 3; ++col) pose.m[2][col] = -pose.m[2][col];
+        Gfx *list = katana ? gevrTacticalKatanaScabbard() : gevrTacticalKnifeSheathList();
+        gdl = drawTacticalGear(gdl, body, list, &pose);
+    }
+    static const float sides[GEVR_VIS_RIG_MAGS] = {-10.f, 0.f, 10.f, -24.f, 24.f};
+    for (int i = 0; i < GEVR_VIS_MAGS; ++i) {
+        const TacticalMagazine *mag = &look->magazines[i];
+        const int kind = tacticalMagazineGun(mag);
+        if (kind < 0) continue;
+        Gfx *list = gevrTacticalGearLooseMagList(mag->gear_part, kind);
+        if (!list) list = gevrTacticalHeldMagList(kind);
+        if (!list) continue;
+        Mtxf pose;
+        if (i < GEVR_VIS_RIG_MAGS) {
+            const float at[3] = {sides[i] * mirror, -26.f, 15.f};
+            pose = tacticalBodyFit(axes, chest, at);
+            for (int col = 0; col < 3; ++col) {
+                pose.m[0][col] = -pose.m[2][col];
+                pose.m[2][col] = axes[0][col] * (.085f * D_800364CC);
+            }
+        } else {
+            const int leftHand = (i == GEVR_VIS_MAG_LEFT) ^ leftHanded;
+            const Mtxf *wrist = modelFindNodeMtx(model, nodes[leftHand ? 8 : 9], 0);
+            float grip[3][3];
+            basis(wrist, grip);
+            const float palm[3] = {-4.f, 0.f, 2.f};
+            pose = tacticalBodyFit(grip, wrist, palm);
+        }
+        gdl = drawTacticalGear(gdl, body, list, &pose);
+        gdl = gevrTacticalDrawMagazineRounds(gdl, kind, mag->rounds, 0, 0, mag->gear_part);
+    }
+    if (sysArgCheck("--tactical-coop-test")) {
+        static uint16_t shown;
+        const int slot = getPlayerPointerIndex(chr->prop);
+        if (slot >= 0 && slot < GEVR_MAX_PLAYERS && !(shown & (1u << slot))) {
+            shown |= 1u << slot;
+            sysLogPrintf(LOG_NOTE, "tactical co-op: drawing teammate body gear for slot %d", slot);
+        }
+    }
+    return gdl;
+}
+
 RenderPosView *gevrAvatarCollisionPose(Model *model) {
     for(int i=0;i<GEVR_MAX_PLAYERS;i++)if(s_collision[i].model==model && s_collision[i].posed==model->render_pos)return s_collision[i].base;
+    for(int i=0;i<256;i++)if(s_guardCollision[i].model==model && s_guardCollision[i].posed==model->render_pos)return s_guardCollision[i].base;
     return NULL;
 }
 ModelNode *gevrAvatarWeaponHand(ChrRecord *chr,int hand,int *physicalLeft) {

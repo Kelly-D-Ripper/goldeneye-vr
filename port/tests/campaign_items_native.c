@@ -38,6 +38,9 @@ void set_cur_player(s32 slot) { current=slot; g_CurrentPlayer=&players[slot]; }
 int netGetLocalSlot(void) { return 0; }
 bool netIsHost(void) { return host; }
 int netCoopActive(void) { return coop; }
+/* This fixture exercises the stock co-op inventory; Tactical owns its own equipped props. */
+int netCoopSession(void) { return coop; }
+int gevrTacticalCampaignRules(void) { return 0; }
 bool netSlotOccupied(int slot) { return slot < 4; }
 void sysLogPrintf(s32 level, const char *fmt, ...) { if (level==LOG_ERROR) overflow++; }
 ObjectRecord *objFindByTagId(s32 tag) { return tag>=0 && tag<10 ? &tagged[tag] : NULL; }

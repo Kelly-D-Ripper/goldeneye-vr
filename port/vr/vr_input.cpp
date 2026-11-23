@@ -6,6 +6,7 @@
 #endif
 
 
+#include "gevr_android_paths.h"
 #include <chrono>
 #include <openxr/openxr.h>
 
@@ -20,7 +21,9 @@
 #include "vr_log.h"
 #include "vr_openxr.h"
 #include "gevr_recoil.h"
+#include "gevr_tactical_stats.h"
 #include "gevr_vrpad.h"
+#include "gevr_watch_status.h"
 
 
 #ifdef ANDROID
@@ -234,7 +237,7 @@ XrResult create_vr_controllers_complete() {
         suggested.countSuggestedBindings = static_cast<uint32_t>(suggestedBindings.size());
 
         XrResult result = xrSuggestInteractionProfileBindings(g_vrState.instance, &suggested);
-        vr_log("[VR_CTRL] Profile %s -> %s", profile_path, (result == XR_SUCCESS) ? "OK" : "FAILED");
+        vr_log("[VR_CTRL] Profile %s -> %s (%d)", profile_path, (result == XR_SUCCESS) ? "OK" : "FAILED", (int)result);
         return XR_SUCCESS;
     };
 
@@ -251,7 +254,7 @@ XrResult create_vr_controllers_complete() {
     });
 
     // 5. OCULUS TOUCH CONTROLLER PROFILE
-    SuggestBindings("/interaction_profiles/oculus/touch_controller", {
+    const std::vector<std::pair<XrAction, const char*>> touchBindings = {
             // Poses
             {gPoseAction, "/user/hand/left/input/grip/pose"},
             {gPoseAction, "/user/hand/right/input/grip/pose"},
@@ -286,7 +289,12 @@ XrResult create_vr_controllers_complete() {
             // Haptic
             {gHapticAction, "/user/hand/left/output/haptic"},
             {gHapticAction, "/user/hand/right/output/haptic"}
-    });
+    };
+    SuggestBindings("/interaction_profiles/oculus/touch_controller", touchBindings);
+#ifdef GEVR_TACTICAL_QUEST
+    SuggestBindings("/interaction_profiles/meta/touch_controller_plus", touchBindings);
+    SuggestBindings("/interaction_profiles/facebook/touch_controller_pro", touchBindings);
+#endif
 
     // 6. VALVE INDEX CONTROLLER PROFILE
     SuggestBindings("/interaction_profiles/valve/index_controller", {
@@ -368,6 +376,8 @@ XrResult create_vr_controllers_complete() {
             {gPoseAction, "/user/hand/right/input/grip/pose"},
 
             // Triggers / grip
+            {gSelectAction, "/user/hand/left/input/trigger/value"},
+            {gSelectAction, "/user/hand/right/input/trigger/value"},
             {gTriggerValueAction, "/user/hand/left/input/trigger/value"},
             {gTriggerValueAction, "/user/hand/right/input/trigger/value"},
             {gGripValueAction, "/user/hand/left/input/squeeze/value"},
@@ -428,6 +438,7 @@ XrResult create_vr_controllers_complete() {
     });
 
 
+#ifndef GEVR_TACTICAL_QUEST
     SuggestBindings("/interaction_profiles/meta/touch_controller_plus", {
             {gPoseAction, "/user/hand/left/input/grip/pose"},
             {gPoseAction, "/user/hand/right/input/grip/pose"},
@@ -446,6 +457,7 @@ XrResult create_vr_controllers_complete() {
             {gHapticAction, "/user/hand/left/output/haptic"},
             {gHapticAction, "/user/hand/right/output/haptic"},
     });
+#endif
 
 
     // 9.5. SONY PLAYSTATION VR2 CONTROLLER PROFILE
@@ -697,6 +709,14 @@ XrResult update_vr_controllers(XrTime predicted_time) {
         // Actions bool
         XR_TRY(GetActionState(gSelectAction, handPath, state.select));
         XR_TRY(GetActionState(gMenuAction, handPath, state.menu));
+        if (hand == 0) {
+            static int lastActive = -1;
+            if ((int)state.menu.isActive != lastActive || state.menu.changedSinceLastSync) {
+                vr_log("[VR_MENU] left action active=%d pressed=%d changed=%d", (int)state.menu.isActive,
+                       (int)state.menu.currentState, (int)state.menu.changedSinceLastSync);
+                lastActive = (int)state.menu.isActive;
+            }
+        }
         XR_TRY(GetActionState(gButtonAAction, handPath, state.button_a));
         XR_TRY(GetActionState(gButtonBAction, handPath, state.button_b));
         XR_TRY(GetActionState(gButtonXAction, handPath, state.button_x));
@@ -727,6 +747,17 @@ XrResult update_vr_controllers(XrTime predicted_time) {
 
 // the gevr_fakegrip.txt probe (vr_fake_grip below): pinned hands, grips held
 static bool s_fakeGripHave[2], s_fakeGripPress[2];
+
+extern "C" bool gevrVrGripInputAvailable(int hand)
+{
+    if (hand < 0 || hand > 1) return false;
+#ifdef __ANDROID__
+    if (s_fakeGripHave[hand] && s_fakeGripPress[hand]) return true;
+#endif
+    const auto& state = gControllerStates[VrLeftHandedMode ? 1 - hand : hand];
+    return state.grip_value.isActive
+        || (gIsValveIndex ? state.grip_force.isActive : state.grip_click.isActive);
+}
 
 // Get a button state
 extern "C" bool get_button_state(int hand_index, const char* button_name) {
@@ -770,11 +801,13 @@ extern "C" bool get_button_state(int hand_index, const char* button_name) {
     // vr_log("[VR_INPUT] Controller state: %d: isActive=%d", hand_index, state.is_active);
 
     if (strcmp(button_name, "trigger") == 0) {
-        // vr_log("[VR_INPUT] Trigger state: %d", state.select.currentState);
-        return state.select.currentState;
+        /* Some WMR runtimes expose only the analogue action. A small
+         * hysteresis prevents trigger chatter around the grab threshold. */
+        static bool triggerLatched[2] = {false, false};
+        if (!state.trigger_value.isActive || state.trigger_value.currentState < 0.35f) triggerLatched[hand_index] = false;
+        else if (state.trigger_value.currentState >= 0.55f) triggerLatched[hand_index] = true;
+        return state.select.currentState || triggerLatched[hand_index];
     }
-
-    if (strcmp(button_name, "trigger") == 0) return state.select.currentState;
 
     if (strcmp(button_name, "grip") == 0) {
         if (gIsValveIndex) {
@@ -1393,6 +1426,19 @@ extern "C" void vrRecoilKick(int gunhand, int recoilClass, float strength)
     RecoilFireImpulse(ctrl, p);
 }
 
+extern "C" void vrTacticalRecoilKick(int gunhand, float strength, float ergonomics)
+{
+    if (!VrPerWeaponRecoil || gunhand < 0 || gunhand > 1) return;
+    const int ctrl = 1 - gunhand;
+    if (gunhand == gevrStereoTwoHandGun() && gevrStereoTwoHandGrip()) strength *= .56f;
+    const WeaponRecoilProfile profile = {
+        .052f * strength, .014f * strength, -1.05f * strength,
+        93.f + .40f * ergonomics, 13.f + .07f * ergonomics
+    };
+    sRecoilProfile[ctrl] = profile;
+    RecoilFireImpulse(ctrl, profile);
+}
+
 /*
  * The spring's offset on a grip pose the game reads (gevrVrGripPoseCamera,
  * gevrVrGripPoseSteady): pos in metres, quat x y z w, view space. In the
@@ -1932,19 +1978,16 @@ extern "C" int gevrTouchPadState(int phys, float *trigger, float *grip, float *s
 
 extern "C" int gevrWatchFaceGripNormal(float out[3]);   // bondview2.c: GE-X's held watch face
 
-extern "C" int gevrVrWatchGesture(void)
+static int watchGesturePose(bool tactical)
 {
     const ControllerInputState& st = gControllerStates[gevrPhysHand(0)];
-    if (!st.is_active) {
+    if (!st.is_active || (tactical && !st.is_tracked)) {
         return 0;
     }
 
     const XrPosef& pose = st.controller_pose;
     const float px = pose.position.x, py = pose.position.y, pz = pose.position.z;
     const float dist = sqrtf(px * px + py * py + pz * pz);
-    if (dist < 0.08f || dist > 0.50f) {
-        return 0;
-    }
 
     // Head pitch and the controller's height relative to the eyes, play space.
     const XrQuaternionf& h = gRawHeadQ;
@@ -1952,6 +1995,13 @@ extern "C" int gevrVrWatchGesture(void)
     const float relY = 2.0f * (h.x * h.y + h.w * h.z) * px
                      + (1.0f - 2.0f * (h.x * h.x + h.z * h.z)) * py
                      + 2.0f * (h.y * h.z - h.w * h.x) * pz;          // (R p).y
+
+    if (tactical && !(dist > 0.0f)) {
+        return gevrCoopWatchPoseClassify(dist, relY, 0.0f, 0.0f);
+    }
+    if (!tactical && (dist < 0.08f || dist > 0.50f)) {
+        return 0;
+    }
 
     const float ahead = -pz / dist;          // cos of the angle from the view direction
 
@@ -1972,6 +2022,10 @@ extern "C" int gevrVrWatchGesture(void)
     const float az = local[2] + 2.0f * (qw * cz + qx * cy - qy * cx);
     const float facing = (ax * -px + ay * -py + az * -pz) / dist;
 
+    if (tactical) {
+        return gevrCoopWatchPoseClassify(dist, relY, ahead, facing);
+    }
+
     const bool lookingDown = lookY < -0.34f;
     const bool raised = relY > -0.45f;
     const bool inView = ahead > 0.85f;
@@ -1983,6 +2037,16 @@ extern "C" int gevrVrWatchGesture(void)
     }
 
     return (lookingDown && raised && inView && wristToEyes) ? 1 : 0;
+}
+
+extern "C" int gevrVrWatchGesture(void)
+{
+    return watchGesturePose(false);
+}
+
+extern "C" int gevrVrCoopWatchPose(void)
+{
+    return watchGesturePose(true);
 }
 
 
@@ -2072,8 +2136,9 @@ static XrQuaternionf gevr_steady(int h, const XrQuaternionf& raw, bool grip, flo
     static const float d0[3]   = { 0.0f, 0.3f,  0.5f };
     static const float d1[3]   = { 1.0f, 3.0f,  5.0f };
     const int lvl = VrAimSteady < 0 ? 0 : VrAimSteady > 2 ? 2 : VrAimSteady;
+    const float handling = gevrTacticalHandling(gevrPhysHand(h));
     XrQuaternionf s = gSteadyQ[h];
-    if (!gSteadyInit[h] || (lvl == 0 && !grip)) {
+    if (!gSteadyInit[h] || (lvl == 0 && !grip && handling <= 0.f)) {
         gSteadyQ[h] = raw;
         gSteadyInit[h] = true;
         return raw;
@@ -2117,7 +2182,11 @@ static XrQuaternionf gevr_steady(int h, const XrQuaternionf& raw, bool grip, flo
 
     float t = (deg - eff_d0) / (eff_d1 - eff_d0);
     t = t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t;
-    const float frameA = targetA + (maxA - targetA) * t;
+    float frameA = targetA + (maxA - targetA) * t;
+    if (handling > 0.f && deg > 1.f) {
+        const float swing = fminf(1.f, (deg - 1.f) * .5f);
+        frameA = fmaxf(1.f - 6.f / deg, frameA * (1.f - handling * swing));
+    }
     // Preserve the 60 Hz response at any headset refresh rate.
     const float a = 1.0f - powf(1.0f - frameA, ticks);
 
@@ -2155,7 +2224,7 @@ extern "C" void gevrVrSteadyControllers(XrTime time, int focused)
         const bool grip = gevrGripSteadyOnCtrl(gevrPhysHand(h)) ||
             (h == gevrPhysHand(0) && twoHand && gevrGripSteadyOnCtrl(1));
         if (restart) gSteadyInit[h] = false;
-        gSteadyUsed[h] = VrAimSteady > 0 || grip;
+        gSteadyUsed[h] = VrAimSteady > 0 || grip || gevrTacticalHandling(gevrPhysHand(h)) > 0.f;
         if (gSteadyUsed[h]) gevr_steady(h, raw, grip, ticks);
         else gSteadyInit[h] = false;
     }
@@ -2247,7 +2316,7 @@ static bool vr_fake_grip(int hand, float pos[3], float quat[4])
     if (now >= next) {
         next = now + std::chrono::seconds(1);
         s_fakeGripHave[0] = s_fakeGripHave[1] = s_fakeGripPress[0] = s_fakeGripPress[1] = false;
-        FILE *f = fopen("/sdcard/Android/data/com.gevr.port/files/gevr_fakegrip.txt", "r");
+        FILE *f = fopen(GEVR_ANDROID_EXTERNAL_FILES "/gevr_fakegrip.txt", "r");
         if (f) {
             char line[256];
             while (fgets(line, sizeof(line), f)) {

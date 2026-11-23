@@ -1,3 +1,4 @@
+#include "gevr_android_paths.h"
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -57,6 +58,8 @@ float s_eye_offsets[8] = { 0.0f, 0.0f, 0.0f, 0.0f,
                            0.0f, 0.0f, 0.0f, 0.0f };
 extern float g_eyeTanHalfFov[2];
 extern "C" bool vr_dl_is_pause_or_menu;
+extern "C" float gevrTacticalTrainShadowLift(void);
+static float s_trainShadowLift;
 extern float vr_world_scale;
 extern bool is_meta_runtime;
 bool copy_fbo_menu = false;
@@ -129,10 +132,10 @@ float gfx_decal_proj_z = 0.0f;
  * scorch marks drew over the tank from inside it. Clamp at the near plane
  * instead (B ~ -2 * near), which no visible point is closer than.
  */
-static void gevr_set_decal_bias(float bias)
+static void gevr_set_decal_bias(float bias, float projectionZ = gfx_decal_proj_z)
 {
     if (gCurDecalBiasLoc >= 0) {
-        float nearW = -gfx_decal_proj_z * 0.5f;
+        float nearW = -projectionZ * 0.5f;
         if (nearW < 0.01f) nearW = 0.01f;
         glUniform2f(gCurDecalBiasLoc, bias, nearW);
     }
@@ -215,6 +218,12 @@ extern "C" GLuint vr_mirror_screen_tex(int *w, int *h);   // vr_openxr.cpp: the 
 #endif
 static GLint s_mirror_uloc_sbs = -1;
 extern "C" bool gfx_sdl_is_mirror_sbs();
+#ifdef GEVR_PCVR
+extern "C" bool gfx_sdl_is_mirror_fullscreen();
+#else
+static bool gfx_sdl_is_mirror_fullscreen() { return false; }
+#endif
+#include "../vr/gevr_mirror_viewport.h"
 
 static GLuint s_logo_tex = 0;
 int    logo_w   = 0;
@@ -374,6 +383,9 @@ struct ShaderProgram {
     GLint TanHalfFovRight;
 
     GLint scopeLocation;       // GoldenEye (issue #40): the sniper scope's pass
+    GLint scopeHeatLocation;
+    GLint shadowLiftLocation;
+    float shadowLift;
     GLint scopeVPLocation;
     GLint scopeHeadPLocation;
     GLint reprojLocation;      // GoldenEye (issue #53): the in-between frame's redraw
@@ -468,7 +480,7 @@ static void gevr_decal_switch_poll(void)
 #ifdef GEVR_PC
     FILE *f = fopen("gevr_decal.txt", "r");   /* the data folder (Apple's, the PC's) */
 #else
-    FILE *f = fopen("/sdcard/Android/data/com.gevr.port/files/gevr_decal.txt", "r");
+    FILE *f = fopen(GEVR_ANDROID_EXTERNAL_FILES "/gevr_decal.txt", "r");
 #endif
     int mode = 0;
     float a = 0.0f, b = 0.0f;
@@ -507,7 +519,7 @@ static void gevr_zdebug_poll(void)
 #ifdef GEVR_PC
     FILE *f = fopen("gevr_zdebug.txt", "r");   /* the data folder (Apple's, the PC's) */
 #else
-    FILE *f = fopen("/sdcard/Android/data/com.gevr.port/files/gevr_zdebug.txt", "r");
+    FILE *f = fopen(GEVR_ANDROID_EXTERNAL_FILES "/gevr_zdebug.txt", "r");
 #endif
     int mode = 0;
     if (f) {
@@ -670,16 +682,15 @@ static uint32_t frame_count;
  * segments; a fence closes each segment and is waited on only before that
  * segment is written again, two frames later.
  *
- * The eyes are redrawn from a game frame's kept draws until the next one is
- * ready, so a frame must fit its segment: one that spilled into the next
- * left the frame after it to wrap onto vertices still being redrawn. At 4 MB
- * Jungle's start with Bean (some 50,000 vertices of foliage a frame) did, and
- * the stereo view showed a band of wild triangles over the canopy, never the
- * 2D one (2026-10-19). 16 MB holds it several times over.
+ * The eyes and optics redraw each frame from saved offsets into this buffer.
+ * A heavy frame may need more space, but it must keep all of its vertices
+ * through the last replay. Grow the storage before writing past a segment.
  */
 #define GEVR_PM_SEGMENTS 3
+using GevrBufferStorageProc = void (APIENTRY *)(GLenum, GLsizeiptr, const void *, GLbitfield);
+static GevrBufferStorageProc s_pmStorage;
 static uint8_t *s_pmPtr;
-static GLsizeiptr s_pmSegSize, s_pmOff;
+static GLsizeiptr s_pmBase, s_pmSegSize, s_pmOff;
 static int s_pmSeg = -1;
 static uint32_t s_pmFrame = 0xffffffffu;
 static GLsync s_pmFence[GEVR_PM_SEGMENTS];
@@ -736,7 +747,17 @@ static void gevr_pm_next_segment(void)
         glDeleteSync(s_pmFence[s_pmSeg]);
         s_pmFence[s_pmSeg] = 0;
     }
-    s_pmOff = (GLsizeiptr)s_pmSeg * s_pmSegSize;
+    s_pmOff = s_pmBase + (GLsizeiptr)s_pmSeg * s_pmSegSize;
+}
+
+static uint8_t *gevr_pm_map(GLenum target, GLsizeiptr bytes)
+{
+    const GLbitfield flags = GL_MAP_WRITE_BIT | 0x0040 /* persistent */ | 0x0080 /* coherent */;
+    for (int i = 0; i < 16 && glGetError() != GL_NO_ERROR; ++i) {}
+    s_pmStorage(target, bytes, NULL, flags);
+    if (glGetError() != GL_NO_ERROR) return NULL;
+    auto *mapped = (uint8_t *)glMapBufferRange(target, 0, bytes, flags);
+    return glGetError() == GL_NO_ERROR ? mapped : NULL;
 }
 #include <time.h>
 static bool s_uniCacheValid;
@@ -837,7 +858,8 @@ static int s_eyeHand = -1;
 static bool s_eyePresent;
 static std::vector<struct ShaderProgram*> s_eyePresentationPrograms;
 static void gevr_eye_keep(GLint first, GLsizei count, bool lineMode);
-static void gevr_issue_draw(GLint first, GLsizei count, bool decalZ, bool decalDepth, float decalPull, bool lineMode);
+static void gevr_issue_draw(GLint first, GLsizei count, bool decalZ, bool decalDepth, float decalPull, bool lineMode,
+    float decalProjectionZ = gfx_decal_proj_z);
 static void gevr_opaque_depth_after_blend(GLint first, GLsizei count);
 
 static std::vector<Framebuffer> framebuffers;
@@ -1150,7 +1172,63 @@ static void gfx_opengl_vertex_array_set_attribs(struct ShaderProgram* prg) {
     }
 }
 
+static bool gevr_pm_grow(GLsizeiptr required)
+{
+    if (!glCopyBufferSubData) return false;
+    const GLsizeiptr oldBytes = s_pmBase + GEVR_PM_SEGMENTS * s_pmSegSize;
+    const GLsizeiptr maxSegment = (INT32_MAX - oldBytes) / GEVR_PM_SEGMENTS;
+    const GLsizeiptr segment = std::max(s_pmSegSize * 2, required);
+    if (segment > maxSegment) return false;
+
+    GLint readBinding = 0, writeBinding = 0;
+    glGetIntegerv(GL_COPY_READ_BUFFER_BINDING, &readBinding);
+    glGetIntegerv(GL_COPY_WRITE_BUFFER_BINDING, &writeBinding);
+    GLuint replacement = 0;
+    glGenBuffers(1, &replacement);
+    if (!replacement) return false;
+    glBindBuffer(GL_COPY_WRITE_BUFFER, replacement);
+    uint8_t *mapped = gevr_pm_map(GL_COPY_WRITE_BUFFER, oldBytes + GEVR_PM_SEGMENTS * segment);
+    if (mapped) {
+        /* Keep every offset used by the active eye, scope and mirror passes.
+         * Server-side copy is ordered before their draws. The CPU only writes
+         * the new segments after this read-only prefix. */
+        glBindBuffer(GL_COPY_READ_BUFFER, opengl_vbo);
+        glCopyBufferSubData(GL_COPY_READ_BUFFER, GL_COPY_WRITE_BUFFER, 0, 0, oldBytes);
+        if (glGetError() != GL_NO_ERROR) mapped = NULL;
+    }
+    glBindBuffer(GL_COPY_READ_BUFFER, (GLuint)readBinding);
+    glBindBuffer(GL_COPY_WRITE_BUFFER, (GLuint)writeBinding);
+    if (!mapped) {
+        glDeleteBuffers(1, &replacement);
+        return false;
+    }
+
+    const GLuint old = opengl_vbo;
+    opengl_vbo = replacement;
+    s_pmPtr = mapped;
+    s_pmBase = s_pmOff = oldBytes;
+    s_pmSeg = 0;
+    s_pmSegSize = segment;
+    for (GLsync &fence : s_pmFence) {
+        if (fence) glDeleteSync(fence);
+        fence = 0;
+    }
+    glBindBuffer(GL_ARRAY_BUFFER, opengl_vbo);
+    glDeleteBuffers(1, &old);
+    if (s_curPrg) gfx_opengl_vertex_array_set_attribs(s_curPrg);
+    sysLogPrintf(LOG_NOTE, "vertex-ring: grew to %d MB per frame and preserved queued draws", (int)(segment >> 20));
+    return true;
+}
+
+static void gevr_set_shadow_lift(struct ShaderProgram* prg)
+{
+    if (!prg || prg->shadowLiftLocation < 0 || prg->shadowLift == s_trainShadowLift) return;
+    glUniform1f(prg->shadowLiftLocation, s_trainShadowLift);
+    prg->shadowLift = s_trainShadowLift;
+}
+
 static void gfx_opengl_set_uniforms(struct ShaderProgram* prg) {
+    gevr_set_shadow_lift(prg);
     if (prg->frame_count_location >= 0) {
         glUniform1i(prg->frame_count_location, frame_count);
     }
@@ -1501,17 +1579,14 @@ static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shad
         append_line(vs_buf, &vs_len, "uniform float uTanHalfFovLeft;");
         append_line(vs_buf, &vs_len, "uniform float uTanHalfFovRight;");
         append_line(vs_buf, &vs_len, "uniform int uVrFlat;");
-        append_line(vs_buf, &vs_len, "uniform vec2 uDecalBias;");
-        // GoldenEye (issue #40): the sniper scope's pass (gfx_vr_scope_render)
-        append_line(vs_buf, &vs_len, "uniform int uScope;");
-        append_line(vs_buf, &vs_len, "uniform mat4 uScopeVP;");
-        append_line(vs_buf, &vs_len, "uniform vec2 uHeadP;");
         // GoldenEye (issue #53): the in-between frame's redraw (gfx_vr_eye_replay)
         append_line(vs_buf, &vs_len, "uniform int uReproj;");
         append_line(vs_buf, &vs_len, "uniform mat4 uReprojVP;");
 
     }
 
+    append_line(vs_buf, &vs_len, "uniform vec2 uDecalBias;");
+    append_line(vs_buf, &vs_len, "uniform int uScope; uniform mat4 uScopeVP; uniform vec2 uHeadP;");
 
     if (gl_es) {
         append_line(vs_buf, &vs_len, "precision highp float;");
@@ -1677,14 +1752,14 @@ static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shad
     // VR
     if (use_multiview) {
         append_line(vs_buf, &vs_len, vr_shader);
-        // GoldenEye decal band (gfx_opengl_draw_triangles): a view-space nudge
-        append_line(vs_buf, &vs_len, "gl_Position.z += uDecalBias.x / max(gl_Position.w, max(uDecalBias.y, 0.0001));");
     } else {
         // One view (a flat game: PC, the phone APK): the vertex as fast3d has it.
         // Only the VR prelude above wrote gl_Position, so without it every draw
         // was clipped away and the flat frame stayed black.
         append_line(vs_buf, &vs_len, "    gl_Position = aVtxPos;");
     }
+    // The impact depth band needs its push and pull in the desktop view too.
+    append_line(vs_buf, &vs_len, "    gl_Position.z += uDecalBias.x / max(gl_Position.w, max(uDecalBias.y, 0.0001));");
 
 
     // The far reach (gfx_pc.h GEVR_FAR_DEPTH_SCALE), with or without depth
@@ -1699,6 +1774,8 @@ static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shad
                     " vec4 c = vec4(aVtxPos.x / uHeadP.x, aVtxPos.y / uHeadP.y, -aVtxPos.w, 1.0);"
                     " gl_Position = (gl_ViewID_OVR == 0u) ? uScopeVP * c : vec4(0.0, 0.0, 2.0, 1.0);"
                     " }");
+    } else {
+        append_line(vs_buf, &vs_len, "if (uScope == 1) gl_Position = uScopeVP * vec4(aVtxPos.x / uHeadP.x, aVtxPos.y / uHeadP.y, -aVtxPos.w, 1.0);");
     }
     append_line(vs_buf, &vs_len, "}");
 
@@ -1758,6 +1835,8 @@ static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shad
     }
 
     append_line(fs_buf, &fs_len, "uniform int frame_count;");
+    append_line(fs_buf, &fs_len, "uniform int uScopeHeat;");
+    append_line(fs_buf, &fs_len, "uniform float uShadowLift;");
     append_line(fs_buf, &fs_len, "uniform float noise_scale;");
     if (cc_features.opt_alpha) {
         append_line(fs_buf, &fs_len, "uniform int uOpaqueDepthPass;");
@@ -1945,6 +2024,15 @@ static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shad
     else {
         append_line(fs_buf, &fs_len, "    OUTPUT_COLOR = vec4(texel, 1.0);");
     }
+    // Train's dim carriage textures need more separation at a distance. The
+    // perspective depth fade leaves the near weapon and the HUD's clip-w
+    // markers (1 through 10) alone. Preserve black and white in the scene.
+    append_line(fs_buf, &fs_len, "    if (uShadowLift > 0.0 && gl_FragCoord.w < .0833333) {");
+    append_line(fs_buf, &fs_len, "        float amount = uShadowLift * (1.0 - smoothstep(.01818, .0833333, gl_FragCoord.w));");
+    append_line(fs_buf, &fs_len, "        vec3 colour = OUTPUT_COLOR.rgb;");
+    append_line(fs_buf, &fs_len, "        OUTPUT_COLOR.rgb = mix(colour, sqrt(colour), amount);");
+    append_line(fs_buf, &fs_len, "    }");
+    append_line(fs_buf, &fs_len, "if (uScopeHeat != 0) { float y = dot(OUTPUT_COLOR.rgb, vec3(.299,.587,.114)); OUTPUT_COLOR.rgb = vec3(uScopeHeat == 2 ? .77+.23*y : .12+.45*y); }");
     if (use_multiview) {
         append_line(fs_buf, &fs_len, "    if (uZTint.a > 0.0) OUTPUT_COLOR = vec4(mix(OUTPUT_COLOR.rgb, uZTint.rgb, uZTint.a), OUTPUT_COLOR.a);");
     }
@@ -2146,17 +2234,20 @@ static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shad
     // location 0, and every draw of a single-view game (the flat game, the
     // phone APK) failed on GL_INVALID_OPERATION and drew nothing.
     prg->zTintLocation = prg->reprojLocation = prg->reprojVPLocation = -1;
-    prg->scopeLocation = prg->scopeVPLocation = prg->scopeHeadPLocation = -1;
     prg->eyeOffsetLeftLocation = prg->eyeOffsetRightLocation = prg->isMenuLocation = -1;
     prg->worldScaleLocation = prg->IsTitleLegal = prg->TanHalfFovRight = prg->TanHalfFovLeft = -1;
-    prg->vrFlatLocation = prg->decalBiasLocation = -1;
+    prg->vrFlatLocation = -1;
+    prg->decalBiasLocation = glGetUniformLocation(shader_program, "uDecalBias");
+    prg->scopeLocation = glGetUniformLocation(shader_program, "uScope");
+    prg->scopeVPLocation = glGetUniformLocation(shader_program, "uScopeVP");
+    prg->scopeHeadPLocation = glGetUniformLocation(shader_program, "uHeadP");
+    prg->scopeHeatLocation = glGetUniformLocation(shader_program, "uScopeHeat");
+    prg->shadowLiftLocation = glGetUniformLocation(shader_program, "uShadowLift");
+    prg->shadowLift = 0.0f;
     if (use_multiview) {
         prg->zTintLocation = glGetUniformLocation(shader_program, "uZTint");
         prg->reprojLocation = glGetUniformLocation(shader_program, "uReproj");
         prg->reprojVPLocation = glGetUniformLocation(shader_program, "uReprojVP");
-        prg->scopeLocation = glGetUniformLocation(shader_program, "uScope");
-        prg->scopeVPLocation = glGetUniformLocation(shader_program, "uScopeVP");
-        prg->scopeHeadPLocation = glGetUniformLocation(shader_program, "uHeadP");
         prg->eyeOffsetLeftLocation = glGetUniformLocation(shader_program, "uEyeOffsetLeft");
         prg->eyeOffsetRightLocation = glGetUniformLocation(shader_program, "uEyeOffsetRight");
         prg->isMenuLocation = glGetUniformLocation(shader_program, "uIsMenu");
@@ -2165,8 +2256,6 @@ static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shad
         prg->TanHalfFovRight = glGetUniformLocation(shader_program, "uTanHalfFovRight");
         prg->TanHalfFovLeft = glGetUniformLocation(shader_program, "uTanHalfFovLeft");
         prg->vrFlatLocation = glGetUniformLocation(shader_program, "uVrFlat");
-        prg->decalBiasLocation = glGetUniformLocation(shader_program, "uDecalBias");
-
     }
 
     gfx_opengl_load_shader(prg);
@@ -2207,6 +2296,29 @@ static void gfx_opengl_clear_shaders(void) {
     s_meshUniforms.clear();
     s_meshDrawUniforms.clear();
 
+}
+
+bool gevrEditorReadTexture(uint32_t id, uint16_t &width, uint16_t &height, std::vector<uint8_t> &pixels)
+{
+#ifdef _WIN32
+    GLint binding, w, h;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &binding);
+    glBindTexture(GL_TEXTURE_2D, id);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
+    const bool good = w > 0 && w <= 512 && h > 0 && h <= 512;
+    if (good) {
+        width = (uint16_t)w;
+        height = (uint16_t)h;
+        pixels.resize((size_t)w * h * 4);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    }
+    glBindTexture(GL_TEXTURE_2D, binding);
+    return good;
+#else
+    (void)id; (void)width; (void)height; (void)pixels;
+    return false;
+#endif
 }
 
 static GLuint gfx_opengl_new_texture(void) {
@@ -2461,6 +2573,7 @@ static void gfx_opengl_set_use_alpha(bool use_alpha, bool modulate) { // VR
  * as they are kept. vr_openxr.cpp shows the target as the lens.
  */
 #include "gevr_scope.h"   // bondview2.c: one scope per hand (GUNRIGHT 0, GUNLEFT 1)
+#include "gevr_tactical_optics.h"
 
 struct GevrScopeDraw {
     struct ShaderProgram* prg;
@@ -2477,6 +2590,8 @@ struct GevrScopeDraw {
     uint8_t faded;  // 255 minus gevrFadeDepthAlpha: 0 a draw that does not fade
     uint32_t mesh; // 1 + scope mesh record, zero for the vertex ring
     uint8_t mask;   // which scopes see it: bit (1 << hand)
+    bool warm;
+    float firstClip[4];  // captured for the scope dump, before upload to the write-only map
 };
 
 #define GEVR_SCOPE_RES 512
@@ -2501,6 +2616,8 @@ static bool s_scopeTaken[2], s_scopeDrawn[2];   // per hand: recording this fram
 static uint8_t s_scopeOnlyMask;   // VR_SCOPE_ONLY: kept for that scope alone, not drawn to the eyes
 static float s_scopeVP[2][16], s_scopeHeadP[2][2];
 static GLuint s_scopeFbo[2], s_scopeTex[2], s_scopeDepth[2];
+static int s_tacticalScopeSlot = -1;
+static bool s_tacticalScopeReady, s_tacticalScopeWarm, s_tacticalScopeThermal;
 
 static bool gevr_scope_any_taken(void)
 {
@@ -2515,6 +2632,8 @@ void gfx_vr_scope_record(bool on, bool invert_y)
         return;
     }
     s_scopeDraws.clear();
+    s_tacticalScopeSlot = -1;
+    s_tacticalScopeReady = s_tacticalScopeWarm = s_tacticalScopeThermal = false;
     s_scopeMeshes.clear();
     s_scopeTaken[0] = s_scopeTaken[1] = false;
     // needs the mapped ring: without it every draw overwrites the last one's vertices
@@ -2534,11 +2653,36 @@ void gfx_vr_scope_record(bool on, bool invert_y)
     s_scopeRec = gevr_scope_any_taken();
 }
 
+void gfx_tactical_scope_record(const float *projection, bool invert_y)
+{
+    gfx_vr_scope_record(true, invert_y);
+    if (!s_pmPtr || fabsf(projection[0]) < 1e-6f || fabsf(projection[5]) < 1e-6f)
+        return;
+    const int slot = s_scopeTaken[0] ? 1 : 0;
+    if (s_scopeTaken[slot]) return;
+    s_tacticalScopeSlot = slot;
+    s_scopeTaken[slot] = s_scopeRec = true;
+    s_scopeHeadP[slot][0] = projection[0];
+    s_scopeHeadP[slot][1] = invert_y ? -projection[5] : projection[5];
+}
+
+bool gfx_tactical_scope_heat_active(void)
+{
+    return s_scopeRec && s_tacticalScopeSlot >= 0;
+}
+
+void gfx_tactical_scope_heat(bool warm)
+{
+    gevr_mesh_settle();
+    s_tacticalScopeWarm = warm;
+}
+
 // Whether any of a batch can show through a hand's scope: not when all its
 // vertices lie outside one side of the scope's view (each side is a plane in
 // clip space, so this holds for the whole triangle), or all behind it.
 static bool gevr_scope_sees(int hand, const float* v, size_t len, size_t tris)
 {
+    if (hand == s_tacticalScopeSlot) return true;
     const size_t n = 3 * tris;
     if (n == 0) {
         return false;
@@ -2571,6 +2715,10 @@ static uint8_t gevr_scope_mesh_mask(const float* mp, const float* lo, const floa
     uint8_t mask = 0;
     for (int h = 0; h < 2; h++) {
         if (!s_scopeTaken[h]) continue;
+        if (h == s_tacticalScopeSlot) {
+            mask |= 1 << h;
+            continue;
+        }
         float scopeMP[16];
         const float* vp = s_scopeVP[h];
         for (int c = 0; c < 4; c++) {
@@ -2600,6 +2748,7 @@ static GevrScopeDraw gevr_scope_draw_state(uint8_t mask, GLint first, GLsizei co
 {
     GevrScopeDraw d = {};
     d.mask = mask;
+    d.warm = s_tacticalScopeWarm;
     d.prg = s_curPrg;
     d.first = first;
     d.count = count;
@@ -2649,7 +2798,9 @@ static void gevr_scope_keep(GLint first, const float* buf_vbo, size_t buf_vbo_le
             return;
         }
     }
-    s_scopeDraws.push_back(gevr_scope_draw_state(mask, first, (GLsizei)(3 * buf_vbo_num_tris)));
+    GevrScopeDraw d = gevr_scope_draw_state(mask, first, (GLsizei)(3 * buf_vbo_num_tris));
+    memcpy(d.firstClip, buf_vbo, sizeof(d.firstClip));
+    s_scopeDraws.push_back(d);
 }
 
 /* a hand's scope target, once (gfx_vr_scope_prepare makes both ahead of use) */
@@ -2703,6 +2854,8 @@ void gfx_vr_scope_render(void)
     GevrProfileSection profile(GEVR_TIME_SCOPE);
     s_scopeRec = false;
     s_scopeOnlyMask = 0;
+    if (s_tacticalScopeSlot >= 0 && !s_tacticalScopeReady)
+        s_scopeTaken[s_tacticalScopeSlot] = false;
     if (!gevr_scope_any_taken()) {
         return;
     }
@@ -2792,6 +2945,9 @@ void gfx_vr_scope_render(void)
                 if (d.prg->scopeVPLocation >= 0) glUniformMatrix4fv(d.prg->scopeVPLocation, 1, GL_FALSE, s_scopeVP[hand]);
                 if (d.prg->scopeHeadPLocation >= 0) glUniform2f(d.prg->scopeHeadPLocation, s_scopeHeadP[hand][0], s_scopeHeadP[hand][1]);
             }
+            const bool heat = hand == s_tacticalScopeSlot && s_tacticalScopeThermal;
+            if (d.prg->scopeHeatLocation >= 0 && (last == NULL || last->prg != d.prg || last->warm != d.warm))
+                glUniform1i(d.prg->scopeHeatLocation, heat ? (d.warm ? 2 : 1) : 0);
             for (int t = 0; t < 2; t++) {
                 if (d.prg->used_textures[t]) {
                     if (!haveTexture[t] || replayTex[t] != d.tex[t]) {
@@ -2831,7 +2987,7 @@ void gfx_vr_scope_render(void)
         // draws' first vertex through the scope camera.
         if (hand == 0 || !taken[0]) {
             static unsigned tick;
-            const char* trig = "/sdcard/Android/data/com.gevr.port/files/gevr_scopedump";
+            const char* trig = GEVR_ANDROID_EXTERNAL_FILES "/gevr_scopedump";
             FILE* t = ((tick++ % 30) == 0) ? fopen(trig, "r") : NULL;
             if (t != NULL) {
                 fclose(t);
@@ -2843,7 +2999,7 @@ void gfx_vr_scope_render(void)
                 for (size_t i = 0; i < px.size(); i += 4) {
                     if (px[i] > 8 || px[i + 1] > 8 || px[i + 2] > 8) lit++;
                 }
-                FILE* f = fopen("/sdcard/Android/data/com.gevr.port/files/gevr_scope.pam", "wb");
+                FILE* f = fopen(GEVR_ANDROID_EXTERNAL_FILES "/gevr_scope.pam", "wb");
                 if (f != NULL) {
                     fprintf(f, "P7\nWIDTH %d\nHEIGHT %d\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n",
                             GEVR_SCOPE_RES, GEVR_SCOPE_RES);
@@ -2858,7 +3014,7 @@ void gfx_vr_scope_render(void)
                 unsigned k = 0;
                 for (const GevrScopeDraw& d : s_scopeDraws) {
                     if (d.mesh || !(d.mask & (1 << hand)) || k >= 4) continue;
-                    const float* v = (const float*)(s_pmPtr + (size_t)d.first * d.prg->num_floats * sizeof(float));
+                    const float* v = d.firstClip;
                     const float cx = v[0] / s_scopeHeadP[hand][0], cy = v[1] / s_scopeHeadP[hand][1], cz = -v[3];
                     const float* M = s_scopeVP[hand];
                     sysLogPrintf(LOG_NOTE, "scope: draw %u first %d count %d clip (%.2f %.2f %.2f %.2f) -> (%.2f %.2f %.2f %.2f)",
@@ -2880,6 +3036,7 @@ void gfx_vr_scope_render(void)
         if (p->scopeLocation >= 0) {
             glUseProgram(p->opengl_program_id);
             glUniform1i(p->scopeLocation, 0);
+            if (p->scopeHeatLocation >= 0) glUniform1i(p->scopeHeatLocation, 0);
         }
     }
     if (bound != prevPrg) {
@@ -2933,7 +3090,9 @@ void gfx_vr_scope_render(void)
 // vr_openxr.cpp: this game frame's scope image for a hand, or 0 when there is none
 GLuint gfx_vr_scope_texture(int hand)
 {
-    return (hand == 0 || hand == 1) && s_scopeDrawn[hand] ? s_scopeTex[hand] : 0;
+    /* The fitted Tactical optic is composited on its housing in the eye
+     * pass. Only the original game's scopes use the OpenXR quad layers. */
+    return (hand == 0 || hand == 1) && hand != s_tacticalScopeSlot && s_scopeDrawn[hand] ? s_scopeTex[hand] : 0;
 }
 
 static void gevr_eye_present_draw(void) {
@@ -2972,12 +3131,14 @@ static void gfx_opengl_draw_triangles(float buf_vbo[], size_t buf_vbo_len, size_
             gevr_pm_next_segment();
         }
         GLsizeiptr off = gevr_pm_base() + (s_pmOff - gevr_pm_base() + stride - 1) / stride * stride;
-        if (off + bytes > (GLsizeiptr)(s_pmSeg + 1) * s_pmSegSize) {
-            static unsigned s_spills;
-            if (!(s_spills++ & (s_spills - 1)))   /* the 1st, 2nd, 4th... */
-                sysLogPrintf(LOG_WARNING, "vertex-ring: a frame outgrew its %d MB segment (%u so far): "
-                             "its redraws may show stale vertices", (int)(s_pmSegSize >> 20), s_spills);
-            gevr_pm_next_segment();   /* a frame too big for one segment: take the next */
+        if (off + bytes > s_pmBase + (GLsizeiptr)(s_pmSeg + 1) * s_pmSegSize) {
+            static uint32_t failedFrame = 0xffffffffu;
+            if (failedFrame == frame_count) return;
+            if (s_stageRing || !gevr_pm_grow(bytes + stride - 1)) {
+                failedFrame = frame_count;
+                sysLogPrintf(LOG_WARNING, "vertex-ring: could not grow storage, skipped excess draws this frame");
+                return;
+            }
             off = gevr_pm_base() + (s_pmOff - gevr_pm_base() + stride - 1) / stride * stride;
         }
         memcpy(s_pmPtr + off, buf_vbo, (size_t)bytes);
@@ -3150,7 +3311,8 @@ struct GevrEdgeCoverage {
     }
 };
 
-static void gevr_issue_draw(GLint first, GLsizei count, bool decalZ, bool decalDepth, float decalPull, bool lineMode)
+static void gevr_issue_draw(GLint first, GLsizei count, bool decalZ, bool decalDepth, float decalPull, bool lineMode,
+    float decalProjectionZ)
 {
     GevrCpuSection timing(GEVR_TIME_DRAW_ISSUE);
     // A HUD capture's draw is the left view only (its right eye is parked):
@@ -3170,7 +3332,7 @@ static void gevr_issue_draw(GLint first, GLsizei count, bool decalZ, bool decalD
          * too. Overlapping decals pass alike, so the later primitive wins, as
          * on the RDP (Frigate's hull "06": shadow, then face).
          */
-        gevr_set_decal_bias(gfx_decal_proj_z * gevr_room_decal_reach());
+        gevr_set_decal_bias(decalProjectionZ * gevr_room_decal_reach(), decalProjectionZ);
         gevr_draw_range(first, count);
         gevr_set_decal_bias(0.0f);
         s_uniCacheValid = false;   /* the pass wrote the bias */
@@ -3220,13 +3382,13 @@ static void gevr_issue_draw(GLint first, GLsizei count, bool decalZ, bool decalD
         glDepthMask(GL_FALSE);
         glDepthFunc(GL_GEQUAL);
         glPolygonOffset(0.0f, 0.0f);
-        gevr_set_decal_bias(-gfx_decal_proj_z * bandD);   // pushed away
+        gevr_set_decal_bias(-decalProjectionZ * bandD, decalProjectionZ);   // pushed away
         glStencilFunc(GL_ALWAYS, 1, 0xff);
         glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
         gevr_draw_range(first, count);
 
         glDepthFunc(GL_LEQUAL);
-        gevr_set_decal_bias(gfx_decal_proj_z * bandD);   // pulled near
+        gevr_set_decal_bias(decalProjectionZ * bandD, decalProjectionZ);   // pulled near
         glStencilFunc(GL_EQUAL, 1, 0xff);
         /* Colour: marks are kept, so every primitive of the draw can land on
          * a marked pixel and the last one submitted wins. */
@@ -3242,7 +3404,7 @@ static void gevr_issue_draw(GLint first, GLsizei count, bool decalZ, bool decalD
         glDepthMask(GL_FALSE);
         glDepthFunc(GL_ALWAYS);
         glPolygonOffset(0.0f, 0.0f);
-        gevr_set_decal_bias(-gfx_decal_proj_z * bandD);
+        gevr_set_decal_bias(-decalProjectionZ * bandD, decalProjectionZ);
         glStencilFunc(GL_ALWAYS, 0, 0xff);
         glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
         gevr_draw_range(first, count);
@@ -3259,7 +3421,7 @@ static void gevr_issue_draw(GLint first, GLsizei count, bool decalZ, bool decalD
     }
 
     if (decalDepth) {
-        if (decalPull != 0.0f) gevr_set_decal_bias(gfx_decal_proj_z * decalPull);
+        if (decalPull != 0.0f) gevr_set_decal_bias(decalProjectionZ * decalPull, decalProjectionZ);
         /*
          * Colour first without depth, as the RDP draws a decal, then its depth
          * alone at the surface (no offset). Writing depth in the colour pass
@@ -3364,15 +3526,19 @@ struct GevrEyeDraw {
     bool gunDecal;
     bool decalDepth;
     float decalPull;
+    float decalProjectionZ;
     bool isMenu;
     int8_t hand;       // the controller it follows (gunfire.c gevrHandTag), 2 the body, or -1: the world
     GLint viewport[4];
     GLint scissor[4];
     uint32_t mesh;     // a static mesh's draw: 1 + its s_eyeMeshes entry; 0 the vertex ring
     uint8_t faded;     // 255 minus gevrFadeDepthAlpha: 0 a draw that does not fade
+    uint32_t optic;    // one plus the lens entry, or zero for an ordinary draw
 };
 
 static std::vector<GevrEyeDraw> s_eyeDraws;
+struct GevrEyeOptic { GevrOpticSurface surface; GLuint scene; };
+static std::vector<GevrEyeOptic> s_eyeOptics;
 static uint32_t s_eyeKept, s_eyeMerged;   // gevr_eye_keep: per second, Show stats / profile traces
 extern "C" int VrShowStats;                 // vr_input.cpp: the stats readout is on
 struct GevrEyeMesh {
@@ -3389,6 +3555,7 @@ void gfx_vr_eye_record(bool on, const float* proj, bool invert_y, const float* p
     gevr_mesh_settle();
     if (on) {
         s_eyeDraws.clear();
+        s_eyeOptics.clear();
         s_eyeMeshes.clear();
         s_eyeReady = false;
         s_eyeHand = -1;
@@ -3461,7 +3628,7 @@ void gfx_vr_eye_record_only(bool on)
  */
 static bool gevr_eye_draw_joins(const GevrEyeDraw& a, const GevrEyeDraw& b)
 {
-    if (a.lineMode || b.lineMode || a.first + a.count != b.first || a.prg != b.prg
+    if (a.optic || b.optic || a.lineMode || b.lineMode || a.first + a.count != b.first || a.prg != b.prg
         || a.prg->opaque_depth_pass_location >= 0
         || a.decalZ || b.decalZ || a.decalDepth || b.decalDepth
         || a.gunDecal != b.gunDecal || a.decalPull != b.decalPull
@@ -3503,7 +3670,7 @@ static void gevr_eye_keep(GLint first, GLsizei count, bool lineMode)
         s_eyeSeg = s_pmSeg;
         s_eyeNeed = s_pmOff - gevr_pm_base();
     }
-    GevrEyeDraw d;
+    GevrEyeDraw d = {};
     d.prg = s_curPrg;
     d.first = first;
     d.count = count;
@@ -3520,6 +3687,8 @@ static void gevr_eye_keep(GLint first, GLsizei count, bool lineMode)
     d.gunDecal = gevrGunDl;  // a hand-held model's decals take the narrow band
     d.decalDepth = gevrRoomDl && s_isDecal;
     d.decalPull = 0.0f;
+    // Later HUD draws can load a different projection before this eye pass replays.
+    d.decalProjectionZ = gfx_decal_proj_z;
     d.isMenu = vr_dl_is_pause_or_menu;
     d.hand = (int8_t)s_eyeHand;
     memcpy(d.viewport, s_curViewport, sizeof(d.viewport));
@@ -3566,6 +3735,8 @@ static void gevr_eye_proj_times(const float* delta, float M[16])
     }
 }
 
+#include "gevr_tactical_optic_render.inc.h"
+
 /*
  * Into the eye buffers already bound and cleared (gfx_pc.cpp
  * gfx_vr_redraw_frame). delta: the head's move from the game frame's pose,
@@ -3578,19 +3749,20 @@ static void gevr_eye_proj_times(const float* delta, float M[16])
 /* GoldenEye: static meshes (gfx_opengl_draw_mesh) - the batch's floats for the bound mesh variant */
 static void gevr_mesh_uniforms(const struct ShaderProgram* prg, const struct GfxMeshDrawParams* p, bool* paletteBound)
 {
-    const bool made = s_skinPaletteBuffer == 0;
-    if (made) glGenBuffers(1, &s_skinPaletteBuffer);
-    // BindBufferBase also binds the generic UBO target used by BufferData.
-    // Only a controlled replay pass can retain ownership across calls.
-    if (made || paletteBound == NULL || !*paletteBound) {
-        glBindBufferBase(GL_UNIFORM_BUFFER, 0, s_skinPaletteBuffer);
-        if (paletteBound != NULL) *paletteBound = true;
-    }
-    if (made || (p->skinned && (!s_skinPaletteUploaded ||
-        memcmp(s_skinPaletteRows, p->palette.rows, sizeof(s_skinPaletteRows)) != 0))) {
-        glBufferData(GL_UNIFORM_BUFFER, sizeof(p->palette.rows), p->palette.rows, GL_STREAM_DRAW);
-        memcpy(s_skinPaletteRows, p->palette.rows, sizeof(s_skinPaletteRows));
-        s_skinPaletteUploaded = true;
+    if (p->skinned) {
+        const bool made = s_skinPaletteBuffer == 0;
+        if (made) glGenBuffers(1, &s_skinPaletteBuffer);
+        // BindBufferBase also binds the generic UBO target used by BufferData.
+        if (made || paletteBound == NULL || !*paletteBound) {
+            glBindBufferBase(GL_UNIFORM_BUFFER, 0, s_skinPaletteBuffer);
+            if (paletteBound != NULL) *paletteBound = true;
+        }
+        if (made || !s_skinPaletteUploaded ||
+            memcmp(s_skinPaletteRows, p->palette.rows, sizeof(s_skinPaletteRows)) != 0) {
+            glBufferData(GL_UNIFORM_BUFFER, sizeof(p->palette.rows), p->palette.rows, GL_STREAM_DRAW);
+            memcpy(s_skinPaletteRows, p->palette.rows, sizeof(s_skinPaletteRows));
+            s_skinPaletteUploaded = true;
+        }
     }
     // Uniform values belong to each mesh program. Capture/replay supplies owned
     // parameters; comparing values avoids repeatedly uploading the same room,
@@ -3763,6 +3935,13 @@ void gfx_vr_eye_replay(const float* delta, const float* hand0, const float* hand
     GevrReplayBindings bindings;
     bindings.ring = ringVbo;
     for (const GevrEyeDraw& d : s_eyeDraws) {
+        if (d.optic) {
+            drawTacticalLens(s_eyeOptics[d.optic-1], Ms[d.hand+1], false);
+            bindings = {};
+            haveTexture[0] = haveTexture[1] = false;
+            last = NULL;
+            continue;
+        }
         gevr_replay_vao(bindings, d.mesh ? s_eyeMeshes[d.mesh - 1].vao : opengl_vao, d.mesh != 0);
         if (last == NULL || d.prg != bound) {
             if (last != NULL || d.prg != bound) {
@@ -3822,7 +4001,7 @@ void gfx_vr_eye_replay(const float* delta, const float* hand0, const float* hand
         }
         s_issueGunDecal = d.gunDecal;
         gevrFadeDepthAlpha = (uint8_t)(255 - d.faded);
-        gevr_issue_draw(d.first, d.count, d.decalZ, d.decalDepth, d.decalPull, d.lineMode);
+        gevr_issue_draw(d.first, d.count, d.decalZ, d.decalDepth, d.decalPull, d.lineMode, d.decalProjectionZ);
         last = &d;
     }
     gevr_replay_vao(bindings, opengl_vao, false);
@@ -4195,7 +4374,7 @@ void gfx_vr_motion_pass(const float* const cur[4], const float* const prev[4], b
     for (const GevrEyeDraw& d : s_eyeDraws) {
         const GevrEyeMesh* mesh = d.mesh ? &s_eyeMeshes[d.mesh - 1] : NULL;
         // decals keep the motion of the surface they lie on (see above)
-        if (d.isMenu || d.decalZ || d.decalDepth) {
+        if (d.optic || d.isMenu || d.decalZ || d.decalDepth) {
             skipped++;
             continue;
         }
@@ -4367,14 +4546,16 @@ struct GevrMeshGpu {
  * of its time in gfx_sp_vertex and gfx_sp_tri1 and ran Dam at 15 fps
  * (2026-11-20); the PC's desktop GL keeps the CPU path.
  */
-static bool gevr_mesh_supported(void)
+static bool gevr_mesh_supported(bool tacticalGear)
 {
+    if (!opengl_vao || s_meshBroken || GLVersion.major < 3) return false;
+    if (tacticalGear) return gl_es || gl_glsl_version >= 140;
 #ifdef GEVR_FLAT
     const bool views = true;
 #else
     const bool views = use_multiview;
 #endif
-    return views && gl_es && GLVersion.major >= 3 && opengl_vao != 0 && !s_meshBroken;
+    return views && gl_es;
 }
 
 static GevrMeshGpu* gevr_mesh_gpu(void** slot, const void* vertices, uint32_t num_vertices,
@@ -4431,6 +4612,14 @@ static GevrMeshGpu* gevr_mesh_gpu(void** slot, const void* vertices, uint32_t nu
     glBindBuffer(GL_ARRAY_BUFFER, opengl_vbo);
     *slot = g;
     return g;
+}
+
+static void gfx_opengl_prepare_mesh(void** gpu, const void* vertices, uint32_t num_vertices,
+                                    const uint32_t* indices, uint32_t num_indices)
+{
+    gevr_mesh_settle();
+    if (gevr_mesh_supported(true))
+        gevr_mesh_gpu(gpu, vertices, num_vertices, indices, num_indices, false, false);
 }
 
 static void gfx_opengl_delete_mesh(void* gpu)
@@ -4553,7 +4742,7 @@ static bool gfx_opengl_draw_mesh(void** gpu, const void* vertices, uint32_t num_
 {
     // fast3d's program: the one bound, or the one put back when the run before settles
     struct ShaderProgram* base = s_meshLazyBase != NULL ? s_meshLazyBase : s_curPrg;
-    if (!gevr_mesh_supported() || base == NULL || base->is_mesh || base->opt_grayscale ||
+    if (!gevr_mesh_supported(p->tactical_gear) || base == NULL || base->is_mesh || base->opt_grayscale ||
         p->num_inputs != base->num_inputs || s_scopeOnlyMask || gForceFlatShaderForMenu ||
         vr_dl_is_pause_or_menu || get_debug_VisCVG_flag()) {
         gevr_mesh_settle();
@@ -4962,8 +5151,7 @@ static void gfx_opengl_init(void) {
     glGenBuffers(1, &opengl_vbo);
     glBindBuffer(GL_ARRAY_BUFFER, opengl_vbo);
     {
-        typedef void (*PFN_BufferStorageEXT)(GLenum, GLsizeiptr, const void *, GLbitfield);
-        PFN_BufferStorageEXT bufferStorage = (PFN_BufferStorageEXT)SDL_GL_GetProcAddress("glBufferStorageEXT");
+        s_pmStorage = (GevrBufferStorageProc)SDL_GL_GetProcAddress("glBufferStorageEXT");
         bool ringOk = gl_es;
         if (gl_es) {
             // GLES: the entry point can resolve without the extension (ANGLE on
@@ -4982,17 +5170,11 @@ static void gfx_opengl_init(void) {
             // against the head and hands (issue #53's, on PC VR).
             const char* e = (const char*)glGetString(GL_EXTENSIONS);
             ringOk = e && strstr(e, "GL_ARB_buffer_storage") != NULL;
-            bufferStorage = ringOk ? (PFN_BufferStorageEXT)SDL_GL_GetProcAddress("glBufferStorage") : NULL;
+            s_pmStorage = ringOk ? (GevrBufferStorageProc)SDL_GL_GetProcAddress("glBufferStorage") : NULL;
         }
-        const GLbitfield flags = GL_MAP_WRITE_BIT | 0x0040 /* PERSISTENT */ | 0x0080 /* COHERENT */;
         const GLsizeiptr segment = 16 << 20;
-        if (ringOk && bufferStorage != NULL && glMapBufferRange != NULL && glFenceSync != NULL) {
-            while (glGetError() != GL_NO_ERROR) {}
-            bufferStorage(GL_ARRAY_BUFFER, segment * GEVR_PM_SEGMENTS, NULL, flags);
-            if (glGetError() == GL_NO_ERROR) {
-                s_pmPtr = (uint8_t *)glMapBufferRange(GL_ARRAY_BUFFER, 0, segment * GEVR_PM_SEGMENTS, flags);
-                if (glGetError() != GL_NO_ERROR) s_pmPtr = NULL;
-            }
+        if (ringOk && s_pmStorage != NULL && glMapBufferRange != NULL && glFenceSync != NULL) {
+            s_pmPtr = gevr_pm_map(GL_ARRAY_BUFFER, segment * GEVR_PM_SEGMENTS);
             if (s_pmPtr) {
                 s_pmSegSize = segment;
             } else {
@@ -5019,7 +5201,9 @@ static void gfx_opengl_init(void) {
     if (gl_core_profile || gl_es) {
         // warn the user that odd behavior can occur
         sysLogPrintf(LOG_WARNING, "GL: using core profile or ES, watch out for errors");
-        // core/ES will fail badly if we don't use a VAO for our VBO
+    }
+    const bool gearVao = sysArgCheck("--tactical-gear-cache") && GLVersion.major >= 3 && glGenVertexArrays;
+    if (gl_core_profile || gl_es || gearVao) {
         glGenVertexArrays(1, &opengl_vao);
         glBindVertexArray(opengl_vao);
     }
@@ -5057,6 +5241,8 @@ static void gfx_opengl_on_resize(void) {
 
 static void gfx_opengl_start_frame(void) {
     gevr_mesh_settle();
+    s_trainShadowLift = gevrTacticalTrainShadowLift();
+    gevr_set_shadow_lift(s_curPrg);
     frame_count++;
     gevr_decal_switch_poll();
     gevr_zdebug_poll();
@@ -6045,19 +6231,24 @@ static void gfx_opengl_mirror_to_desktop(
 
     gfx_opengl_init_mirror_shader();
 
-    // Letterbox calculation: rendering area in UV coordinates [0..1]
-    float src_ratio = (float)src_w / (float)src_h;
-    float dst_ratio = (float)dst_w / (float)dst_h;
+    // Fullscreen uses a centred crop rather than stretching a near-square eye.
+    // Use the same viewport for XR overlays, so they stay aligned with the eye.
+    bool sbs = gfx_sdl_is_mirror_sbs();
+    GevrMirrorViewport viewport = gevrMirrorViewport((int)src_w, (int)src_h, (int)dst_w, (int)dst_h,
+        gfx_sdl_is_mirror_fullscreen() && !sbs);
     float rect_x = 0.0f, rect_y = 0.0f, rect_w = 1.0f, rect_h = 1.0f;
 
 
     // ── Switch to mirror_wnd ──
+    // Submit the eye writes from the game context before the shared mirror
+    // context samples the acquired image.
+    glFlush();
     SDL_GL_MakeCurrent(mirror_wnd, mirror_ctx);
 
     // Disable auto sRGB conversion on the desktop backbuffer
     glDisable(GL_FRAMEBUFFER_SRGB);
 
-    glViewport(0, 0, (GLsizei)dst_w, (GLsizei)dst_h);
+    glViewport(viewport.x, viewport.y, viewport.w, viewport.h);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -6067,7 +6258,6 @@ static void gfx_opengl_mirror_to_desktop(
     glBindTexture(GL_TEXTURE_2D_ARRAY, eye_array_tex);
     glUniform1i(s_mirror_uloc_tex,   0);
 
-    bool sbs = gfx_sdl_is_mirror_sbs();
     glUniform1i(s_mirror_uloc_sbs, gfx_sdl_is_mirror_sbs() ? 1 : 0);
 
     if (sbs) {
@@ -6085,7 +6275,7 @@ static void gfx_opengl_mirror_to_desktop(
     SDL_GL_MakeCurrent(mirror_wnd, mirror_ctx);
 
     glDisable(GL_FRAMEBUFFER_SRGB);
-    glViewport(0, 0, (GLsizei)dst_w, (GLsizei)dst_h);
+    glViewport(viewport.x, viewport.y, viewport.w, viewport.h);
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_BLEND);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -6144,7 +6334,7 @@ static void gfx_opengl_mirror_to_desktop(
                 case VR_MIRROR_MENU_R: tex = gfx_opengl_get_vr_menu_texture_R(); break;
                 case VR_MIRROR_MENU_H: tex = gfx_opengl_get_vr_menu_texture_H(); break;
             }
-            gfx_opengl_draw_mirror_menu_overlay(tex, entries[i].mvp, 0, 0, dst_w, dst_h);
+            gfx_opengl_draw_mirror_menu_overlay(tex, entries[i].mvp, viewport.x, viewport.y, viewport.w, viewport.h);
         }
     }
 
@@ -6202,7 +6392,8 @@ struct GfxRenderingAPI gfx_opengl_api = {
         gfx_opengl_upload_texture_hd,
         gfx_opengl_draw_mesh,
         gfx_opengl_delete_mesh,
-        gfx_opengl_scope_sees_mesh
+        gfx_opengl_scope_sees_mesh,
+        gfx_opengl_prepare_mesh
 };
 
 // ============================================================================

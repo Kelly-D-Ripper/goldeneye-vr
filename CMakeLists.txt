@@ -46,6 +46,7 @@ option(GEVR_MOBILE "Android phone/tablet: flat, no OpenXR" OFF)
 # The Steam Frame APK (the "frame" flavor, docs/pc-platforms.md "Steam Frame"):
 # the Quest's game with Khronos's OpenXR loader, which finds SteamVR in Lepton.
 option(GEVR_FRAME "Android OpenXR on any runtime (Steam Frame): Khronos's loader" OFF)
+option(GEVR_TACTICAL_QUEST "Standalone GEVR Tactical Quest release" OFF)
 if(GEVR_PLATFORM STREQUAL "server")
   set(GEVR_HEADLESS ON)
 elseif(GEVR_PLATFORM STREQUAL "pc")
@@ -575,6 +576,8 @@ set(SRC_NET
   "${CMAKE_SOURCE_DIR}/port/src/net/net_spatial.c"
   "${CMAKE_SOURCE_DIR}/port/src/net/net_discovery.c"
   "${CMAKE_SOURCE_DIR}/port/src/net/net_player_sync.c"
+  "${CMAKE_SOURCE_DIR}/port/src/net/net_tactical.c"
+  "${CMAKE_SOURCE_DIR}/port/src/net/net_tactical_loot.c"
   "${CMAKE_SOURCE_DIR}/port/src/net/net_ice.cpp"
 )
 
@@ -852,6 +855,9 @@ add_library(gevr SHARED ${SRC})
 add_dependencies(gevr gevr_buildid)
 target_include_directories(gevr PRIVATE ${GEVR_INCLUDES})
 target_compile_options(gevr PRIVATE -include "${CMAKE_BINARY_DIR}/port/include/versioninfo.h")
+if(GEVR_TACTICAL_QUEST)
+  target_compile_definitions(gevr PRIVATE GEVR_TACTICAL_QUEST=1 GEVR_APP_VERSION="0.16-test")
+endif()
 add_library(steamaudio SHARED IMPORTED)
 set_target_properties(steamaudio PROPERTIES IMPORTED_LOCATION "${CMAKE_SOURCE_DIR}/port/external/steamaudio/lib/android-armv8/libphonon.so")
 target_include_directories(gevr PRIVATE "${CMAKE_SOURCE_DIR}/port/external/steamaudio/include")
@@ -870,7 +876,7 @@ endif()
 # Quest; gevrAndroidJava picks at run time and the Quest keeps its Java.
 # HTTPS is libcurl over mbedTLS with curl's Mozilla CA bundle built in: no
 # Android trust store answers there.
-if(NOT GEVR_MOBILE)
+if(NOT GEVR_MOBILE AND NOT GEVR_TACTICAL_QUEST)
   file(STRINGS "${CMAKE_SOURCE_DIR}/android/app/build.gradle" GEVR_VERSION_LINE REGEX "versionName \"[^\"]+\"")
   string(REGEX REPLACE ".*versionName \"([^\"]+)\".*" "\\1" GEVR_APP_VERSION "${GEVR_VERSION_LINE}")
   target_sources(gevr PRIVATE

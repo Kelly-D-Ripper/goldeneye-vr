@@ -64,6 +64,7 @@ void chrlvStanPointPointIntersection(coord3d *arg0, coord3d *arg1, coord3d *resu
 bool handles_shot_actors(ChrRecord *self, s32 hitpart, coord3d *vector, s32 weaponid, bool isPlayer);
 bool chrCanSeeBond(ChrRecord *self);
 bool check_if_position_in_same_room(ChrRecord *self, coord3d *pos, StandTile *stan);
+void chrStopFiring(ChrRecord *self);
 s32 chrSawTargetRecently(ChrRecord *);
 s32 chrIsDead(ChrRecord *chr);
 #ifdef GEVR
@@ -82,6 +83,10 @@ bool check_set_actor_standing_still(ChrRecord *self, s32 faceentitytype, s32 fac
 bool chrGoToPad(ChrRecord *self, s32 padid, SPEED speed);
 struct PathRecord;
 bool if_actor_able_set_on_path(ChrRecord *self, struct PathRecord *path);
+#ifdef GEVR
+enum { GEVR_PATROL_DIRECT_PADS = 0x80 };
+void set_actor_on_path(ChrRecord *self, struct patrol_path *path);
+#endif
 f32 chrlvGetSubrotySideback(ChrRecord *arg0);
 f32 chrlvGetAimLimitAngle(f32 arg0);
 struct weapon_firing_animation_table;
@@ -140,6 +145,9 @@ void chrSetPadPresetByChrnum(ChrRecord *self, s32 chrid, s32 padid);
 s32 chrIsTargetNearlyInSight(ChrRecord *arg0);
 bool chrAdjustPosForSpawn(coord3d *pos, StandTile **arg1, f32 facing, bool b);
 PropRecord *chrSpawnAtPad(ChrRecord *self, s32 bodynum, s32 headnum, s32 padid, AIRecord *ailist, s32 flags);
+#ifdef GEVR
+PropRecord *gevrSpawnCampaignGuard(s32 bodynum, const PadRecord *pad, f32 angle, AIRecord *ailist, s32 id);
+#endif
 PropRecord *chrSpawnAtChr(ChrRecord *self, s32 bodynum, s32 headnum, s32 chrnum, AIRecord *ailist, s32 flags);
 bool chrIfInPadRoom(ChrRecord *self, s32 chrnum, s32 padnum);
 bool check_if_actor_is_at_preset(ChrRecord *self, s32 padnum);

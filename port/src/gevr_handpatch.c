@@ -3,6 +3,7 @@
  * gevr_handpatch.h. The patch data is gevr_handpatch_data.c (generated).
  */
 
+#include "gevr_android_paths.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -227,7 +228,7 @@ static void *hpAlloc(s32 slot, size_t size)
 
 static s32 hpMode(void)
 {
-	FILE *f = fopen("/sdcard/Android/data/com.gevr.port/files/gevr_handpatch.txt", "r");
+	FILE *f = fopen(GEVR_ANDROID_EXTERNAL_FILES "/gevr_handpatch.txt", "r");
 	s32 mode = 1;
 
 	if (f != NULL) {

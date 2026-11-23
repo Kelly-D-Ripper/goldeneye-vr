@@ -74,6 +74,7 @@ struct ModelSlot *g_ModelSlots;
 s32 g_MaxAnimModelSlots = 0;
 //D:80036074
 s32 g_MaxModelSlots = 0;
+s32 g_NumSetupModelSlots = 0;
 //D:80036078
 s32 g_ModelIsLvResetting = 0;
 //D:8003607C

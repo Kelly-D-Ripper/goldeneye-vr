@@ -14,6 +14,31 @@
 
 int VrRagdolls, VrDismemberment, VrBodiesStay, VrDismemberChance=40;
 static int hordeOn;
+s32 sysArgCheck(const char *arg) { (void)arg; return 0; }
+void gevrBloodyCombatForgetWound(const Model *model) { (void)model; }
+int gevrBloodyCombatMoveWound(const Model *from, const Model *to) { (void)from; (void)to; return -1; }
+int gevrBloodyCombatFollowWound(const Model *model, const f32 pose[4][4], int room)
+{
+    (void)model; (void)pose; (void)room; return 0;
+}
+int gevrEnemyRigAttachRagdoll(ChrRecord *chr, unsigned serial, int *matrix)
+{
+    (void)chr; (void)serial; (void)matrix; return 0;
+}
+void gevrEnemyRigRagdollPose(int rig, unsigned serial, const Mtxf *world) { (void)rig; (void)serial; (void)world; }
+void gevrEnemyRigRagdollReleased(int rig, unsigned serial, int restore) { (void)rig; (void)serial; (void)restore; }
+Gfx *gevrEnemyRigDrawRagdoll(int rig, unsigned serial, Model *model, const coord3d *origin, ModelRenderData *render, Gfx *g)
+{
+    (void)rig; (void)serial; (void)model; (void)origin; (void)render; return g;
+}
+int gevrBloodyCombatImpact(int item, int room, const f32 point[3], const f32 direction[3])
+{
+    (void)item; (void)room; (void)point; (void)direction;
+    return 0;
+}
+int gevrBloodyCombatEffects(void) { return 0; }
+void gevrBloodyCombatHeadBurst(int room, const f32 point[3], const f32 direction[3])
+{ (void)room; (void)point; (void)direction; }
 int netHordeActive(void) { return hordeOn; }
 float VrDismemberDamage=2.0f; /* CE's defaults: the cut-rule checks are CE's */
 s32 lvlGetCurrentStageToLoad(void) { return LEVELID_DAM; }
@@ -48,6 +73,7 @@ void subdraw(ModelRenderData *data,Model *model) {
 }
 static void *frameMemory[4096]; static int nframe;
 void *dynAllocate(s32 bytes) { assert(nframe<4096); return frameMemory[nframe++]=calloc(1,bytes); }
+s32 getTileRoom(StandTile *tile) { return tile->room; }
 static void frameFree(void) { while(nframe)free(frameMemory[--nframe]); }
 void bondviewTransformManyPosToViewMatrix(RenderPosView *p,s32 n) { memset(p,0,(size_t)n*sizeof(*p)); }
 Gfx *bgScissorCurrentPlayerViewDefault(Gfx *g) { return g; }
@@ -255,6 +281,15 @@ static void portChecks(void)
     cuts=0;for(int i=0;i<500;i++){int c=rdVolleyCut(b,leg,3);assert(c<0 || c==b->body[9]);cuts+=c>=0;}
     assert(cuts>100 && cuts<300);
     for(int i=0;i<200;i++){assert(rdVolleyCut(b,limbs,3)<0);assert(rdVolleyCut(b,torso,2)<0);}
+    /* Tactical suppresses both firearm detach paths even at 100% chance.
+     * The blast below still cuts joints with that rule in effect. */
+    const int head[3]={2,2,2};
+    VrDismemberChance=100; weaponDamage=50; s_tacticalDeaths=1;
+    assert(rdCutForHit(b,b->body[2],ITEM_TACTICAL_M4A1)<0);
+    assert(rdCutForHit(b,b->body[9],ITEM_RUGER)<0);
+    assert(rdCutForHit(b,b->body[1],ITEM_GOLDENGUN)<0);
+    assert(rdVolleyCut(b,head,3)<0 && rdVolleyCut(b,leg,3)<0);
+    VrDismemberChance=40; weaponDamage=1;
     /* Hitparts map through the model's BBOX nodes, hands to forearms */
     b->hitskel[9]=7;assert(rdSkelForHit(b,9)==5); /* HIT_LEFT_HAND */
     /* Cut limits: no hands or feet bodies, never the pelvis */
@@ -264,6 +299,7 @@ static void portChecks(void)
     Gfx *g=calloc(16384,sizeof(Gfx));
     roomsShown=0;gevrRagdollTick(0);drawn=0;gevrRagdollRender(g);assert(drawn==0);frameFree();
     roomsShown=1;drawn=0;gevrRagdollRender(g);assert(drawn>=1);frameFree();free(g);
+    s_tacticalDeaths=0;
     /* CE's blasts: a guard killed by one is thrown up and away; bodies
      * already down within reach lose up to two joints to it */
     sourceChr.actiontype=ACT_STAND;gevrRagdollNeedsPose(&sourceChr);
@@ -346,6 +382,135 @@ static void portChecks(void)
     puts("PASS: CE human skeleton (11 bodies, hands/feet riding), masses, hinges, damage/chance/shotgun/blast cut rules, blast throws, room culling, layout fallback");
 }
 
+static void tacticalDeathChecks(void)
+{
+    VrRagdolls=1;VrDismemberment=1;VrDismemberChance=100;s_tacticalDeaths=1;
+    sourceProp.type=PROP_TYPE_CHR;
+    const float forward[3]={0,0,1};
+
+    sourceChr.actiontype=ACT_STAND;
+    gevrRagdollNoteHit(&sourceChr,-1,HIT_HEAD,forward,ITEM_WPPK);
+    gevrRagdollNoteHit(&sourceChr,-1,HIT_LEFT_THIGH,forward,ITEM_TACTICAL_M4A1);
+    sourceChr.actiontype=ACT_DIE;
+    gevrRagdollNoteShotDeath(&sourceChr,HIT_LEFT_THIGH,TRUE);
+    assert(!gevrRagdollNeedsPose(&sourceChr));
+    gevrRagdollNoteHit(&sourceChr,-1,HIT_HEAD,forward,ITEM_WPPK);
+    gevrRagdollCapture(&sourceChr);
+    assert(countBodies()==0 && !gevrRagdollSuppress(&sourceChr));
+    assert(rdSeen(&sourceChr,0)->hitpart==HIT_LEFT_THIGH);
+
+    sourceChr.actiontype=ACT_DEAD;
+    assert(gevrRagdollNeedsPose(&sourceChr));
+    gevrRagdollCapture(&sourceChr);
+    assert(countBodies()==1 && !newest()->cuts && gevrRagdollSuppress(&sourceChr));
+    assert(newest()->reaction.hit==HIT_LEFT_THIGH && newest()->reaction.limb==9
+        && !newest()->reaction.started && newest()->reaction.active);
+
+    sourceChr.actiontype=ACT_STAND;
+    assert(!gevrRagdollNeedsPose(&sourceChr));
+    gevrRagdollNoteHit(&sourceChr,-1,HIT_HEAD,forward,ITEM_WPPK);
+    sourceChr.actiontype=ACT_DIE;
+    gevrRagdollNoteShotDeath(&sourceChr,HIT_HEAD,TRUE);
+    assert(gevrRagdollNeedsPose(&sourceChr));
+    gevrRagdollCapture(&sourceChr);
+    assert(countBodies()==2 && !newest()->cuts && newest()->reaction.hit==HIT_HEAD);
+
+    sourceChr.actiontype=ACT_STAND;
+    assert(!gevrRagdollNeedsPose(&sourceChr));
+    sourceChr.actiontype=ACT_DIE;
+    coord3d blast=sourceProp.pos;
+    blast.y=60.f;
+    gevrRagdollExplosionChr(&sourceChr,&blast,1000,1);
+    assert(!gevrRagdollNeedsPose(&sourceChr));
+    g_GlobalTimer+=180;
+    sourceChr.actiontype=ACT_DEAD;
+    gevrRagdollCapture(&sourceChr);
+    assert(countBodies()==3 && newest()->cuts && !newest()->reaction.hit);
+
+    VrDismemberChance=40;
+    gevrRagdollReset();
+    puts("PASS: Tactical limb death waits for animation, fatal headshots enter physics immediately, and fatal blast cuts survive animation");
+}
+
+static void bladeHoldChecks(void)
+{
+    const float forward[3] = {0.f, 0.f, 1.f};
+    const int items[] = {ITEM_KNIFE, ITEM_TACTICAL_KATANA};
+    VrRagdolls = TRUE;
+    VrBodiesStay = 12;
+    sourceProp.pos.x = sourceProp.pos.z = 0.f;
+    for (int i = 0; i < RD_SKEL; ++i) {
+        sourceMatrices[i + 1].pos = identity();
+        memcpy(sourceMatrices[i + 1].pos.m[3], positions[i], sizeof(positions[i]));
+    }
+    for (int hand = 0; hand < 2; ++hand) {
+        const int item = items[hand];
+        s_tacticalDeaths = TRUE;
+        sourceChr.actiontype = ACT_STAND;
+        assert(!gevrRagdollNeedsPose(&sourceChr));
+        const float *contact = sourceMatrices[10].pos.m[3];
+        const float length = hand ? 73.f : 13.f;
+        const float insert = .5f * length;
+        float base[3] = {contact[0], contact[1], contact[2] - (length - insert)};
+        float tip[3] = {contact[0], contact[1], contact[2] + insert};
+        assert(!gevrRagdollBladePose(hand, item, base, tip));
+        sourceChr.actiontype = ACT_DIE;
+        gevrRagdollNoteBladeStab(&sourceChr, hand, item, HIT_LEFT_THIGH, forward, contact);
+        assert(gevrRagdollNeedsPose(&sourceChr));
+        gevrRagdollCapture(&sourceChr);
+        RdBody *body = newest();
+        assert(body && body->bladeHeld && !body->cuts && gevrRagdollSuppress(&sourceChr));
+        RdBladeHold *blade = &s_blades[hand];
+        for (int tick = 0; tick < 150; ++tick) {
+            if (tick < 24) {
+                base[0] += .65f;
+                tip[0] += .65f;
+                base[1] += 1.2f;
+                tip[1] += 1.2f;
+            }
+            if (tick >= 60 && tick < 90) {
+                base[2] -= insert / 60.f;
+                tip[2] -= insert / 60.f;
+            }
+            ++g_GlobalTimer;
+            assert(gevrRagdollBladePose(hand, item, base, tip));
+            gevrRagdollTick(1);
+            assert(body->bladeHeld);
+        }
+        float point[3];
+        memcpy(point, blade->anchor, sizeof(point));
+        rdTransform(&body->joints[blade->part], point, TRUE);
+        assert(fabsf(point[0] - base[0]) < 9.f && fabsf(point[1] - base[1]) < 9.f);
+        assert(fabsf(point[2] - contact[2]) < 9.f && fabsf(blade->depth - .5f * insert) < .1f);
+
+        /* The pose is still tracked. Only the tip clearing the anchor releases the joint. */
+        base[2] -= insert;
+        tip[2] -= insert;
+        ++g_GlobalTimer;
+        assert(gevrRagdollBladePose(hand, item, base, tip));
+        gevrRagdollTick(1);
+        assert(!body->bladeHeld && !blade->body);
+        const float hangingY = body->joints[body->root].m[3][1];
+        for (int tick = 0; tick < 90; ++tick) {
+            ++g_GlobalTimer;
+            gevrRagdollTick(1);
+        }
+        assert(body->joints[body->root].m[3][1] < hangingY - 20.f);
+        while (body->age < 7.97f) {
+            ++g_GlobalTimer;
+            gevrRagdollTick(1);
+        }
+        assert(body->reaction.active && body->reaction.pulses >= 8 && body->reaction.contacted);
+        for (int tick = 0; tick < 5; ++tick) {
+            ++g_GlobalTimer;
+            gevrRagdollTick(1);
+        }
+        assert(!body->reaction.active && body->age < 8.1f);
+        gevrRagdollReset();
+    }
+    puts("PASS: both held blades move a ragdoll, hold through a partial draw, release with the blade clear, and twitch for eight seconds");
+}
+
 #include "ragdoll_movers_test.inc.h"
 
 int main(void)
@@ -354,7 +519,10 @@ int main(void)
     sourceInit();floors();
     movingCollisionChecks();
     guardLiftChecks();
-    portChecks();VrDismemberment=VrRagdolls=0;fflush(stdout);
+    portChecks();
+    tacticalDeathChecks();
+    bladeHoldChecks();
+    VrDismemberment=VrRagdolls=0;fflush(stdout);
     assert(!gevrRagdollNeedsPose(&sourceChr));assert(!pdphysIsReady());
     VrRagdolls=1;VrBodiesStay=RD_BODIES;
     for(int mode=1;mode<=8;mode*=2) {

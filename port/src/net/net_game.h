@@ -54,6 +54,7 @@ int netRoundRosterReady(void);
 int netLocalReady(void);
 void gevrNetSetReady(int ready);
 int netRemoteWeapon(int slot, int hand);
+int netRemoteSuppressed(int slot, int hand);
 int netRemoteTrigger(int slot, int hand);
 int netActiveLoadoutItem(int slot, int k);
 int netCountdownSecondsLeft(void);

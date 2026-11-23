@@ -9,6 +9,8 @@
 #include "options.h"
 #ifdef GEVR
 #include "net_voice.h"
+#include "system.h"
+#include "gevr_tactical_range.h"
 #endif
 #include "bondview.h"
 #include "dyn.h"
@@ -732,9 +734,31 @@ void sub_GAME_7F0A5210(void)
 }
 
 
+#ifdef GEVR
+static int s_rangeWatchSelection;
+Gfx *draw_options_labels(Gfx *gdl, s32 x, s32 y, char *text, u32 colour,
+    s32 outlined, u32 outlinecolour, s32 centre, s32 drawbg, u32 bgcolour, s32 rightalign);
+
+static void rangeWatchInput(void)
+{
+    const u16 buttons = joyGetButtonsPressedThisFrame(PLAYER_1,
+        A_BUTTON | Z_TRIG | U_JPAD | D_JPAD | U_CBUTTONS | D_CBUTTONS);
+    const s32 stick = joyGetStickY(PLAYER_1);
+    if ((buttons & (U_JPAD | U_CBUTTONS)) || stick > 12) s_rangeWatchSelection = 0;
+    if ((buttons & (D_JPAD | D_CBUTTONS)) || stick < -12) s_rangeWatchSelection = 1;
+    if (buttons & (Z_TRIG | A_BUTTON)) {
+        if (s_rangeWatchSelection) gevrTacticalRangeLeave();
+        else gevrTacticalRangeToggleMoving();
+    }
+}
+#endif
+
 // initial pause screen: WATCH_INDEX_MISSION_STATUS
 void watch_screen0_navigation(void)
 {
+#ifdef GEVR
+    if (gevrTacticalRangeActive()) { rangeWatchInput(); return; }
+#endif
     s32 goto_watch_screen_index_4;
     s32 goto_watch_screen_index_1;
 
@@ -1542,6 +1566,9 @@ void build_watch_static_scanline_vertices(Vtx *vertices)
 
 void sub_GAME_7F0A69A8(void)
 {
+#ifdef GEVR
+    s_rangeWatchSelection = 0;
+#endif
     if (joyGetControllerCount() < 2)
     {
         D_800409D8 = 4;
@@ -2303,6 +2330,17 @@ Gfx *draw_watch_mission_status_page(Gfx *gdl, Mtx *param_2)
 
     if (check_watch_page_transistion_running() != 1)
     {
+#ifdef GEVR
+        if (gevrTacticalRangeActive()) {
+            const s32 cx = viGetViewLeft() + viGetViewWidth() / 2;
+            gdl = microcode_constructor(gdl);
+            gdl = draw_options_labels(gdl, cx, 80, "FIRING RANGE", 0xE7EEE9FF, 1, 0x003000A0, 1, 0, 0, 0);
+            gdl = draw_options_labels(gdl, cx, 115, gevrTacticalRangeMoving() ? "Moving targets   ON" : "Moving targets   OFF",
+                s_rangeWatchSelection == 0 ? 0xFFD587FF : 0xD0DDD3FF, 0, 0, 1, 0, 0, 0);
+            return draw_options_labels(gdl, cx, 139, "Return to Workshop",
+                s_rangeWatchSelection == 1 ? 0xFFD587FF : 0xD0DDD3FF, 0, 0, 1, 0, 0, 0);
+        }
+#endif
         gdl = draw_text_q_watch_v201_beta(gdl);
         gdl = draw_text_mission_status(gdl);
         gdl = draw_current_hand_item_and_ammo(empty_draw_function(gdl));
@@ -2316,25 +2354,45 @@ Gfx *draw_watch_mission_status_page(Gfx *gdl, Mtx *param_2)
 }
 
 
-void sub_GAME_7F0A8378(void)
+/* Shared by the watch and the isolated scripted regression. */
+void gevrWatchEquipSelection(s32 index)
 {
-    if (joyGetButtonsPressedThisFrame(PLAYER_1, Z_TRIG|A_BUTTON) == 0) {
-        if (joyGetButtonsPressedThisFrame(PLAYER_1, START_BUTTON) == 0)
-        {
-            return;
-        }
-
-        if (getCurrentPlayerWeaponId(0) == bondinvGetTextbyInvIndex(g_curWatchItemIndex))
-        {
-            return;
-        }
+    g_curWatchItemIndex=index;
+#ifdef GEVR
+    extern int gevrTacticalPrepareWatchItem(s32 item);
+    extern s32 gevrTacticalPrimeGadget(GUNHAND hand);
+    s32 selected = bondinvGetTextbyInvIndex(g_curWatchItemIndex);
+    if (!gevrTacticalPrepareWatchItem(selected)) return;
+    /* Stowing can move the gadget's row. Update the cursor too because
+     * inventory navigation recomputes the highlighted index from it. */
+    for (s32 i = 0; i < bondinvCountTotalItemsInInv(); i++) {
+        if (bondinvGetTextbyInvIndex(i) != selected) continue;
+        g_curWatchItemIndex = i;
+        watch_inventory_cursor_pos = (f32)i + 0.5f;
+        break;
     }
-
+    currentPlayerUnEquipWeaponWrapper(0, selected);
+    gevrTacticalPrimeGadget(GUNRIGHT);
+    /* Consumable gadgets normally recall the last weapon on use. In the
+     * physical inventory that firearm is already on the body or ground. */
+    if (sysArgCheck("--tactical-physical"))
+        g_CurrentPlayer->hands[0].previous_weapon = ITEM_FIST;
+#else
     currentPlayerUnEquipWeaponWrapper(0, bondinvGetTextbyInvIndex(g_curWatchItemIndex));
+#endif
     currentPlayerUnEquipWeaponWrapper(1, 0);
     bondinvSetCurEquippedItem(g_curWatchItemIndex);
     D_800409C4 = 10;
     sndPlaySfx(g_musicSfxBufferPtr, CAMERA_BEEP1_SFX, 0);
+}
+
+void sub_GAME_7F0A8378(void)
+{
+    if (joyGetButtonsPressedThisFrame(PLAYER_1, Z_TRIG|A_BUTTON) == 0) {
+        if (joyGetButtonsPressedThisFrame(PLAYER_1, START_BUTTON) == 0) return;
+        if (getCurrentPlayerWeaponId(0) == bondinvGetTextbyInvIndex(g_curWatchItemIndex)) return;
+    }
+    gevrWatchEquipSelection(g_curWatchItemIndex);
 }
 
 

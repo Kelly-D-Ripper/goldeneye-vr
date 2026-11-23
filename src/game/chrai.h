@@ -172,7 +172,22 @@ Rotate Image:
 #define PTR_LIST_OBJECT_LOOKUP_INDICES_LEN (MAX_PROPS + 1)
 #define BSS_8007161C_LEN 256
 #define BSS_8007161C_DATA_LEN 16
-#define MAX_WEAPON_SLOTS 30
+#ifdef GEVR
+void gevrTacticalReinforcementsReset(s32 stage);
+void gevrTacticalReinforcementsTick(void);
+bool gevrTacticalReinforcementRequest(const struct ChrRecord *guard,
+    const struct coord3d *point, struct StandTile *floor, s32 scripted);
+#endif
+
+#define BASE_WEAPON_SLOTS 30
+#ifdef GEVR
+#define GEVR_JUNGLE_SQUAD_SIZE 5
+#define GEVR_JUNGLE_SQUAD_COUNT 9
+#define GEVR_JUNGLE_PATROL_CAPACITY (GEVR_JUNGLE_SQUAD_SIZE * GEVR_JUNGLE_SQUAD_COUNT)
+#define MAX_WEAPON_SLOTS 256
+#else
+#define MAX_WEAPON_SLOTS BASE_WEAPON_SLOTS
+#endif
 #define MAX_HAT_SLOTS 10
 #define MAX_AMMO_CRATES 20
 #define PROJECTILES_ARR_MAX 20

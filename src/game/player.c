@@ -631,6 +631,14 @@ PROP getPropForHeldItem(ITEM_IDS arg0)
 #endif
     switch (arg0)
     {
+#ifdef GEVR
+        case ITEM_TACTICAL_AK74N: return PROP_TACTICAL_AK74N;
+        case ITEM_TACTICAL_KATANA: return PROP_TACTICAL_KATANA;
+#define TACTICAL_EXPANDED(id, group, native, gun, prop, capacity, cadence, name) \
+        case ITEM_TACTICAL_##id: return PROP_TACTICAL_##id;
+#include "gevr_tactical_expanded.inc.h"
+#undef TACTICAL_EXPANDED
+#endif
         case ITEM_KNIFE:         ret = PROP_CHRKNIFE;         break; /* weapon_multi_hunting_knife */
         case ITEM_WPPK:          ret = PROP_CHRWPPK;          break; /* weapon_multi_pp7 */
         case ITEM_SKORPION:      ret = PROP_CHRSKORPION;      break; /* weapon_multi_klobb */

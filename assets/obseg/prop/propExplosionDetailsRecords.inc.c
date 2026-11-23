@@ -1702,6 +1702,20 @@ ExplosionDetailsRecord object_explosion_details[] = {
 		EXPLOSION_BREAK_OBJECT    ,
 		{0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000}
 	},
+#ifdef GEVR
+    { EXPLOSION_BREAK_OBJECT, {0, 0, 0, 0, 0, 0} }, /* PROP_TACTICAL_AK74N */
+#define TACTICAL_EXPANDED(id, group, native, gun, prop, capacity, cadence, name) \
+    { EXPLOSION_BREAK_OBJECT, {0, 0, 0, 0, 0, 0} },
+#define TACTICAL_EXPANDED_BOUNDARY \
+    { EXPLOSION_BREAK_OBJECT, {0, 0, 0, 0, 0, 0} }, /* PROP_TACTICAL_ALTYN */ \
+    { EXPLOSION_BREAK_OBJECT, {0, 0, 0, 0, 0, 0} }, /* PROP_TACTICAL_FAST_TROOPER */
+#define TACTICAL_EXPANDED_MELEE_BOUNDARY \
+    { EXPLOSION_BREAK_OBJECT, {0, 0, 0, 0, 0, 0} }, /* PROP_TACTICAL_KATANA */
+#include "gevr_tactical_expanded.inc.h"
+#undef TACTICAL_EXPANDED
+#undef TACTICAL_EXPANDED_BOUNDARY
+#undef TACTICAL_EXPANDED_MELEE_BOUNDARY
+#endif
     {
 		EXPLOSION_BREAK_OBJECT    ,
 		{0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff}

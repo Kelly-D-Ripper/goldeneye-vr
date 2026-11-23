@@ -52,6 +52,10 @@ fixtures = {
         "FIT": function(view, "static void gevrWatchStatusFit("),
         "RENDER": "static Gfx *gevrRenderWatchStatusAt(Gfx *gdl, const Mtxf *transform);\n"
                   + function(view, "static Gfx *gevrRenderWatchStatus(Gfx *gdl, const Mtxf *wrist)\n{") + "\n"
+                  + function(glass, "void sub_GAME_7F0A33F8(") + "\n"
+                  + function(glass, "Gfx *draw_watch_background(") + "\n"
+                  + function(view, "static Gfx *gevrDrawTacticalWatchPanel(") + "\n"
+                  + function(view, "static Gfx *gevrDrawWatchGauges(Gfx *gdl, const Mtxf *transform, s32 originalDial)\n{") + "\n"
                   + function(view, "static Gfx *gevrRenderWatchStatusAt(Gfx *gdl, const Mtxf *transform)\n{"),
     },
 }

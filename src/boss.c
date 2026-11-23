@@ -45,6 +45,7 @@
 #include "gevr_sched.h"
 #ifdef GEVR
 #include "gevr_romlayout.h"
+#include "game/prop.h"
 #endif
 
 #ifdef GEVR
@@ -61,6 +62,7 @@ extern u64 sysGetMicroseconds(void);
 extern bool netSlotOccupied(int slot);
 extern bool netTakeRoundReset(void);
 extern void netStageLoaded(void);
+extern void gevrTacticalGuardAiReset(void);
 extern void netCoopStageLoaded(void);   /* co-op (#94): a new mission's guards (net_coop.c) */
 extern int netCoopActive(void);
 extern int netCoopSession(void);
@@ -417,6 +419,15 @@ void bossMainloop(void)
                 set_selected_difficulty(*(const unsigned char*)tokenFind(1, "-hard") - '0');
                 lvlSetSelectedDifficulty(*(const unsigned char*)tokenFind(1, "-hard") - '0');
             }
+#ifdef GEVR
+            if (sysArgCheck("--input-script") && sysArgCheck("--boot-difficulty")) {
+                const s32 diff = sysArgGetInt("--boot-difficulty", DIFFICULTY_AGENT);
+                if (diff >= DIFFICULTY_AGENT && diff <= DIFFICULTY_007) {
+                    set_selected_difficulty(diff);
+                    lvlSetSelectedDifficulty(diff);
+                }
+            }
+#endif
         }
 #ifdef GEVR
         else
@@ -568,7 +579,9 @@ void bossMainloop(void)
             gevrLobbySessionStopped();
         for (int slot = 0; slot < MAX_PLAYER_COUNT; slot++) s_net_slot_enabled[slot] = TRUE;
         s_net_session_started = netIsActive() && (g_StageNum != LEVELID_TITLE || netCoopSession());
+        gevrTacticalGuardAiReset();
         netCoopStageLoaded();   /* a load, which netStageLoaded's other calls are not */
+        gevrCampaignEncountersStageLoaded(g_StageNum);
         {
             extern void gevrBotStageLoaded(void);
             extern void gevrSndPathStageLoaded(void);

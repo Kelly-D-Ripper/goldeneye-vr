@@ -12,6 +12,7 @@
 #define GEVR_HAND_USE    0   /* a door, switch or console B would use */
 #define GEVR_HAND_PICKUP 1   /* something to collect off the floor */
 #define GEVR_HAND_MINE   2   /* the player's own remote mine, or a proximity mine still arming */
+#define GEVR_HAND_PICKUP_CONTACT 3   /* pickup within actual reach, no seated projection */
 
 struct PropRecord;
 
@@ -19,8 +20,10 @@ struct PropRecord;
 struct PropRecord *gevrHandFindProp(const float p[3], float reach, int kind);
 int gevrHandInteract(struct PropRecord *prop);
 int gevrHandPickup(struct PropRecord *prop, int mine);
+int gevrHandPickupIntoHand(struct PropRecord *prop, int ctrl);
 
 /* bondview2.c: port/src/input.c reports each grip; lv.c ticks after propsTick */
+void gevrTacticalAcceptWeaponPickup(struct PropRecord *prop, int ctrl, int item);
 void gevrGripGestureInput(int ctrl, int pressed, int held);
 int gevrGripGestureTaken(int ctrl);
 void gevrGripGestureTick(void);

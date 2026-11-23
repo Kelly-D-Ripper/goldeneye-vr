@@ -874,6 +874,31 @@ s32 gunSample1PTransform(Weapon1PTransformKeyframe *keyframes, f32 time, Mtxf *m
 
 WeaponStats *get_ptr_item_statistics(ITEM_IDS item)
 {
+#ifdef GEVR
+    if (item == ITEM_TACTICAL_AK74N) {
+        static WeaponStats stats;
+        static int initialized;
+        if (!initialized) { stats = ak47_stats; stats.Inaccuracy *= .8f; initialized = 1; }
+        return &stats;
+    }
+    switch (item) {
+#define TACTICAL_EXPANDED(id, group, native, gun, prop, capacity, cadence, name) \
+    case ITEM_TACTICAL_##id: { \
+        static WeaponStats stats; \
+        if (!stats.MagSize) { \
+            stats = item == ITEM_TACTICAL_DEAGLE ? ruger_stats : gun##_stats; \
+            stats.MagSize = capacity; \
+            if (cadence) stats.AutomaticFiringRate = cadence; \
+            if (item == ITEM_TACTICAL_M4A1 || item == ITEM_TACTICAL_HK416) \
+                stats.BitFlags &= ~WEAPONSTATBITFLAG_BURST_FIRE; \
+        } \
+        return &stats; \
+    }
+#include "gevr_tactical_expanded.inc.h"
+#undef TACTICAL_EXPANDED
+    default: break;
+    }
+#endif
     if (gitem_structs[item].has_no_model == 0)
     { /* weapon has model, return stats struct */
         return gitem_structs[item].item_weapon_stats;
@@ -1077,14 +1102,14 @@ extern s32 g_gevrHandPatchSkip;   /* gevr_handpatch.c: the hand shells are Golde
 static s32 s_gevrGexDetonate;   /* the off hand's trigger asked; the gun hand's tick detonates */
 
 /* any of the current player's remote mines thrown or stuck */
-s32 gevrGexRemoteMinesOut(void)
+s32 gevrPlayerHasLiveRemoteMines(void)
 {
     PropRecord *prop;
     s32 me = get_cur_playernum();
 
     for (prop = chrpropGetActiveTail(); prop != NULL; prop = prop->prev)
     {
-        if (prop->type == PROP_TYPE_WEAPON && prop->weapon != NULL && prop->weapon->weaponnum == ITEM_REMOTEMINE
+        if (prop->type == PROP_TYPE_WEAPON && prop->weapon != NULL && prop->weapon->weaponnum == ITEM_REMOTEMINE && prop->weapon->timer > 0
             && RUNTIME_OWNER(prop->weapon->runtime_bitflags) == me)
         {
             return TRUE;
@@ -1097,6 +1122,7 @@ s32 gevrGexRemoteMinesOut(void)
 s32 gevrGexMineDetonates(void)
 {
     return VrGexGuns && g_CurrentPlayer != NULL && !g_CurrentPlayer->bonddead
+        && !gevrTacticalGuidedThrow(ITEM_REMOTEMINE)
         && getCurrentPlayerWeaponId(GUNRIGHT) == ITEM_REMOTEMINE
         && getCurrentPlayerWeaponId(GUNLEFT) == ITEM_UNARMED
         && bondinvItemAvailable(ITEM_TRIGGER);
@@ -1127,8 +1153,9 @@ void gevrGexDetonateTick(void)
 /* the hand empty of mines stays on them while any are out (no Detonator to go to) */
 s32 gevrGexMinesHold(GUNHAND hand)
 {
-    return VrGexGuns && hand == GUNRIGHT && getCurrentPlayerWeaponId(GUNRIGHT) == ITEM_REMOTEMINE
-        && bondinvItemAvailable(ITEM_TRIGGER) && gevrGexRemoteMinesOut();
+    return VrGexGuns && !gevrTacticalGuidedThrow(ITEM_REMOTEMINE)
+        && hand == GUNRIGHT && getCurrentPlayerWeaponId(GUNRIGHT) == ITEM_REMOTEMINE
+        && bondinvItemAvailable(ITEM_TRIGGER) && gevrPlayerHasLiveRemoteMines();
 }
 
 /* GoldenEye X's watch rig (WATCH_DEF): both arms are its own */
@@ -4819,7 +4846,6 @@ Gfx *gevrGexDrawOffHand(Gfx *gdl, ModelRenderData *templ, s32 *drawn)
     extern void matrix_4x4_7F058C88(void);
     extern Gfx *gevrRenderGexWatch(Gfx *gdl, ModelRenderData *templ, const f32 pos[3], const f32 x[3],
                                    const f32 y[3]);   /* bondview2.c */
-    extern s32 gevrStereoWatchItem(s32 item);   /* bondview2.c: the watch laser's and detonator's arm */
     extern Gfx *gevrRenderWatchFace(Gfx *gdl, const f32 centre[3], const f32 up[3], const f32 normal[3],
                                     f32 radius);   /* bondview2.c */
     ModelFileHeader *hdr = &s_gevrGexHandHeader;
@@ -5730,6 +5756,22 @@ u16 bondwalkItemGetSound(ITEM_IDS item)
   return get_ptr_item_statistics(item)->Sound;
 }
 
+#ifdef GEVR
+#include "gevr_tactical_session.h"
+u16 gevrTacticalShotSound(ITEM_IDS item, s32 suppressed)
+{
+    extern int gevrTacticalSvdEnabled(void);
+    extern int gevrTacticalItem(int item);
+    if (suppressed) {
+        const int kind = gevrTacticalItem(item);
+        return bondwalkItemGetSound(tacticalGunIsPistol(kind) ? ITEM_WPPKSIL : ITEM_MP5KSIL);
+    }
+    if (item == ITEM_SNIPERRIFLE && gevrTacticalSvdEnabled())
+        return bondwalkItemGetSound(ITEM_M16);
+    return bondwalkItemGetSound(item);
+}
+#endif
+
 
 u8 bondwalkItemGetObjectsShootThrough(ITEM_IDS item)
 {
@@ -5742,13 +5784,13 @@ s32 bondwalkItemHasAmmo(ITEM_IDS item)
 #ifdef GEVR
     /* GE-X's remote mines (gevrGexMineDetonates): the Detonator is theirs, out of
      * the lists; the mines stay while any are out to detonate */
-    if (VrGexGuns && item == ITEM_TRIGGER)
+    if (VrGexGuns && item == ITEM_TRIGGER && !gevrTacticalHandheldDetonator(item))
     {
         return 0;
     }
     if (gevrReloadStoredRounds(GUNRIGHT, item) > 0 || gevrReloadStoredRounds(GUNLEFT, item) > 0) return 1;
     if (VrGexGuns && item == ITEM_REMOTEMINE && get_ammo_count_for_weapon(item) <= 0
-        && bondinvItemAvailable(ITEM_TRIGGER) && gevrGexRemoteMinesOut())
+        && bondinvItemAvailable(ITEM_TRIGGER) && gevrPlayerHasLiveRemoteMines())
     {
         return 1;
     }
@@ -6376,6 +6418,61 @@ void generate_player_thrown_knife(s32 hand)
 
 
 
+#ifdef GEVR
+static void gevrTacticalSwapGadget(GUNHAND hand, ITEM_IDS item)
+{
+    struct hand *state = &g_CurrentPlayer->hands[hand];
+
+    /* A queued switch can be swallowed by the gadget recovery animation. */
+    currentPlayerUnEquipWeaponWrapper(hand, item);
+    state->previous_weapon = hand == GUNRIGHT ? ITEM_FIST : ITEM_UNARMED;
+    state->weapon_next_weapon = item;
+    state->weapon_current_animation = 0;
+    state->weapon_animation_trigger = 0;
+    state->weapon_action_state = GUN_ANIM_STATE_IDLE;
+    state->weapon_firing_status = 0;
+    state->field_890 = 0.f;
+    state->field_88C = 0;
+}
+
+void gevrTacticalReleaseGadget(GUNHAND hand)
+{
+    gevrTacticalSwapGadget(hand, hand == GUNRIGHT ? ITEM_FIST : ITEM_UNARMED);
+}
+
+s32 gevrTacticalPrimeGadget(GUNHAND hand)
+{
+    const ITEM_IDS item = getCurrentPlayerWeaponId(hand);
+    if (!gevrTacticalGuidedThrow(item)) return FALSE;
+
+    struct hand *state = &g_CurrentPlayer->hands[hand];
+    s32 *reserve = &g_CurrentPlayer->ammoheldarr[get_ammo_type_for_weapon(item)];
+    if (state->weapon_ammo_in_magazine <= 0 && *reserve > 0) {
+        --*reserve;
+        state->weapon_ammo_in_magazine = 1;
+    }
+    return state->weapon_ammo_in_magazine > 0;
+}
+
+void gevrTacticalThrowVelocity(s32 hand, coord3d *velocity)
+{
+    extern s32 gevrStereoShot(s32 hand, coord2d *spread, coord3d *origin, coord3d *direction);
+    extern void transformAndNormalizeByLength2Dto3D(coord2d *screen, coord3d *out, f32 length);
+    coord3d origin;
+    if (!gevrStereoShot(hand, NULL, &origin, velocity))
+        transformAndNormalizeByLength2Dto3D(&g_CurrentPlayer->crosshair_angle, velocity, 1.f);
+    mtx4RotateVecInPlace(currentPlayerGetViewToWorldMtxf(), velocity);
+    for (int i = 0; i < 3; ++i) velocity->f[i] *= 16.666666f;
+    velocity->y += 5.f;
+    if (g_ClockTimer > 0 && g_GlobalTimerDelta > 0.f) {
+        const coord3d *pos = &getCurrentPlayerProp()->pos;
+        const coord3d *previous = getCurrentPlayerPrevPos();
+        for (int i = 0; i < 3; ++i)
+            velocity->f[i] += (pos->f[i] - previous->f[i]) / g_GlobalTimerDelta;
+    }
+}
+#endif
+
 /**
  * Address 0x7F05F358 (NTSC)
  * Address 0x7F05F810 (PAL)
@@ -6448,6 +6545,10 @@ void generate_player_thrown_object(s32 hand)
     spE0.f[1] = g_CurrentPlayer->hands[hand].throw_item_pos_related.m[3][1];
     spE0.f[2] = g_CurrentPlayer->hands[hand].throw_item_pos_related.m[3][2];
 
+#ifdef GEVR
+    const s32 guided = gevrTacticalGuidedThrow(current_weapon);
+    if (guided) gevrTacticalThrowVelocity(hand, &throw_speed_vec);
+#endif
     matrix_4x4_set_identity(&spA0_a);
     matrix_4x4_copy(&g_CurrentPlayer->hands[hand].throw_item_pos_related, &sp40_f);
     sp40_f.m[3][0] = 0.0f;
@@ -6590,6 +6691,11 @@ void generate_player_thrown_object(s32 hand)
 
         gunInitProjectileFromPlayer(wor, &spE0, &spA0_a, &throw_speed_vec, &unk_mtxf);
 
+#ifdef GEVR
+        if (guided && wor->prop)
+            sysLogPrintf(LOG_NOTE, "tactical gadget: deployed item %d from hand %d, projectile %d",
+                current_weapon, hand, (wor->runtime_bitflags & RUNTIMEBITFLAG_HASPROJECTILE) != 0);
+#endif
         if ((wor->runtime_bitflags & RUNTIMEBITFLAG_HASPROJECTILE) != 0)
         {
             wor->projectile->flags = (s32) (wor->projectile->flags | 2);
@@ -6605,6 +6711,46 @@ void generate_player_thrown_object(s32 hand)
             }
         }
     }
+#ifdef GEVR
+    if (guided)
+    {
+        if (wor && wor->prop)
+        {
+            if (current_weapon != ITEM_BUG && gevrTacticalPrimeGadget(hand)) {
+                sysLogPrintf(LOG_NOTE, "tactical gadget: item %d ready again, %d remaining",
+                    current_weapon, g_CurrentPlayer->ammoheldarr[get_ammo_type_for_weapon(current_weapon)] + 1);
+                return;
+            }
+            if (g_CurrentPlayer->ammoheldarr[get_ammo_type_for_weapon(current_weapon)] <= 0)
+                bondinvRemoveItemByID(current_weapon);
+            if (current_weapon == ITEM_REMOTEMINE) {
+                bondinvAddInvItem(ITEM_TRIGGER);
+                if (g_gevrStereo && hand == GUNLEFT) {
+                    gevrTacticalReleaseGadget(hand);
+                    const s32 right = getCurrentPlayerWeaponId(GUNRIGHT);
+                    if (right == ITEM_FIST || right == ITEM_UNARMED)
+                        gevrTacticalSwapGadget(GUNRIGHT, ITEM_TRIGGER);
+                } else {
+                    gevrTacticalSwapGadget(hand, ITEM_TRIGGER);
+                }
+            } else {
+                gevrTacticalReleaseGadget(hand);
+            }
+            sysLogPrintf(LOG_NOTE, "tactical gadget: item %d released hand %d to %d",
+                current_weapon, hand, getCurrentPlayerWeaponId(hand));
+        }
+        else
+        {
+            struct hand *state = &g_CurrentPlayer->hands[hand];
+            state->weapon_ammo_in_magazine = 1;
+            state->weapon_action_state = GUN_ANIM_STATE_IDLE;
+            state->field_890 = 0.f;
+            state->field_88C = 0;
+            sysLogPrintf(LOG_WARNING, "tactical gadget: placement failed, retained item %d in hand %d",
+                current_weapon, hand);
+        }
+    }
+#endif
 }
 
 
@@ -6662,6 +6808,10 @@ void gunSpawnGLGrenade(s32 handnum)
 
     if (grenadeobj != NULL)
     {
+#ifdef GEVR
+        if (getCurrentPlayerWeaponId(handnum) == ITEM_TACTICAL_M32A1 && sysArgCheck("--tactical-sim") && sysArgCheck("--input-script"))
+            sysLogPrintf(LOG_NOTE, "tactical sim: M32A1 projectile spawned");
+#endif
         grenadeobj->timer = GLGRENADE_TIMER;
         grenadeobj->runtime_bitflags &= ~(RUNTIMEBITFLAG_OWNER_ALL);
         grenadeobj->runtime_bitflags |= RUNTIME_OWNER_BITS(get_cur_playernum());
@@ -6861,12 +7011,19 @@ void gunFireTankShell(s32 handnum)
     } 
     else 
     {
-        bullet_path_from_screen_center(&screenpos, &aimdir, handnum);
-        mtx4RotateVecInPlace(currentPlayerGetViewToWorldMtxf(), &aimdir);
-
-        spawnpos.x = hand->field_B58.x;
-        spawnpos.y = hand->field_B58.y;
-        spawnpos.z = hand->field_B58.z;
+#ifdef GEVR
+        extern int gevrTacticalRpgEnabled(void);
+        extern s32 gevrStereoShotWorld(s32 handnum, coord3d *origin, coord3d *direction);
+        /* The imported launcher has its own muzzle, separate from the
+         * stock launcher node. Use the same tracked ray as its sights. */
+        if (weaponid != ITEM_ROCKETLAUNCH || !gevrTacticalRpgEnabled()
+            || !gevrStereoShotWorld(handnum, &spawnpos, &aimdir))
+#endif
+        {
+            bullet_path_from_screen_center(&screenpos, &aimdir, handnum);
+            mtx4RotateVecInPlace(currentPlayerGetViewToWorldMtxf(), &aimdir);
+            spawnpos = hand->field_B58;
+        }
 
         if (1);
 
@@ -6912,6 +7069,11 @@ void gunFireTankShell(s32 handnum)
     obj->runtime_bitflags |= RUNTIME_OWNER_BITS(get_cur_playernum());
 
     gunInitProjectileFromPlayer(obj, &spawnpos, &shellmtx, &velocity, (s32 *) &identitymtx);
+#ifdef GEVR
+    if (weaponid == ITEM_TANKSHELLS && sysArgCheck("--tactical-sim") && sysArgCheck("--input-script"))
+        sysLogPrintf(LOG_NOTE, "tactical sim: tank cannon fired, %d loaded, %d spare",
+            hand->weapon_ammo_in_magazine, get_ammo_count_for_weapon(ITEM_TANKSHELLS));
+#endif
 
     if (obj->runtime_bitflags & RUNTIMEBITFLAG_00000080)
     {

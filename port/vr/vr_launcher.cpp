@@ -1,3 +1,4 @@
+#include "gevr_android_paths.h"
 #include "gevr_launcher_ui.h"
 #include "gevr_settings_ui.h"
 #include "gevr_romcheck.h"
@@ -68,7 +69,6 @@ std::string pcServiceString(const char *method);
 void pcServiceCommand(const char *method, const char *arg);
 bool pcOpenPicker(const char *method);
 void pcRestartSelf(void);
-extern "C" int sysArgCheck(const char *arg);   // port/src/system.c
 #endif
 #ifdef GEVR_FLAT
 /* a flat game's window, PC or Android phone/tablet (port/flat/window/flat_launcher.cpp) */
@@ -104,6 +104,7 @@ extern "C" int flatHalfRate(int bean);   // port/flat/window/flat_window.cpp: le
 #include "gevr_friends_ui.h"
 
 extern "C" {
+int sysArgCheck(const char *arg);     // port/src/system.c
 int gevrVrPumpBegin(void);            // port/src/gevr_engine_shim.c
 void gevrVrPumpEnd(void);
 const char *fsFullPath(const char *relPath);  // port/src/fs.c
@@ -336,7 +337,7 @@ void pollInjected(Injected &in)
 #ifdef GEVR_IOS
     const char *path = "gevr_input.txt";   /* Apple: the app's Documents (its working folder) */
 #else
-    const char *path = "/sdcard/Android/data/com.gevr.port/files/gevr_input.txt";
+    const char *path = GEVR_ANDROID_EXTERNAL_FILES "/gevr_input.txt";
 #endif
     FILE *f = fopen(path, "r");
     if (!f) return;
@@ -2067,7 +2068,9 @@ static bool gevrLauncherHostIdleTick(uint64_t nowMs, bool hosting, bool act)
 static void gevrHostLobbyOptions(const ImVec4 &gold, bool hosting, const std::string &code, const char *visibility = nullptr) {
     if (ImGui::BeginTable("host-lobby-options", 2, ImGuiTableFlags_SizingStretchSame)) {
         ImGui::TableNextColumn();
-        if (!hosting) {
+        const bool tactical = sysArgCheck("--tactical-coop");
+        if (tactical) ImGui::TextDisabled("LAN or Direct IP");
+        else if (!hosting) {
             if (ImGui::RadioButton("Public", VrMpVisibility == 0)) { VrMpVisibility=0;vrSettingsSave(); }
             if (ImGui::IsItemHovered()) gevrTooltip("Listed for everyone under Join > Public.");
             ImGui::SameLine();
@@ -2090,7 +2093,7 @@ static void gevrHostLobbyOptions(const ImVec4 &gold, bool hosting, const std::st
             if (ImGui::IsItemHovered()) gevrTooltip("Only players in VR can join: not a PC, phone or tablet, or a headset's flat screen.");
         }
         ImGui::TextUnformatted("Mode:");ImGui::SameLine();
-        const bool hackCoopOnly = VrCampaign != GEVR_CAMPAIGN_GE;   // a hack campaign: co-op only
+        const bool hackCoopOnly = VrCampaign != GEVR_CAMPAIGN_GE;
         ImGui::BeginDisabled(hackCoopOnly);
         if (ImGui::RadioButton("Deathmatch", VrMpMode == NET_MODE_DEATHMATCH)) { VrMpMode=NET_MODE_DEATHMATCH;gevrHostChoiceChanged(); }
         ImGui::EndDisabled();
@@ -2128,7 +2131,9 @@ static void gevrHostLobbyOptions(const ImVec4 &gold, bool hosting, const std::st
             ImGui::TextWrapped("Endless waves of armed guards, with Oddjob swarms and bosses. Ammo drops from enemies. Everyone down ends the run.");
         } else {
             ImGui::TextDisabled("Campaign: up to %d players",NET_COOP_MAX_PLAYERS);
-            if (ImGui::IsItemHovered()) gevrTooltip("Each player picks a folder. The host picks missions. Players can join or leave any time.");
+            if (ImGui::IsItemHovered()) gevrTooltip(tactical
+                ? "The host picks missions. Everyone picks their own gear before deployment."
+                : "Each player picks a folder. The host picks missions. Players can join or leave any time.");
         }
         ImGui::TableNextColumn();
         if (VrMpMode == NET_MODE_DEATHMATCH) {
@@ -2274,7 +2279,7 @@ static void gevrMpStartHosting()
         netSetGameName(gameName.c_str()); // the clients keep it: the LAN beacon of a migrated host
         g_joinedViaInternet = false;
         gevrJavaCommand("requestVoicePermission", "");
-        netIceStartHost();
+        if (!sysArgCheck("--tactical-coop")) netIceStartHost();
         netDiscoveryInit();
         netDiscoveryStartBroadcasting(gameName.c_str(), GEVR_DEFAULT_PORT);
         netLobbySetCharacter((uint8_t)VrMpChr);
@@ -2285,6 +2290,10 @@ static void gevrMpStartHosting()
         }
         hostedCode.clear();
         hostJoinIds.clear();
+        if (sysArgCheck("--tactical-coop")) {
+            onlineMessage = "Lobby ready. Join over LAN or Direct IP.";
+            return;
+        }
         onlineMessage = "Registering online lobby...";
         const std::string command =
             gevrLobbyCreateCommand(gameName, netGetLobbyStage(), netGetLobbyWeaponSet(), netGetMaxPlayers());
@@ -2605,7 +2614,7 @@ void gevrMultiplayerPage(int sub, bool &startMatch, bool romReady, const ImVec4 
                                     "Private",
                                     "LAN",
                                     "Direct IP"};
-            for (int pane = 0; pane < 4; pane++) {
+            for (int pane = sysArgCheck("--tactical-coop") ? 2 : 0; pane < 4; pane++) {
                 if (!ImGui::BeginTabItem(titles[pane]))
                     continue;
                 joinMethod = pane;
@@ -2825,9 +2834,10 @@ void gevrMultiplayerPage(int sub, bool &startMatch, bool romReady, const ImVec4 
     ImGui::EndChild();
     ImGui::Separator();
     // Fixed footer: long rosters, popups and status messages cannot push it away.
+    const bool tacticalBriefing = sysArgCheck("--tactical-coop") && netGetMatchConfig()->mode == NET_MODE_COOP;
     gevrLauncherStatus(onlineMessage.empty()
                            ? (!romReady ? "Choose a GoldenEye ROM before launching a match."
-                                        : (netIsHost() ? (netLobbyCanLaunch() ? "Ready to launch warmup."
+                                        : (netIsHost() ? (netLobbyCanLaunch() ? (tacticalBriefing ? "Ready to launch campaign." : "Ready to launch.")
                                                                               : "Waiting for joined players to ready up.")
                                                        : "Choose a game or connection method."))
                            : onlineMessage.c_str());
@@ -2835,7 +2845,7 @@ void gevrMultiplayerPage(int sub, bool &startMatch, bool romReady, const ImVec4 
     float h = ImGui::GetFrameHeight() * 1.5f;
     if (netIsHost()) {
         ImGui::BeginDisabled(!netLobbyCanLaunch() || !romReady);
-        if (ImGui::Button("Launch", ImVec2(0, h))) {
+        if (ImGui::Button(tacticalBriefing ? "Launch campaign" : "Launch", ImVec2(0, h))) {
 
             if (netLobbyHostLaunchMatch()) {
                 // the lobby service lists one player as warming up (it refuses "in progress" alone)
@@ -2863,7 +2873,7 @@ void gevrMultiplayerPage(int sub, bool &startMatch, bool romReady, const ImVec4 
         ImGui::SameLine();
     } else if (netIsActive()) {
         int slot = netGetLocalSlot();
-        if (slot >= 0 && netGetState() != NET_STATE_CONNECTING) {
+        if (slot >= 0 && netGetState() != NET_STATE_CONNECTING && !tacticalBriefing) {
             bool ready = netGetLobbyState()->slots[slot].ready != 0;
             ImGui::BeginDisabled(gevrLobbyHasTeams(netGetMatchConfig()) && netGetSlotTeam(slot) == NET_TEAM_NONE);
             if (ImGui::Checkbox("Ready", &ready))
@@ -3454,7 +3464,11 @@ extern "C" void gevrLauncherRun(void)
     Uint32 last = SDL_GetTicks();
 
     // The app's versionName (android build.gradle), for the header beside the build.
+#ifdef GEVR_TACTICAL_QUEST
+    const std::string appVersion = GEVR_APP_VERSION;
+#else
     const std::string appVersion = gevrUpdaterStatus().installed;
+#endif
     {
         char localVerStr[32];
         snprintf(localVerStr, sizeof(localVerStr), "v%s (%.7s)", appVersion.c_str(), gevrBuildId);
@@ -3467,7 +3481,9 @@ extern "C" void gevrLauncherRun(void)
     // One look at the GitHub releases per launch (the answer arrives in the
     // background; the line under the ROM shows it). Polled a few times a
     // second rather than every frame: it crosses into Java.
+#ifndef GEVR_TACTICAL_QUEST
     gevrUpdaterCommand("check");
+#endif
     UpdateStatus upd;
     Uint32 lastUpdPoll = 0;
     bool reportPage = false;
@@ -3651,11 +3667,11 @@ extern "C" void gevrLauncherRun(void)
                                        "android-files/files/data folder in the Files app (any name).");
                 } else {
                     ImGui::TextWrapped("Choose your GoldenEye 007 (USA) ROM, or copy it over USB into "
-                                       "Android/data/com.gevr.port/files/data (any name).");
+                                       GEVR_ANDROID_FILES "/data (any name).");
                 }
 #else
                 ImGui::TextWrapped("Choose your GoldenEye 007 (USA) ROM, or copy it over USB into "
-                                   "Android/data/com.gevr.port/files/data (any name).");
+                                   GEVR_ANDROID_FILES "/data (any name).");
 #endif
                 if (ImGui::Button("Choose ROM file...")) {
                     pickerPending = gevrOpenRomPicker();
@@ -3707,10 +3723,12 @@ extern "C" void gevrLauncherRun(void)
         }
 
         // Poll updater status for the scrollable settings area above START.
+#ifndef GEVR_TACTICAL_QUEST
         if (now - lastUpdPoll > 250 || lastUpdPoll == 0) {
             lastUpdPoll = now;
             upd = gevrUpdaterStatus();
         }
+#endif
         ImGui::Separator();
 
         s_launcherFrame++;   // the host's idle clock (gevrMultiplayerPage) sees frames it missed

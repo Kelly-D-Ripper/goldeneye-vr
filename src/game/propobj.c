@@ -9,6 +9,7 @@
 #include <ultra64.h>
 #ifdef GEVR
 #include "gevr_avatar.h"
+#include "gevr_hollywood_fx.h"
 #endif
 #include <math.h>
 #include <PR/libaudio.h>
@@ -56,8 +57,17 @@
 #include "system.h"
 #include <stdio.h>   /* snprintf: the #85 cryptdoor probe */
 #include "gevr_bean.h" /* monitor screens under Bean's meshes */
+#include "gevr_tactical_mesh.h"
+#include "gevr_tactical_net.h"
+#include "gevr_tactical_loot_net.h"
+#include "gevr_tactical_range.h"
+#include "gevr_tactical_facility.h"
+#include "gevr_tactical_heavy_guards.h"
+#include "gevr_tactical_gear.h"
+#include "gevr_tactical_loadouts.h"
 #include "net_objects.h"
 #include "net_coop.h"
+#include "prop.h"
 extern bool netIsActive(void);
 extern bool netIsHost(void);
 extern int netGetLocalSlot(void);
@@ -441,7 +451,7 @@ static void gevrMineToDrawnSurface(ObjectRecord *obj, PropRecord *prop, Model *m
                  hit.y - contact->y, hit.z - contact->z);
 }
 #endif
-/* 0x80030AF8 */ s32 g_NextWeaponSlot = 0; // numbers between 0 and 30
+/* 0x80030AF8 */ s32 g_NextWeaponSlot = 0;
 /* 0x80030AFC */ s32 g_NextHatSlot = 0;
 /* 0x80030B00 */ ObjectRecord *g_LevelLoadPropSwitch = NULL;
 /* 0x80030B04 */ LockDoorRecord *g_LevelLoadPropLockDoor = NULL;
@@ -1756,6 +1766,47 @@ bool sub_GAME_7F041BB8(ChrRecord *chr, coord3d *arg1, coord3d *arg2, f32 arg3, c
     return 0;
 }
 
+
+#ifdef GEVR
+/* Stock props describe their top in the object matrix. Test the actual
+ * rotated footprint so a magazine cannot land outside a tabletop. */
+f32 gevrTacticalSurfaceY(const coord3d *pos, f32 ceiling, f32 floor, const PropRecord *ignore)
+{
+    floor = gevrTacticalRangeSupport(pos, ceiling, floor);
+    for (PropDefHeaderRecord *def = g_CurrentSetup.propDefs; def && def->type != PROPDEF_END;
+         def += sizepropdef(def)) {
+        if (def->type != PROPDEF_PROP && def->type != PROPDEF_AMMO && def->type != PROPDEF_RACK) continue;
+        ObjectRecord *obj = (ObjectRecord *)def;
+        const PropRecord *prop = obj->prop;
+        if (!prop || prop == ignore || prop->parent || !(prop->flags & PROPFLAG_ENABLED)
+            || (obj->state & PROPSTATE_DESTROYED) || !obj->model) continue;
+        const float dx = pos->x - obj->runtime_pos.x, dz = pos->z - obj->runtime_pos.z;
+        if (fabsf(dx) > 380.f || fabsf(dz) > 380.f || obj->runtime_pos.y > ceiling + 20.f) continue;
+        struct ModelRoData_BoundingBoxRecord *bounds = chrobjGetBboxFromObjectRecord(obj);
+        if (!bounds) continue;
+        const Mtxf *m = &obj->mtx;
+        const float det = m->m[0][0]*m->m[2][2] - m->m[0][2]*m->m[2][0];
+        if (fabsf(det) < .000001f) continue;
+        const float x = (dx*m->m[2][2] - dz*m->m[2][0]) / det;
+        const float z = (dz*m->m[0][0] - dx*m->m[0][2]) / det;
+        if (x < bounds->Bounds.xmin || x > bounds->Bounds.xmax
+            || z < bounds->Bounds.zmin || z > bounds->Bounds.zmax) continue;
+        const float top = obj->runtime_pos.y + chrpropSumMatrixNegY(bounds, &obj->mtx);
+        if (top <= ceiling && top > floor) floor = top;
+    }
+    return floor;
+}
+#endif
+
+#ifdef GEVR
+static bool gevrTacticalWeaponRestsOnProps(const ObjectRecord *obj)
+{
+    if (obj->type != PROPDEF_COLLECTABLE || !sysArgCheck("--tactical-physical") || !gevrTacticalCampaignRules())
+        return FALSE;
+    const int item = ((const WeaponObjRecord *)obj)->weaponnum;
+    return gevrCampaignGunIsFirearm(item) || item == ITEM_KNIFE || item == ITEM_TACTICAL_KATANA;
+}
+#endif
 
 bool projectileFindCollidingProp(PropRecord *ignoreProp, coord3d *worldRayStart, coord3d *worldRayEnd, u32 cdtypes, coord3d *outHitPos, coord3d *outHitNormal, s32 *rooms)
 {
@@ -4238,6 +4289,12 @@ s32 sub_GAME_7F0448A8(struct PropRecord *argProp)
         return 1;
     }
 
+#ifdef GEVR
+    const s32 ignoreCorpses = (argProp->type == PROP_TYPE_DOOR
+        || (argProp->obj && argProp->obj->type == PROPDEF_VEHICHLE))
+        && sysArgCheck("--tactical-physical") && gevrTacticalCampaignRules();
+#endif
+
     chraiGetPropRoomIds(argProp, (s32*)&roomids);
     roomGetProps((s32*)&roomids);
 
@@ -4249,6 +4306,12 @@ s32 sub_GAME_7F0448A8(struct PropRecord *argProp)
 
         if (prop != argProp)
         {
+#ifdef GEVR
+            if (ignoreCorpses && prop->type == PROP_TYPE_CHR && prop->chr && chrIsDead(prop->chr))
+            {
+                continue;
+            }
+#endif
             if ((prop->type == PROP_TYPE_VIEWER) || (prop->type == PROP_TYPE_CHR))
             {
                 temp_v0_2 = prop->obj;
@@ -4591,6 +4654,41 @@ static s32 gevrKnifeHitsActor(ObjectRecord *obj, PropRecord *target, s32 bodypar
 }
 #endif
 
+#ifdef GEVR
+static s32 coopAutogunTarget(AutogunRecord *gun, const PropRecord *prop)
+{
+    s32 target = -1;
+    f32 nearest = gun->aimdist * gun->aimdist;
+    if (!prop->stan) return target;
+    for (s32 slot = 0; slot < 4; ++slot) {
+        if (!gevrCoopPlayerTargetable(slot)) continue;
+        PropRecord *candidate = g_playerPointers[slot]->prop;
+        if (!candidate->stan) continue;
+        const f32 x = candidate->pos.x - gun->runtime_pos.x;
+        const f32 y = candidate->pos.y - gun->runtime_pos.y - 20.f;
+        const f32 z = candidate->pos.z - gun->runtime_pos.z;
+        const f32 distance = x * x + z * z + ((gun->flags & PROPFLAG_DOOR_TWOWAY) ? y * y : 0.f);
+        if (distance > nearest) continue;
+        const f32 yaw = atan2f(x, z);
+        const f32 range = remainderf(yaw - gun->rot_related, M_TAU_F);
+        if (range < gun->unk8C || range > gun->unk88) continue;
+        if (!(gun->flags & (PROPFLAG_NO_AMMO | PROPFLAG_INMOTION))
+            && fabsf(remainderf(yaw - gun->unk90, M_TAU_F)) >= DegToRad(70)) continue;
+        StandTile *tile = prop->stan;
+        bondviewUpdateGuardTankFlagsRelated(candidate, 0);
+        const s32 visible = stanTestLineUnobstructed(&tile, prop->pos.x, prop->pos.z,
+            candidate->pos.x, candidate->pos.z, 0x1b, prop->pos.y, prop->pos.y,
+            candidate->pos.y, candidate->pos.y);
+        bondviewUpdateGuardTankFlagsRelated(candidate, 1);
+        if (visible && tile == candidate->stan) {
+            target = slot;
+            nearest = distance;
+        }
+    }
+    return target;
+}
+#endif
+
 s32 objTick(struct PropRecord *prop)
 {
 	Mtxf *mtxs;
@@ -4612,6 +4710,9 @@ s32 objTick(struct PropRecord *prop)
 	 * Code outside this guard is per-viewport render setup and runs every pass. 
      */
 	bool isSimOwner;
+#ifdef GEVR
+	s32 coopTurretTarget = -1;
+#endif
 
 	s32 playerCount;
 	bool applyFogCull;
@@ -4911,6 +5012,11 @@ s32 objTick(struct PropRecord *prop)
 	sp100 = (struct PropRecord *) &obj->nextcol;
 #endif
 #ifdef GEVR
+    const bool coopTurret = obj->type == PROPDEF_AUTOGUN && (gevrCoopHostGuards() || gevrCoopPuppets());
+    if (coopTurret) {
+        extern s32 g_gevrExtraPass;
+        isSimOwner = get_cur_playernum() == netGetLocalSlot() && !g_gevrExtraPass;
+    }
     if (gevrAmmoNetworked(obj)) {
         extern s32 g_gevrExtraPass;
         isSimOwner = netIsHost() && get_cur_playernum() == netGetLocalSlot() && !g_gevrExtraPass;
@@ -5274,6 +5380,12 @@ s32 objTick(struct PropRecord *prop)
 					{
 						temp_f20 = stanGetPositionYValue(prop->stan, prop->pos.f[0], prop->pos.f[2]);
 						bboxBottomOffset = chrpropSumMatrixPosY(projectileBBox, &objectMatrix[0]);
+#ifdef GEVR
+                        if (Rocket->speed.y <= 0.f && gevrTacticalWeaponRestsOnProps(obj))
+                            temp_f20 = gevrTacticalSurfaceY(&prop->pos,
+                                RocketCurrent.y + bboxBottomOffset - Rocket->speed.y*g_GlobalTimerDelta + 2.f,
+                                temp_f20, prop);
+#endif
 						hitGround = (prop->pos.f[1] < (temp_f20 - bboxBottomOffset));
 					}
 					else
@@ -5486,6 +5598,10 @@ s32 objTick(struct PropRecord *prop)
 					sub_GAME_7F042EB4(obj, &RocketCurrent.f[0], &sp530, &sp53C, 0, 0);
 					objMovedThisFrame = 1;
 					temp_f20 = stanGetPositionYValue(prop->stan, prop->pos.f[0], prop->pos.f[2]);
+#ifdef GEVR
+                    if (gevrTacticalWeaponRestsOnProps(obj))
+                        temp_f20 = gevrTacticalSurfaceY(&prop->pos, RocketCurrent.y + 5.f, temp_f20, prop);
+#endif
 					angleDelta = (temp_f20 - chrpropSumMatrixPosY(objectBBox, objectMatrix)) + 4.0f;
 					prop->pos.f[1] = angleDelta;
 					obj->runtime_pos.f[1] = angleDelta;
@@ -5761,6 +5877,17 @@ s32 objTick(struct PropRecord *prop)
 			AutogunSeesPlayer = 0;
 			isTracking = 0;
 			hasLineOfSight = 0;
+#ifdef GEVR
+			if (coopTurret && !(obj->flags2 & PROPFLAG_IS_DOUBLE)) {
+				coopTurretTarget = coopAutogunTarget(poAGun, prop);
+				playerProp2 = coopTurretTarget >= 0 ? g_playerPointers[coopTurretTarget]->prop : NULL;
+				if (!playerProp2) {
+					poAGun->is_active = 0;
+					poAGun->unkB8 = poAGun->unkBC = -1;
+					poAGun->unkD4 = 0.f;
+				}
+			}
+#endif
 			if (obj->flags2 & PROPFLAG_IS_DOUBLE)
 			{
 				if (obj->flags2 & PROPFLAG2_40000000)
@@ -5779,6 +5906,11 @@ s32 objTick(struct PropRecord *prop)
 			}
 			else
 			{
+				/* A turret in co-op only aims and fires at a standing visible player. */
+#ifdef GEVR
+				if (playerProp2)
+				{
+#endif
 				var_f0_2 = playerProp2->pos.f[0] - obj->runtime_pos.f[0];
 				playerDirVec.f[1] = (playerProp2->pos.f[1] - obj->runtime_pos.f[1]) - 20.0f;//Aim 20 units below player’s head
 				temp_f2_23 = playerProp2->pos.f[2] - obj->runtime_pos.f[2];
@@ -5847,7 +5979,11 @@ s32 objTick(struct PropRecord *prop)
 						}
 
 						bondviewUpdateGuardTankFlagsRelated(playerProp2, 0);
-						if ((((sp494 <= poAGun->unk88) && (poAGun->unk8C <= sp494)) && (stanTestLineUnobstructed(&collisionTile, prop->pos.f[0], prop->pos.f[2], playerProp2->pos.f[0], playerProp2->pos.f[2], 0x1B, prop->pos.f[1], prop->pos.f[1], playerProp2->pos.f[1], playerProp2->pos.f[1]) != 0)) && ((collisionTile) == playerProp2->stan))
+						if (
+#ifdef GEVR
+							coopTurret ||
+#endif
+							((((sp494 <= poAGun->unk88) && (poAGun->unk8C <= sp494)) && (stanTestLineUnobstructed(&collisionTile, prop->pos.f[0], prop->pos.f[2], playerProp2->pos.f[0], playerProp2->pos.f[2], 0x1B, prop->pos.f[1], prop->pos.f[1], playerProp2->pos.f[1], playerProp2->pos.f[1]) != 0)) && ((collisionTile) == playerProp2->stan)))
 						{
 							obj->flags |= PROPFLAG_INMOTION;
 							hasLineOfSight = 1;
@@ -5974,6 +6110,9 @@ s32 objTick(struct PropRecord *prop)
 					}
 				}
 
+#ifdef GEVR
+				}
+#endif
 				if (isTracking != 0) //firing
 				{
 					poAGun->unkB0 += AUTOGUN_SPIN_ACCEL_PER_FRAME * g_GlobalTimerDelta;
@@ -6130,7 +6269,17 @@ s32 objTick(struct PropRecord *prop)
 				RocketCurrent.f[0] = (poTruck->runtime_pos.f[0] + ((poTruck->speed * g_GlobalTimerDelta) * forwardDir.f[0])) - (forwardDir.f[2] * sp460);
 				RocketCurrent.f[1] = poTruck->runtime_pos.f[1];
 				RocketCurrent.f[2] = (poTruck->runtime_pos.f[2] + ((poTruck->speed * g_GlobalTimerDelta) * forwardDir.f[2])) + (forwardDir.f[0] * sp460);
+#ifdef GEVR
+                extern s32 g_gevrVehicleIgnoreDead;
+                s32 truckClear;
+                g_gevrVehicleIgnoreDead = sysArgCheck("--tactical-physical") && !netIsActive();
+                truckClear = (stanTestLineUnobstructed(&currentTile, prop->pos.f[0], prop->pos.f[2], RocketCurrent.f[0], RocketCurrent.f[2], 0x1F, 0.0f, 1.0f, 0.0f, 1.0f) != 0)
+                    && (stanTestVolume(&currentTile, RocketCurrent.f[0], RocketCurrent.f[2], 10.0f, 0x1F, 0.0f, 1.0f) < 0);
+                g_gevrVehicleIgnoreDead = FALSE;
+                if (truckClear)
+#else
 				if ((stanTestLineUnobstructed(&currentTile, prop->pos.f[0], prop->pos.f[2], RocketCurrent.f[0], RocketCurrent.f[2], 0x1F, 0.0f, 1.0f, 0.0f, 1.0f) != 0) && (stanTestVolume(&currentTile, RocketCurrent.f[0], RocketCurrent.f[2], 10.0f, 0x1F, 0.0f, 1.0f) < 0))
+#endif
 				{
 					nextTile = prop->stan;
 					sp450.f[0] = prop->pos.f[0];
@@ -6810,7 +6959,12 @@ s32 objTick(struct PropRecord *prop)
 
 				if (model->obj->Switches[7] != NULL)
 				{
-					modelGetNodeRwData(model, model->obj->Switches[7])->Gunfire.visible = (s16) tank_render->is_firing_tank;
+#ifdef GEVR
+                    modelGetNodeRwData(model, model->obj->Switches[7])->Gunfire.visible =
+                        tank_render->is_firing_tank && !gevrHollywoodWeapon(ITEM_TANKSHELLS);
+#else
+                    modelGetNodeRwData(model, model->obj->Switches[7])->Gunfire.visible = (s16) tank_render->is_firing_tank;
+#endif
 				}
 
 				if (model->obj->Switches[8] != NULL)
@@ -6878,7 +7032,11 @@ s32 objTick(struct PropRecord *prop)
 			sp13C = 0;
 			sp138 = 0;
 
-			if ((autogun->is_active != 0) && (!(obj->flags & PROPFLAG_IS_DRONE_GUN)))
+			if ((autogun->is_active != 0) && (!(obj->flags & PROPFLAG_IS_DRONE_GUN))
+#ifdef GEVR
+				&& (!coopTurret || gevrCoopPlayerTargetable(coopTurretTarget))
+#endif
+			)
 			{
 				autogun->unkAC = autogun->unkAC + 1;
 #ifdef GEVR
@@ -6897,7 +7055,11 @@ s32 objTick(struct PropRecord *prop)
 #endif
 				}
 
-				if (autogun->unkC0 < g_GlobalTimer)
+				if (autogun->unkC0 < g_GlobalTimer
+#ifdef GEVR
+					&& (!coopTurret || netIsHost())
+#endif
+				)
 				{
 					if ((autogun->unkC4 != NULL) && (sndGetPlayingState(autogun->unkC4) != 0))
 					{
@@ -6921,6 +7083,9 @@ s32 objTick(struct PropRecord *prop)
 					}
 
 					autogun->unkC0 = (s32) (g_GlobalTimer + 2);
+#ifdef GEVR
+					if (coopTurret) gevrCoopTurretSound(autogun->padID, coopTurretTarget, &prop->pos);
+#endif
 				}
 
 				if ((sp13C != 0) || (sp138 != 0))
@@ -6930,6 +7095,9 @@ s32 objTick(struct PropRecord *prop)
 					sp108 = prop->stan;
 					sp104 = (autogun->unkAC & 3) == 0;
 					sp100 = getCurrentPlayerProp();
+#ifdef GEVR
+					if (coopTurret) sp100 = g_playerPointers[coopTurretTarget]->prop;
+#endif
 					var_a0_6 = 5;
 
 					if ((model->obj->Switches[7] != 0) && (!(autogun->unkAC & 7)))
@@ -6978,7 +7146,11 @@ s32 objTick(struct PropRecord *prop)
 						sp110.f[2] -= 26.0f * sp120.f[2];
 					}
 
-					if (g_GlobalTimer == ((s32) autogun->unkBC))
+					if (g_GlobalTimer == ((s32) autogun->unkBC)
+#ifdef GEVR
+						&& (!coopTurret || netIsHost())
+#endif
+					)
 					{
 						beam_xdiff = sp100->pos.f[0] - sp12C.f[0];
 						beam_ydiff = sp100->pos.f[1] - sp12C.f[1];
@@ -6987,7 +7159,15 @@ s32 objTick(struct PropRecord *prop)
 						beam_xdiff = sp110.f[0] - sp12C.f[0];
 						beam_ydiff = sp110.f[1] - sp12C.f[1];
 						beam_collisionTile = sp110.f[2] - sp12C.f[2];
-						if ((temp_f20_4 <= (((beam_xdiff * beam_xdiff) + (beam_ydiff * beam_ydiff)) + (beam_collisionTile * beam_collisionTile))) && (bondviewGetIfCurrentPlayerDamageShowTime() == 0))
+						if ((temp_f20_4 <= (((beam_xdiff * beam_xdiff) + (beam_ydiff * beam_ydiff)) + (beam_collisionTile * beam_collisionTile))) &&
+#ifdef GEVR
+							((coopTurret && coopTurretTarget != netGetLocalSlot()) ||
+#endif
+							(bondviewGetIfCurrentPlayerDamageShowTime() == 0)
+#ifdef GEVR
+							)
+#endif
+						)
 						{
 							temp_f0_35 = sqrtf(temp_f20_4);
 							var_f2_7 = (0.16f * OBJECT_INTERACTION_TIMER_DELTA) * g_AutogunPendingDamageTick;
@@ -7013,6 +7193,20 @@ s32 objTick(struct PropRecord *prop)
 									}
 								}
 #endif
+#ifdef GEVR
+								if (coopTurret && coopTurretTarget != netGetLocalSlot())
+								{
+									const s32 previousPlayer = get_cur_playernum();
+									const s32 previousGuardTick = g_gevrCoopGuardTick;
+									set_cur_player(coopTurretTarget);
+									g_gevrCoopGuardTick = TRUE;
+									bondviewCallRecordDamageKills((gunItemGetDestructionAmount(14) * 0.125f) * g_AutogunDamageScalar, autogun->unk90, -1, 1);
+									g_gevrCoopGuardTick = previousGuardTick;
+									set_cur_player(previousPlayer);
+									sp11C = 0;
+								}
+								else
+#endif
 								bondviewCallRecordDamageKills((gunItemGetDestructionAmount(14) * 0.125f) * g_AutogunDamageScalar, autogun->unk90, -1, 1);
 								autogun->unkD4 = 0.0f;
 								if (bondviewGetIfCurrentPlayerDamageShowTime() != 0)
@@ -7030,6 +7224,9 @@ s32 objTick(struct PropRecord *prop)
 							bullet_spark_create(&sp110, 1, 26.0f, (s16) sp10C->room);
 						}
 
+#ifdef GEVR
+						if (!coopTurret || netIsHost())
+#endif
 						recall_joy2_hits_edit_flag(14, &sp110, -1);
 					}
 					else
@@ -8653,6 +8850,9 @@ void objBounce(ObjectRecord *obj, coord3d *arg1)
 void propobjSetDropped(PropRecord *prop, DROPTYPE droptype)
 {
     PropRecord *parent = prop->parent;
+#ifdef GEVR
+    if (parent && gevrTacticalPermanentHelmet(prop)) return;
+#endif
 
     if (parent)
     {
@@ -8723,6 +8923,9 @@ s32 objDrop(PropRecord *prop)
     PropRecord *root;
     StandTile* rootstan;
 
+#ifdef GEVR
+    if (parent && gevrTacticalPermanentHelmet(prop)) return FALSE;
+#endif
     if ((obj->runtime_bitflags & RUNTIMEBITFLAG_EMBEDDED) && obj->embedment->projectile)
     {
         Projectile* projectile2 = obj->embedment->projectile;
@@ -8892,6 +9095,10 @@ s32 objDrop(PropRecord *prop)
         obj->shadecol.a = obj->nextcol.a;
 
         setupUpdateObjectRoomPosition(obj);
+#ifdef GEVR
+        if (parent->type == PROP_TYPE_CHR && prop->type == PROP_TYPE_WEAPON)
+            gevrTacticalLootPublishGuardDrop(prop);
+#endif
 
         return TRUE;
     }
@@ -10240,6 +10447,16 @@ void objHit(ShotData *shotdata, BulletHit *hit)
     pos.y = shotdata->viewOrigin.y - ((hit->dist * shotdata->viewDir.y) / shotdata->viewDir.z);
     pos.z = shotdata->viewOrigin.z - hit->dist;
 
+#ifdef GEVR
+    int hollywoodImpact = FALSE;
+    if (shotdata->weapon == ITEM_TACTICAL_M4A1 && gevrHollywoodWeapon(shotdata->weapon)) {
+        coord3d contact = pos;
+        mtx4TransformVecInPlace(currentPlayerGetViewToWorldMtxf(), &contact);
+        hollywoodImpact = gevrHollywoodImpact(shotdata->weapon, hit->hit.texturenum,
+            contact.f, NULL, shotdata->dir.f);
+    }
+#endif
+
     pos.x -= 26.0f * shotdata->viewDir.x;
     pos.y -= 26.0f * shotdata->viewDir.y;
     pos.z -= 26.0f * shotdata->viewDir.z;
@@ -10251,7 +10468,10 @@ void objHit(ShotData *shotdata, BulletHit *hit)
         gunSetTracerTarget(&pos);
     }
 
-    bullet_spark_create(&pos, 1, 26.0f, rootprop->stan->room);
+#ifdef GEVR
+    if (!hollywoodImpact)
+#endif
+        bullet_spark_create(&pos, 1, 26.0f, rootprop->stan->room);
 
     if ((objIsHealthy(obj) && objIsMortal(obj)) && (hit->countsAsPenetration != 0))
     {
@@ -10889,8 +11109,54 @@ void display_text_when_ammo_collected(s32 ammotype, s32 quantity)
     HUDMESSAGEBOTTOM(buffer);
 }
 
+#ifdef GEVR
+static bool gevrTacticalPhysicalSupplies(void)
+{
+    return sysArgCheck("--tactical-physical") && gevrTacticalCampaignRules();
+}
+
+static bool gevrTacticalMineSupply(s32 type)
+{
+    return type == AMMO_REMOTEMINE || type == AMMO_TIMEDMINE || type == AMMO_PROXMINE;
+}
+
+static bool gevrTacticalEquipmentSupply(s32 type)
+{
+    if (gevrTacticalMineSupply(type)) return TRUE;
+    switch (type) {
+    case AMMO_GRENADE:
+    case AMMO_KNIFE:
+    case AMMO_GGUN:
+    case AMMO_DARTS:
+    case AMMO_EXPLOSIVEPEN:
+    case AMMO_BOMBCASE:
+    case AMMO_FLARE:
+    case AMMO_PITON:
+    case AMMO_DYNAMITE:
+    case AMMO_BUG:
+    case AMMO_MICRO_CAMERA:
+    case AMMO_GEKEY:
+    case AMMO_PLASTIQUE:
+    case AMMO_WATCH_LASER:
+    case AMMO_WATCH_MAGNET:
+    case AMMO_CAMERA:
+    case AMMO_TOKEN:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+#endif
+
 void add_ammo_to_inventory(AMMOTYPE ammotype,int amount,int doplaysound,int dodisplaytext)
 {
+#ifdef GEVR
+    extern int gevrTacticalKnifeEnabled(void);
+    if (ammotype == AMMO_KNIFE && amount > 0 && gevrTacticalKnifeEnabled()) {
+        bondinvAddInvItem(ITEM_KNIFE);
+        return;
+    }
+#endif
     int curammo;
     int maxammo;
 
@@ -11289,6 +11555,9 @@ TICKOP propPickupByPlayer(PropRecord *prop, bool showstring)
                     ammotype = AMMO_9MM;
                 }
 
+#ifdef GEVR
+                if (gevrTacticalPhysicalSupplies() && !gevrTacticalEquipmentSupply(ammotype)) continue;
+#endif
                 ammoquantity = multicrate->slots[i].quantity;
 
 #ifdef GEVR
@@ -11335,7 +11604,12 @@ TICKOP propPickupByPlayer(PropRecord *prop, bool showstring)
 
             if (obj->runtime_bitflags & RUNTIMEBITFLAG_DESTROYED)
             {
-                if (wep->weaponnum < ITEM_BOMBCASE)
+                if (wep->weaponnum < ITEM_BOMBCASE
+#ifdef GEVR
+                    /* Doak's scripted gift uses the hidden decoder prop. */
+                    || (wep->weaponnum == ITEM_DOORDECODER && gevrTacticalPhysicalSupplies())
+#endif
+                )
                 {
                     bondinvAddWeaponByProp(prop);
                 }
@@ -11386,9 +11660,18 @@ TICKOP propPickupByPlayer(PropRecord *prop, bool showstring)
 
             ammo_type = get_ammo_type_for_weapon(wep->weaponnum);
 
-            if (ammo_type)
+            if (ammo_type
+#ifdef GEVR
+                && (!gevrTacticalPhysicalSupplies()
+                    || gevrTacticalEquipmentSupply(ammo_type))
+#endif
+                )
             {
                 s32 pickupqty = ammo_collected_from_weapon(wep);
+#ifdef GEVR
+                if (prop == g_gevrHandGrabProp && g_gevrHandGrabMine && gevrTacticalMineSupply(ammo_type))
+                    pickupqty = 1;
+#endif
 
                 if (pickupqty > 0)
                 {
@@ -11661,6 +11944,10 @@ TICKOP objTickPlayer(struct PropRecord* prop)
         struct AmmoCrateRecord* ammoCrateObj;
 
         ammoCrateObj = (AmmoCrateRecord*)prop->obj;
+#ifdef GEVR
+        if (gevrTacticalPhysicalSupplies() && !gevrTacticalEquipmentSupply(ammoCrateObj->ammoType))
+            return TICKOP_NONE;
+#endif
 
 #if defined(VERSION_JP) || defined(VERSION_EU)
         if (check_cur_player_ammo_amount_in_inventory(ammoCrateObj->ammoType) >= get_max_ammo_for_type(ammoCrateObj->ammoType)
@@ -11704,6 +11991,9 @@ TICKOP objTickPlayer(struct PropRecord* prop)
                 sp64 = 1;
             }
 
+#ifdef GEVR
+            if (gevrTacticalPhysicalSupplies() && !gevrTacticalEquipmentSupply(sp64)) continue;
+#endif
             if (multiAmmoCrateObj->slots[i].quantity > 0) {
                 if (check_cur_player_ammo_amount_in_inventory(sp64) < get_max_ammo_for_type(sp64)) {
                     sp6C = 0;
@@ -11763,12 +12053,25 @@ TICKOP objTickPlayer(struct PropRecord* prop)
     }
 
 #ifdef GEVR
+    bool magnetPickup = FALSE;
     {
         /* force pull (gevr_forcepull.c): not a prop flying to a hand, nor a gun
          * with Auto pickup off (grab or pull it) */
         extern s32 gevrPullBlocksWalkOver(PropRecord *prop);
 
-        if (prop != g_gevrHandGrabProp && gevrPullBlocksWalkOver(prop))
+        /* Keep the watch magnet's native pickup path for the GoldenEye key.
+         * It must retain the tagged prop when it enters the inventory. */
+        magnetPickup = gevrTacticalPhysicalSupplies()
+            && g_CurrentPlayer->magnetattracttime >= 0x3c && obj->type == PROPDEF_COLLECTABLE
+            && (((const WeaponObjRecord *)obj)->weaponnum == ITEM_GOLDENEYEKEY
+                || (obj->pad >= 0 && prop->type == PROP_TYPE_WEAPON && !prop->parent
+                    && ((const WeaponObjRecord *)obj)->weaponnum >= ITEM_WPPK
+                    && ((const WeaponObjRecord *)obj)->weaponnum <= ITEM_ROCKETLAUNCH));
+        if (gevrTacticalPhysicalSupplies() && prop != g_gevrHandGrabProp && !magnetPickup
+            && (obj->type == PROPDEF_MAGAZINE || obj->type == PROPDEF_AMMO
+                || obj->type == PROPDEF_COLLECTABLE)) return TICKOP_NONE;
+
+        if (prop != g_gevrHandGrabProp && !magnetPickup && gevrPullBlocksWalkOver(prop))
         {
             return TICKOP_NONE;
         }
@@ -11830,6 +12133,13 @@ TICKOP objTickPlayer(struct PropRecord* prop)
 
         if (pickup != 0) 
         {
+#ifdef GEVR
+            if (magnetPickup && ((const WeaponObjRecord *)obj)->weaponnum != ITEM_GOLDENEYEKEY) {
+                extern void gevrTacticalMoveMagneticWeapon(PropRecord *prop);
+                gevrTacticalMoveMagneticWeapon(prop);
+                return TICKOP_NONE;
+            }
+#endif
             return propPickupByPlayer(prop, TRUE);
         }
 
@@ -11941,6 +12251,12 @@ PropRecord *hatApplyToChr(HatRecord *hat, ChrRecord *chr, ModelFileHeader *filed
 
         chrpropReparent(prop, chr->prop);
         chr->handle_positiondata_hat = prop;
+#ifdef GEVR
+        const int helmet = gevrCampaignGuardHelmet(chr);
+        if (helmet >= 0 && gevrTacticalHelmetAttach(hat->model, hat, helmet))
+            sysLogPrintf(LOG_NOTE, "loadout editor: chr %d helmet %d", chr->chrnum, helmet);
+        if (gevrTacticalHelmetModel(hat->model)) hat->damage = 0.f;
+#endif
     }
 
     return prop;
@@ -11971,6 +12287,14 @@ PropRecord *hatCreateForChr(ChrRecord *chr, s32 modelnum, u32 flags)
     Model *model;
     HatRecord *hat;
 
+#ifdef GEVR
+    const int helmet = gevrCampaignGuardHelmet(chr);
+    if (helmet == GEVR_LOADOUT_NO_HELMET) return NULL;
+    if (helmet >= 0 && gevrTacticalHelmetAvailable(helmet)) {
+        if (chr->handle_positiondata_hat) return chr->handle_positiondata_hat;
+        modelnum = helmet == GEVR_HELMET_ALTYN ? PROP_TACTICAL_ALTYN : PROP_HATHELMET;
+    }
+#endif
     modeldef = PitemZ_entries[modelnum].header;
 
     modelLoad(modelnum);
@@ -12044,10 +12368,24 @@ PropRecord *hatCreateForChr(ChrRecord *chr, s32 modelnum, u32 flags)
 }
 
 
+s32 weaponGetSlotCapacity(void)
+{
+#ifdef GEVR
+    /* Patrol weapons, drops and projectiles share the pool. Co-op replicas
+     * need the same capacity as the host on every map. */
+    if (sysArgCheck("--tactical-physical") && gevrTacticalCampaignRules())
+    {
+        return MAX_WEAPON_SLOTS;
+    }
+#endif
+    return BASE_WEAPON_SLOTS;
+}
+
 // PD: weaponCreate
 WeaponObjRecord* weaponCreate(bool musthaveprop, bool musthavemodel, ModelFileHeader *modeldef)
 {
     s32 i;
+    const s32 slotCount = weaponGetSlotCapacity();
     WeaponObjRecord *tmp;
     WeaponObjRecord *sp4c = NULL;
     WeaponObjRecord *sp48 = NULL;
@@ -12055,6 +12393,7 @@ WeaponObjRecord* weaponCreate(bool musthaveprop, bool musthavemodel, ModelFileHe
     s32 sp40 = -1;
     s32 sp3c = -1;
 
+    if (g_NextWeaponSlot >= slotCount) g_NextWeaponSlot = 0;
     for (i = g_NextWeaponSlot; TRUE; )
     {
 
@@ -12087,7 +12426,7 @@ WeaponObjRecord* weaponCreate(bool musthaveprop, bool musthavemodel, ModelFileHe
             }
         }
 
-        i = (i + 1) % MAX_WEAPON_SLOTS;
+        i = (i + 1) % slotCount;
 
         if (i == g_NextWeaponSlot)
         {
@@ -12097,7 +12436,7 @@ WeaponObjRecord* weaponCreate(bool musthaveprop, bool musthavemodel, ModelFileHe
 
     if (sp44 >= 0)
     {
-        g_NextWeaponSlot = (sp44 + 1) % MAX_WEAPON_SLOTS;
+        g_NextWeaponSlot = (sp44 + 1) % slotCount;
         return &g_WeaponSlots[sp44];
     }
 
@@ -12115,7 +12454,7 @@ WeaponObjRecord* weaponCreate(bool musthaveprop, bool musthavemodel, ModelFileHe
             objFreePermanently((ObjectRecord *)&g_WeaponSlots[sp40], TRUE);
         }
 
-        g_NextWeaponSlot = (sp40 + 1) % MAX_WEAPON_SLOTS;
+        g_NextWeaponSlot = (sp40 + 1) % slotCount;
         return (g_WeaponSlots + sp40);
     }
 
@@ -12136,7 +12475,7 @@ WeaponObjRecord* weaponCreate(bool musthaveprop, bool musthavemodel, ModelFileHe
             objFreePermanently((ObjectRecord *)&g_WeaponSlots[sp3c], TRUE);
         }
 
-        g_NextWeaponSlot = (sp3c + 1) % MAX_WEAPON_SLOTS;
+        g_NextWeaponSlot = (sp3c + 1) % slotCount;
         return (g_WeaponSlots + sp3c);
     }
 
@@ -12575,13 +12914,97 @@ PropRecord *sub_GAME_7F051F30(WeaponObjRecord *weapon, ChrRecord *chr, ModelFile
 }
 
 
+#ifdef GEVR
+static PROP gevrTacticalGuardModel(ITEM_IDS target)
+{
+    extern PROP getPropForHeldItem(ITEM_IDS item);
+    return getPropForHeldItem(target);
+}
+
+static bool gevrReplaceGuardWeapon(const ChrRecord *chr, int item, u32 flags, GevrGuardWeapon *choice)
+{
+    if (!chr || !chr->prop || chr->prop->type != PROP_TYPE_CHR || !gevrCampaignGunIsFirearm(item)) return FALSE;
+
+    const bool stockEditorSlot = !(flags & (PROPFLAG_WEAPON_LEFTHANDED | PROPFLAG_IS_DOUBLE));
+    GevrGuardWeapon editor = {0};
+    if (stockEditorSlot && gevrCampaignGuardWeapon(chr, &editor.item, &editor.model, &editor.build)) {
+        *choice = editor;
+        return TRUE;
+    }
+    if ((flags & PROPFLAG_CONCEAL_GUN) || !gevrCampaignRosterWeapon(chr, item, choice)) return FALSE;
+    if (!stockEditorSlot && gevrCampaignGuardWeapon(chr, &editor.item, &editor.model, &editor.build))
+        *choice = editor;
+    return TRUE;
+}
+
+static PropRecord *createChrWeapon(ChrRecord *self, s32 propid, ITEM_IDS itemid, s32 flags,
+    WeaponObjRecord *weapon, ItemModelFileRecord *prop_header);
+
+static void gevrRecordGuardBuild(ChrRecord *chr, PropRecord *prop, const GevrGuardWeapon *choice, int original)
+{
+    if (!prop) return;
+    if (choice) {
+        gevrTacticalGuardIssueBuild(prop, choice->build);
+        if (choice->offhandItem && chr->weapons_held[GUNRIGHT] == prop && !chr->weapons_held[GUNLEFT]) {
+            PropRecord *left = createChrWeapon(chr, choice->offhandModel, choice->offhandItem,
+                PROPFLAG_WEAPON_LEFTHANDED, NULL, NULL);
+            if (left) {
+                left->weapon->flags |= PROPFLAG_IS_DOUBLE;
+                prop->weapon->flags |= PROPFLAG_IS_DOUBLE;
+                propweaponSetDual(left->weapon, prop->weapon);
+                gevrTacticalGuardIssueBuild(left, choice->offhandBuild);
+                sysLogPrintf(LOG_NOTE, "campaign weapon: chr %d offhand item %d preset %s",
+                    chr->chrnum, choice->offhandItem, choice->offhandPreset);
+            }
+        }
+        if (choice->preset) {
+            sysLogPrintf(LOG_NOTE, "campaign weapon: chr %d body %d original %d item %d build %d dual %d preset %s",
+                chr->chrnum, chr->bodynum, original, choice->item, choice->build,
+                prop->weapon->dualweapon != NULL, choice->preset);
+        } else {
+            sysLogPrintf(LOG_NOTE, "loadout editor: chr %d body %d weapon %d build %d",
+                chr->chrnum, chr->bodynum, prop->weapon->weaponnum, choice->build);
+        }
+    } else if (prop->weapon->weaponnum == ITEM_TACTICAL_M4A1 && gevrTacticalJanusGuard(chr)) {
+        gevrTacticalGuardIssueM4(prop);
+    }
+}
+#endif
+
 void sub_GAME_7F051FD4(WeaponObjRecord *weapon, ChrRecord *chr)
 {
 	u32 stack;
+	#ifdef GEVR
+    const int original = weapon->weaponnum;
+    GevrGuardWeapon choice;
+    const bool assigned = gevrReplaceGuardWeapon(chr, original, weapon->flags, &choice);
+    if (assigned) {
+        /* Replace an authored pair through its right-hand record. A single
+         * weapon keeps its authored hand unless it becomes a pair. */
+        if ((weapon->flags & PROPFLAG_IS_DOUBLE) && (weapon->flags & PROPFLAG_WEAPON_LEFTHANDED)) return;
+        if (choice.offhandItem) weapon->flags &= ~PROPFLAG_WEAPON_LEFTHANDED;
+        weapon->flags &= ~PROPFLAG_IS_DOUBLE;
+        weapon->weaponnum = choice.item;
+        weapon->obj = choice.model;
+    } else {
+        const int target = gevrCampaignGuardWeaponFallback(chr, original);
+        if (target != original) {
+            sysLogPrintf(LOG_NOTE, "tactical guard: placed chr %d body %d item %d -> %d",
+                chr->chrnum, chr->bodynum, original, target);
+            weapon->weaponnum = target;
+            weapon->obj = gevrTacticalGuardModel(target);
+        }
+	}
+	#endif
 	s32 modelnum = weapon->obj;
 
 	modelLoad(modelnum);
+	#ifdef GEVR
+    PropRecord *prop = sub_GAME_7F051F30(weapon, chr, PitemZ_entries[modelnum].header, 0, 0);
+    gevrRecordGuardBuild(chr, prop, assigned ? &choice : NULL, original);
+	#else
 	sub_GAME_7F051F30(weapon, chr, PitemZ_entries[modelnum].header, 0, 0);
+	#endif
 }
 
 
@@ -12687,7 +13110,7 @@ ObjectRecord *create_new_item_instance_of_model(PROP modelnum, s32 weaponid)
 
 /*
  * GEVR: create_new_item_instance_of_model into a record the caller owns, not
- * one of the 30 g_WeaponSlots. weaponCreate frees the oldest idle slot when
+ * one of the g_WeaponSlots. weaponCreate frees an idle slot when
  * the pool is full, so an object meant to stay (Horde's station and drop
  * markers) must not live there: a busy fight recycled one and its owner
  * dereferenced the freed prop (reports a8d242cd, 42ed2cf1). The record is
@@ -12772,7 +13195,13 @@ WeaponObjRecord blank_08_object_preset_4001 = {
 /**
  * NTSC address 0x7F052214.
 */
-PropRecord *something_with_generating_object(ChrRecord *self, s32 propid, ITEM_IDS itemid, s32 flags, WeaponObjRecord *weapon, ItemModelFileRecord *prop_header)
+#ifdef GEVR
+static PropRecord *createChrWeapon(ChrRecord *self, s32 propid, ITEM_IDS itemid, s32 flags,
+    WeaponObjRecord *weapon, ItemModelFileRecord *prop_header)
+#else
+PropRecord *something_with_generating_object(ChrRecord *self, s32 propid, ITEM_IDS itemid, s32 flags,
+    WeaponObjRecord *weapon, ItemModelFileRecord *prop_header)
+#endif
 {
     Model *objinst;
     PropRecord *lastobjentry;
@@ -12831,6 +13260,58 @@ PropRecord *something_with_generating_object(ChrRecord *self, s32 propid, ITEM_I
 
     return lastobjentry; //should be new weapon
 }
+
+#ifdef GEVR
+PropRecord *something_with_generating_object(ChrRecord *self, s32 propid, ITEM_IDS itemid, s32 flags,
+    WeaponObjRecord *weapon, ItemModelFileRecord *prop_header)
+{
+    GevrGuardWeapon choice;
+    const int original = itemid;
+    const bool marksmanRifle = original == ITEM_SNIPERRIFLE && gevrCampaignGuardIsMarksman(self)
+        && gevrTacticalCampaignRules() && sysArgCheck("--tactical-physical");
+    const bool assigned = !marksmanRifle && !weapon && !prop_header
+        && gevrReplaceGuardWeapon(self, original, flags, &choice);
+    if (assigned) {
+        if ((flags & PROPFLAG_IS_DOUBLE) && self->weapons_held[GUNRIGHT])
+            return self->weapons_held[GUNRIGHT];
+        if (choice.offhandItem || (flags & PROPFLAG_IS_DOUBLE)) flags &= ~PROPFLAG_WEAPON_LEFTHANDED;
+        flags &= ~PROPFLAG_IS_DOUBLE;
+        itemid = choice.item;
+        propid = choice.model;
+    } else if (!marksmanRifle && !weapon && !prop_header) {
+        const int target = gevrCampaignGuardWeaponFallback(self, original);
+        if (target != original) {
+            sysLogPrintf(LOG_NOTE, "tactical guard: spawned chr %d body %d item %d -> %d",
+                self->chrnum, self->bodynum, original, target);
+            propid = gevrTacticalGuardModel(target);
+            itemid = target;
+        }
+    }
+    PropRecord *prop = createChrWeapon(self, propid, itemid, flags, weapon, prop_header);
+    gevrRecordGuardBuild(self, prop, assigned ? &choice : NULL, original);
+    return prop;
+}
+
+PropRecord *gevrCloneGuardWeapon(ChrRecord *clone, const PropRecord *source, s32 flags)
+{
+    const WeaponObjRecord *gun = source->weapon;
+    const GevrGuardLoadout *outfit = gevrCampaignGuardLoadout(clone);
+    if (!gevrCampaignRosterActive()
+        || (outfit && outfit->gun.key >= 0 && !(flags & PROPFLAG_WEAPON_LEFTHANDED)))
+        return chrGiveWeapon(clone, gun->obj, gun->weaponnum, flags);
+
+    /* The source item is already a Tactical replacement. Copy its build and
+     * keep the clone's normal left/right pairing path. */
+    PropRecord *prop = createChrWeapon(clone, gun->obj, gun->weaponnum, flags, NULL, NULL);
+    gevrTacticalGuardCopyBuild(prop, source);
+    return prop;
+}
+
+PropRecord *gevrGiveReplicatedGuardWeapon(ChrRecord *chr, s32 model, ITEM_IDS item, s32 flags)
+{
+    return createChrWeapon(chr, model, item, flags, NULL, NULL);
+}
+#endif
 
 
 /**
@@ -12977,6 +13458,16 @@ void chrRenderHeldWeapon(void *renderContext, GUNHAND hand, Gfx **gdl)
                 instcalcmatrices(&renderData, heldModel);
 #endif
 #ifdef GEVR
+                extern s32 g_gevrExtraPass;
+                if (chr->prop && chr->prop->type == PROP_TYPE_CHR && !netIsActive()
+                    && sysArgCheck("--tactical-mesh") && !g_gevrExtraPass) {
+                    gevrTacticalFitGuardWeapon(heldModel, prop->weapon->weaponnum);
+                }
+                if (gdl && chr->prop && chr->prop->stan && !g_gevrExtraPass
+                    && chr->actiontype != ACT_DEAD && chr->actiontype != ACT_DIE
+                    && (chr->prop->type == PROP_TYPE_CHR || gevrTacticalRemoteWeapon(heldModel))) {
+                    gevrTacticalGuardAccessories(heldModel, prop->weapon->weaponnum, getTileRoom(chr->prop->stan));
+                }
                 {
                     /* gevr_forcepull.c: the hand holding it, for pull and disarm. Its own
                      * mtxlist is often not written yet here (headset log: NaN, 1e38); the
@@ -13027,6 +13518,9 @@ void weaponSetGunfireVisible(PropRecord *prop, s32 firing)
     ObjectRecord *obj = prop->obj;
     Model *model = obj->model;
     ModelNode *node;
+#ifdef GEVR
+    if (firing && gevrHollywoodGuardFired(prop)) firing = FALSE;
+#endif
 
     if (model && model->obj->Skeleton == &skeleton_prop_weapon) {
         node = model->obj->Switches[0];
@@ -13098,6 +13592,10 @@ HATTYPE get_hat_model(PropRecord *prop) //#MATCH
 
         case PROP_HATHELMET:
         case PROP_HATHELMETGREY:
+#ifdef GEVR
+        case PROP_TACTICAL_ALTYN:
+        case PROP_TACTICAL_FAST_TROOPER:
+#endif
         {
             return HATTYPE_HELMATE;
         }

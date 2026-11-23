@@ -20,6 +20,9 @@ static int s_gevrHordeBHeld;
 #include "gevr_camera_collision.h"
 #include "gevr_romlayout.h"
 #include "gevr_dam_boat.h"
+#include "gevr_tactical_range.h"
+#include "gevr_android_paths.h"
+#include "gevr_tactical_heavy_guards.h"
 #endif
 #include <ultra64.h>
 #ifdef GEVR
@@ -31,6 +34,9 @@ extern s32 gevrCrouchToggled(void); // port/src/input.c
 #endif
 #include <math.h>
 #include <bondtypes.h>
+#ifdef GEVR
+#include <bondaicommands.h>
+#endif
 #include <boss.h>
 #include <fr.h>
 #include <joy.h>
@@ -81,6 +87,7 @@ extern s32 gevrCrouchToggled(void); // port/src/input.c
 #ifdef GEVR
 extern bool netIsActive(void);
 extern int netGetLocalSlot(void);
+int gevrTacticalPrepareWatchItem(s32 selected);
 extern void netSendRespawnEvent(u8 pad_index, f32 theta);
 #endif
 
@@ -754,6 +761,7 @@ static s32 gevrWatchOpeningByGesture(s32 inlevel)
 #include <strings.h>
 void cheatButtonHandleCheatsTurnedOn(CHEAT_ID cheat_id);
 static s32 gevrHandSelected(s32 hand);   /* below: the gun or item a hand is on or switching to */
+static s32 gevrTacticalTestHook(const char *word); /* scripted PC test only */
 s32 check_cur_player_ammo_amount_in_inventory(AMMOTYPE ammotype);   /* gunfire.c */
 s32 get_ammo_type_for_weapon(ITEM_IDS weapon);                       /* gunfire.c */
 static void gevrCheatProbe(s32 inlevel)
@@ -766,7 +774,7 @@ static void gevrCheatProbe(s32 inlevel)
 #ifdef GEVR_PC
     const char *path = "gevr_cheat.txt";   /* the PC game runs in its own folder */
 #else
-    const char *path = "/sdcard/Android/data/com.gevr.port/files/gevr_cheat.txt";
+    const char *path = GEVR_ANDROID_EXTERNAL_FILES "/gevr_cheat.txt";
 #endif
     char word[32];
     FILE *fp;
@@ -783,6 +791,7 @@ static void gevrCheatProbe(s32 inlevel)
     }
     while (fscanf(fp, "%31s", word) == 1)
     {
+        if (!strncasecmp(word, "tac", 3) && gevrTacticalTestHook(word)) continue;
         /* "stall": freeze the game thread 7 s - tests the watchdog stack dump */
         if (strcasecmp(word, "stall") == 0)
         {
@@ -1089,6 +1098,25 @@ s32 gevrSpawnGuards(s32 count)
     const f32 facing = g_CurrentPlayer->vv_theta * (M_PI_F / 180.0f);
     s32 i, n = 0;
 
+#ifdef _WIN32
+    if (sysArgCheck("--input-script") && sysArgCheck("--tactical-editor-export-npc") && bond && bond->stan) {
+        extern PropRecord *g_gevrEditorPreviewActor;
+        extern float g_gevrEditorPreviewYaw;
+        if (g_gevrEditorPreviewActor) return 0;
+        const s32 body = sysArgGetInt("--tactical-editor-export-npc", BODY_Russian_Soldier);
+        if (body < 0 || body >= BODIES_MAX) return 0;
+        coord3d pos = bond->pos;
+        pos.x -= sinf(facing) * 235.f;
+        pos.z += cosf(facing) * 235.f;
+        StandTile *stan = bond->stan;
+        if (!walkTilesBetweenPoints_NoCallback(&stan, bond->pos.x, bond->pos.z, pos.x, pos.z) || !stan) return 0;
+        g_gevrEditorPreviewYaw = M_PI_F - facing;
+        g_gevrEditorPreviewActor = chrSpawnAtCoord(body, -1, &pos, stan, g_gevrEditorPreviewYaw, NULL, 0x10);
+        if (g_gevrEditorPreviewActor) hatCreateForChr(g_gevrEditorPreviewActor->chr, PROP_HATHELMET, 0);
+        return g_gevrEditorPreviewActor ? 1 : 0;
+    }
+#endif
+
     for (i = 0; i < g_NumChrSlots && like == NULL; i++)
     {
         if (g_ChrSlots[i].model != NULL && g_ChrSlots[i].prop != NULL && g_ChrSlots[i].prop->type == PROP_TYPE_CHR)
@@ -1103,16 +1131,36 @@ s32 gevrSpawnGuards(s32 count)
     for (i = 0; i < count; i++)
     {
         /* three abreast, 1.5 m on and a row every 60 units, facing Bond */
-        const f32 ahead = 150.0f + (f32) (i / 3) * 60.0f, side = (f32) (i % 3 - 1) * 60.0f;
+        const f32 ahead = 150.0f + (f32) (i / 3) * 60.0f;
+        const f32 side = sysArgCheck("--input-script") && sysArgCheck("--tactical-showcase-variety")
+            ? (f32) ((i % 3 == 0) ? 0 : (i % 3 == 1) ? 55 : -55)
+            : (f32) (i % 3 - 1) * 60.0f;
         coord3d pos = bond->pos;
         StandTile *stan = bond->stan;
 
         pos.x += sinf(facing) * ahead + cosf(facing) * side;
         pos.z += cosf(facing) * ahead - sinf(facing) * side;
-        if (walkTilesBetweenPoints_NoCallback(&stan, bond->pos.x, bond->pos.z, pos.x, pos.z) && stan != NULL &&
-            chrSpawnAtCoord(like->bodynum, like->headnum, &pos, stan, facing + M_PI_F, NULL, 0x10) != NULL)   /* 0x10: in view, as the ally's (gevr_ally.c) */
+        if (walkTilesBetweenPoints_NoCallback(&stan, bond->pos.x, bond->pos.z, pos.x, pos.z) && stan != NULL)
         {
-            n++;
+            s32 showBody = sysArgCheck("--tactical-showcase-variety") && sysArgCheck("--input-script")
+                ? (i == 0 ? BODY_Russian_Soldier : i == 1 ? BODY_Russian_Commandant : like->bodynum) : like->bodynum;
+            PropRecord *spawned = chrSpawnAtCoord(showBody, like->headnum, &pos, stan, facing + M_PI_F, NULL, 0x10);
+            if (spawned) {
+                /* Scripted desktop showcase only; ordinary spawning is unchanged. */
+                if (sysArgCheck("--input-script") && sysArgCheck("--tactical-rig-showcase") && spawned->chr) {
+                    static const int props[3]={PROP_CHRKALASH,PROP_CHRSPECTRE,PROP_CHRMP5K};
+                    static const ITEM_IDS items[3]={ITEM_AK47,ITEM_SPECTRE,ITEM_MP5K};
+                    int variant=sysArgCheck("--tactical-rig-showcase-variants") ? i%3 : 0;
+                    if (sysArgCheck("--tactical-showcase-skorpion")) {
+                        something_with_generating_object(spawned->chr,PROP_CHRSKORPION,ITEM_SKORPION,0,NULL,NULL);
+                    } else if (sysArgCheck("--tactical-showcase-variety")) {
+                        static const int varietyProps[3]={PROP_TACTICAL_AK74N,PROP_CHRTT33,PROP_CHRKALASH};
+                        static const ITEM_IDS varietyItems[3]={ITEM_TACTICAL_AK74N,ITEM_TT33,ITEM_AK47};
+                        something_with_generating_object(spawned->chr,varietyProps[i%3],varietyItems[i%3],0,NULL,NULL);
+                    } else something_with_generating_object(spawned->chr,props[variant],items[variant],0,NULL,NULL);
+                }
+                n++;
+            }
         }
     }
     return n;
@@ -1321,7 +1369,7 @@ static void gevrWarpProbe(s32 inlevel)
 #ifdef GEVR_PC
     const char *path = "gevr_warp.txt";   /* the PC and Apple games' own folder, as gevr_cheat.txt */
 #else
-    const char *path = "/sdcard/Android/data/com.gevr.port/files/gevr_warp.txt";
+    const char *path = GEVR_ANDROID_EXTERNAL_FILES "/gevr_warp.txt";
 #endif
     s32 padnum = -1;
     FILE *fp;
@@ -1651,9 +1699,26 @@ void gevrStereoFrame(s32 inlevel)
  * kept in centimetres instead: 0.17 x 5 = 0.85 cm per model-row unit.
  */
 #define GEVR_VIEWMODEL_CM 0.85f
+#include "gevr_tactical_scale.h"
+#include "gevr_tactical_support.h"
+#include "gevr_tactical_mesh.h"
+#include "gevr_tactical_asset.h"
+#include "gevr_tactical_fit.h"
+#include "gevr_tactical_gear.h"
+#include "gevr_tactical_net.h"
+#include "gevr_tactical_loot_net.h"
+#include "gevr_tactical_stats.h"
+static float gevrTacticalMoveScale(void);
+#include "gevr_tactical_loadouts.h"
+#include "gevr_tactical_native_mags.h"
+#include "gevr_tactical_optics.h"
+#include "audio.h"
+int gevrTacticalItem(int item);
+extern int gevrTacticalMode(void);
 #define GEVR_GRIP_TO_ORIGIN_CM 12.0f
 
 static s32 s_gevrTwoHandGun = GUNRIGHT;   /* the slot holding the supported gun */
+static struct { s32 active, gun, ctrl; f32 relative[4][3]; Mtxf last; } s_tacticalSupport;
 static f32 s_gevrTwoHandAmt;   /* issue #35: the two-handed hold, eased 0..1 (gevrStereoTwoHandUpdate) */
 static void gevrTwoHandAim(const f32 pos[3], f32 right[3], f32 up[3], f32 back[3]);
 static s32 gevrCoopTankTaken(struct PropRecord *prop);   /* a teammate drives this tank (co-op) */
@@ -1692,6 +1757,33 @@ static s32 gevrGripAxesRaw(s32 ctrl, f32 pos[3], f32 right[3], f32 up[3], f32 ba
         pos[i] *= GEVR_UNITS_PER_METRE * D_800364CC;
     }
 
+    return TRUE;
+}
+
+int gevrTacticalSupportHolding(void) { return s_tacticalSupport.active; }
+
+s32 gevrTacticalWeaponController(s32 hand)
+{
+    return s_tacticalSupport.active && s_tacticalSupport.gun == hand ? s_tacticalSupport.ctrl : 1 - hand;
+}
+static s32 gevrTacticalSupportFrame(s32 ctrl, f32 frame[4][3])
+{
+    return gevrGripAxesRaw(ctrl, frame[3], frame[0], frame[1], frame[2]);
+}
+
+static s32 gevrTacticalSupportPose(Mtxf *out)
+{
+    f32 frame[4][3], pose[4][3];
+    if (!s_tacticalSupport.active) return FALSE;
+    if (!gevrTacticalSupportFrame(s_tacticalSupport.ctrl, frame)) {
+        *out = s_tacticalSupport.last;
+        return TRUE;
+    }
+    gevrSupportRestore(frame, s_tacticalSupport.relative, pose);
+    for (int row = 0; row < 4; row++) for (int j = 0; j < 3; j++) out->m[row][j] = pose[row][j];
+    out->m[0][3] = out->m[1][3] = out->m[2][3] = 0;
+    out->m[3][3] = 1;
+    s_tacticalSupport.last = *out;
     return TRUE;
 }
 
@@ -1746,6 +1838,7 @@ typedef struct
 static GevrItemPose s_gevrItemPoses[] = {
     { ITEM_TIMEDMINE,     { 0.0f, 1.0f, 16.0f }, { 0.0f, 0.0f, -90.0f }, 1.0f, TRUE },  /* flat against the palm, top out (#19) */
     { ITEM_PROXIMITYMINE, { 0.0f, 1.0f, 16.0f }, { 0.0f, 0.0f, -90.0f }, 1.0f, TRUE },
+    { ITEM_TRIGGER,       { 0.0f, 1.0f, 14.5f }, { 0.0f, 0.0f, 0.0f }, 1.0f, TRUE },
     { ITEM_REMOTEMINE,    { 0.0f, 1.0f, 16.0f }, { 0.0f, 0.0f, -90.0f }, 1.0f, TRUE },
     { ITEM_BUG,           { 0.0f, 1.0f, 15.0f }, { 0.0f, 0.0f, 0.0f }, 0.67f, TRUE },  /* covert modem: 1.5x too big (user) */
     { ITEM_MICROCAMERA,   { 0.0f, 1.0f, 15.0f }, { 0.0f, 0.0f, 0.0f }, 1.0f, TRUE },
@@ -1902,7 +1995,8 @@ s32 gevrStereoItemShown(s32 item)
 {
     extern s32 gevrGexDrawsItem(s32 item);   /* gun.c: GE-X's rig holds it in its own hand */
 
-    return g_gevrStereo && gevrItemPoseFind(item) != NULL && !gevrGexDrawsItem(item);
+    return g_gevrStereo && (item == ITEM_TRIGGER ? gevrTacticalHandheldDetonator(item)
+        : gevrItemPoseFind(item) != NULL && !gevrGexDrawsItem(item));
 }
 
 /* gunfire.c, the screen: GoldenEye drew none of these gadgets; with GoldenEye X's
@@ -1912,7 +2006,9 @@ s32 gevrScreenGadget(s32 hand, s32 item)
     extern s32 gevrGexDrawsItem(s32 item);   /* gun.c */
     extern int VrGexGuns;   /* vr_settings_defaults.c */
 
-    return !g_gevrStereo && VrGexGuns && hand == GUNRIGHT && gevrItemPoseFind(item) != NULL
+    if (g_gevrStereo) return FALSE;
+    if (gevrTacticalHandheldDetonator(item) || gevrTacticalGuidedThrow(item)) return TRUE;
+    return VrGexGuns && hand == GUNRIGHT && gevrItemPoseFind(item) != NULL
         && gevrItemPoseFind(item)->fist != 0 && !gevrGexDrawsItem(item);
 }
 
@@ -2206,6 +2302,8 @@ s32 gevrStereoGunMatrix(s32 handnum, Mtxf *out)
     {
         return FALSE;
     }
+    if (s_tacticalSupport.active && handnum == s_tacticalSupport.gun)
+        return gevrTacticalSupportPose(out);
 
     {
         static s32 had[2] = { -1, -1 };
@@ -2238,9 +2336,11 @@ s32 gevrStereoGunMatrix(s32 handnum, Mtxf *out)
         off[1] = s_gevrGunOffOverride[1];
         off[2] = s_gevrGunOffOverride[2];
     }
+    extern int gevrTacticalUnmirroredItem(int item);
+    const s32 keepModelSide = gevrTacticalUnmirroredItem(getCurrentPlayerWeaponId(handnum));
     for (i = 0; i < 3; i++)
     {
-        out->m[0][i] = (VrLeftHandedMode ? right[i] : -right[i]) * k;   /* model +X: the gun's left */
+        out->m[0][i] = (VrLeftHandedMode && !keepModelSide ? right[i] : -right[i]) * k;
         out->m[1][i] = up[i] * k;
         out->m[2][i] = -back[i] * k;    /* model +Z: along the barrel */
         /* fist on the controller, then the ini trim, in the gun's own right/up/back */
@@ -2249,6 +2349,48 @@ s32 gevrStereoGunMatrix(s32 handnum, Mtxf *out)
     }
     out->m[0][3] = out->m[1][3] = out->m[2][3] = 0.0f;
     out->m[3][3] = 1.0f;
+    return TRUE;
+}
+
+static s32 gevrTacticalSupportTake(s32 gun, s32 ctrl)
+{
+    Mtxf matrix;
+    f32 frame[4][3], pose[4][3];
+    if (s_tacticalSupport.active || !gevrTacticalSupportFrame(ctrl, frame)
+        || !gevrStereoGunMatrix(gun, &matrix)) return FALSE;
+    for (int row = 0; row < 4; row++) for (int j = 0; j < 3; j++) pose[row][j] = matrix.m[row][j];
+    gevrSupportCapture(frame, pose, s_tacticalSupport.relative);
+    s_tacticalSupport.gun = gun; s_tacticalSupport.ctrl = ctrl;
+    s_tacticalSupport.last = matrix; s_tacticalSupport.active = TRUE;
+    sysLogPrintf(LOG_NOTE, "tactical: long gun held by support hand %d", ctrl);
+    return TRUE;
+}
+
+/* The freed trigger hand follows its own tracked controller, independently of
+ * the rifle pose held by the other hand. */
+s32 gevrStereoFreeGunHandMatrix(s32 hand, Mtxf *out)
+{
+    f32 pos[3], right[3], up[3], back[3];
+    f32 size = gevrGunSizeFactor();
+    f32 cm = GEVR_UNITS_PER_METRE * D_800364CC / 100.0f;
+    f32 k = GEVR_VIEWMODEL_CM * cm * size;
+    if (!g_gevrStereo || !gevrGripAxesRaw(hand == GUNRIGHT ? 1 : 0, pos, right, up, back)) return FALSE;
+    for (int i = 0; i < 3; i++) {
+        out->m[0][i] = (VrLeftHandedMode ? right[i] : -right[i]) * k;
+        out->m[1][i] = up[i] * k;
+        out->m[2][i] = -back[i] * k;
+        /* This is the free hand, not the gun's model origin 12 cm behind it. */
+        out->m[3][i] = pos[i] + 3.0f * back[i] * cm;
+    }
+    out->m[0][3] = out->m[1][3] = out->m[2][3] = 0; out->m[3][3] = 1;
+    return TRUE;
+}
+
+s32 gevrStereoTacticalHandMatrix(s32 ctrl, Mtxf *out)
+{
+    if (!gevrStereoFreeGunHandMatrix(ctrl ? GUNRIGHT : GUNLEFT, out)) return FALSE;
+    if (!ctrl) matrix_column_1_scalar_multiply(-1.f, out->m[0]);
+    matrix_scalar_multiply(.1f, out->m[0]);
     return TRUE;
 }
 
@@ -2299,14 +2441,16 @@ s32 gevrStereoOffHandMatrix(Mtxf *out)
 s32 gevrStereoReloadHandMatrix(Mtxf *out)
 {
     const s32 gunHand = gevrReloadSupportGun();
-    const s32 mirrored = VrLeftHandedMode != (gunHand == GUNLEFT);
+    const s32 changing = s_tacticalSupport.active && s_tacticalSupport.gun == gunHand;
+    const s32 interactionCtrl = changing ? 1 - gunHand : gunHand;
+    const s32 mirrored = (VrLeftHandedMode != (gunHand == GUNLEFT)) != changing;
     f32 pos[3], right[3], up[3], back[3], off[3];
     f32 size = gevrGunSizeFactor();
     f32 cm = GEVR_UNITS_PER_METRE * D_800364CC / 100.0f;
     f32 k = GEVR_VIEWMODEL_CM * cm * size * 0.1f;
     s32 i;
 
-    if (!g_gevrStereo || !gevrGripAxesRaw(gunHand, pos, right, up, back))
+    if (!g_gevrStereo || !gevrGripAxesRaw(interactionCtrl, pos, right, up, back))
     {
         return FALSE;
     }
@@ -2316,8 +2460,12 @@ s32 gevrStereoReloadHandMatrix(Mtxf *out)
         out->m[0][i] = (mirrored ? right[i] : -right[i]) * k;
         out->m[1][i] = up[i] * k;
         out->m[2][i] = -back[i] * k;
-        out->m[3][i] = pos[i] + ((mirrored ? -off[0] : off[0]) * right[i] + off[1] * up[i]
-                                 + (GEVR_GRIP_TO_ORIGIN_CM + off[2]) * back[i]) * cm * size;
+        if (sysArgCheck("--tactical-ppk-hand-refit") && sysArgCheck("--tactical-physical")
+            && (getCurrentPlayerWeaponId(gunHand) == ITEM_WPPK || getCurrentPlayerWeaponId(gunHand) == ITEM_WPPKSIL || (sysArgCheck("--tactical-variety") && getCurrentPlayerWeaponId(gunHand) == ITEM_TT33)))
+            out->m[3][i] = pos[i] + 3.0f * back[i] * cm;
+        else
+            out->m[3][i] = pos[i] + ((mirrored ? -off[0] : off[0]) * right[i] + off[1] * up[i]
+                                     + (GEVR_GRIP_TO_ORIGIN_CM + off[2]) * back[i]) * cm * size;
     }
     out->m[0][3] = out->m[1][3] = out->m[2][3] = 0.0f;
     out->m[3][3] = 1.0f;
@@ -2365,6 +2513,7 @@ static f32 s_gevrWatchScale;               /* 0 until calibrated */
 static f32 s_gevrWatchFaceCm[3];           /* the face's centre from the wrist, in the wrist frame (#31) */
 static s32 s_gevrWatchFaceKnown;
 static f32 s_gevrWatchStatusRadius, s_gevrWatchStatusPlane;
+static ModelNode *s_gevrWatchHandDl;
 
 /* Measure the dial from the loaded model, never from a second arm or guessed
  * world offset. The clock pivot is in the root wrist's model coordinates. */
@@ -2407,6 +2556,7 @@ static s32 gevrLeftWatchLoad(void)
     }
     s_gevrWatchReady = FALSE;
     s_gevrWatchStage = bossGetStageNum();
+    s_gevrWatchHandDl = NULL;
 
     tmpl = get_ptr_weapon_model_header_line(ITEM_SUIT_LF_HAND);
     name = get_ptr_item_text_call_line(ITEM_SUIT_LF_HAND);
@@ -2571,7 +2721,6 @@ static void gevrWatchArmHands(Mtxf *matrices, s32 mirrored)
  */
 extern float VrGexWatch[4];   /* vr_settings_defaults.c */
 
-static ModelNode *s_gevrWatchHandDl;   /* the watch arm's hand: its first unswitched list */
 static f32 s_gevrWatchPalmCm[3];       /* its centre from the wrist, in the wrist frame (cm) */
 static s32 s_gevrWatchPalmKnown;
 
@@ -2727,6 +2876,7 @@ s32 gevrWatchFaceGripNormal(f32 out[3])
 }
 
 static Gfx *gevrRenderWatchStatusAt(Gfx *gdl, const Mtxf *transform);
+static Gfx *gevrDrawWatchGauges(Gfx *gdl, const Mtxf *transform, s32 originalDial);
 
 /*
  * gun.c gevrGexDrawOffHand: GoldenEye's readout (health, armor, radar) on a
@@ -2761,14 +2911,121 @@ Gfx *gevrRenderWatchFace(Gfx *gdl, const f32 centre[3], const f32 up[3], const f
     return gevrRenderWatchStatusAt(gdl, &transform);
 }
 
+/* Draw the ROM's bracelet and watch independently of the arm. */
+static Gfx *gevrDrawDetachedWatch(Gfx *gdl, ModelRenderData *templ, Mtxf *matrices)
+{
+    for (s32 i = 3; i < s_gevrWatchHeader.numSwitches && i < 10; ++i) {
+        ModelNode *node = s_gevrWatchHeader.Switches[i];
+        ModelRwData_SwitchRecord *sw = node ? (ModelRwData_SwitchRecord *)modelGetNodeRwData(&s_gevrWatchModel, node) : NULL;
+        if (sw) sw->visible = i == 3;
+    }
+    ModelRoData_DisplayListRecord *hand = &s_gevrWatchHandDl->Data->DisplayList;
+    Gfx *primary = hand->Primary, *secondary = hand->Secondary;
+    hand->Primary = hand->Secondary = NULL;
+
+    ModelRenderData renderdata = *templ;
+    renderdata.flags = 3;
+    renderdata.zbufferenabled = 1;
+    renderdata.gdl = gdl;
+    renderdata.PropType = PROP_TYPE_WEAPON;
+    renderdata.envcolour.word = g_CurrentPlayer->tileColor.a
+                              | ((u32)g_CurrentPlayer->tileColor.r << 24)
+                              | ((u32)g_CurrentPlayer->tileColor.g << 16)
+                              | ((u32)g_CurrentPlayer->tileColor.b << 8);
+    renderdata.cullmode = CULLMODE_NONE;
+    s_gevrWatchModel.render_pos = (RenderPosView *)matrices;
+    gSPClearGeometryMode(renderdata.gdl++, G_CULL_BOTH);
+    subdraw(&renderdata, &s_gevrWatchModel);
+
+    hand->Primary = primary;
+    hand->Secondary = secondary;
+    gdl = renderdata.gdl;
+    gSPClearGeometryMode(gdl++, G_CULL_BOTH);
+    return gdl;
+}
+
+int gevrTacticalOriginalWatchReady(void)
+{
+    return sysArgCheck("--tactical-watch") && g_CurrentPlayer
+        && (g_gevrStereo || sysArgCheck("--input-script"))
+        && gevrLeftWatchLoad() && s_gevrWatchStatusRadius > 0.f && gevrWatchHandDl() != NULL;
+}
+
+static s32 gevrTacticalWatchFrame(const Mtxf *glove, const GevrTacticalWatchMount *mount,
+    f32 centre[3], f32 along[3], f32 normal[3], f32 side[3], f32 *scale)
+{
+    for (int i = 0; i < 3; ++i) {
+        along[i] = mount->along[0]*glove->m[0][i] + mount->along[1]*glove->m[1][i] + mount->along[2]*glove->m[2][i];
+        normal[i] = mount->normal[0]*glove->m[0][i] + mount->normal[1]*glove->m[1][i] + mount->normal[2]*glove->m[2][i];
+        centre[i] = glove->m[3][i] + mount->centre[0]*glove->m[0][i]
+            + mount->centre[1]*glove->m[1][i] + mount->centre[2]*glove->m[2][i];
+    }
+    const f32 wristScale = sqrtf(SQ(along[0]) + SQ(along[1]) + SQ(along[2]));
+    if (wristScale <= 1e-6f) return FALSE;
+    for (int i = 0; i < 3; ++i) along[i] /= wristScale;
+    const f32 skew = along[0]*normal[0] + along[1]*normal[1] + along[2]*normal[2];
+    for (int i = 0; i < 3; ++i) normal[i] -= skew*along[i];
+    const f32 faceScale = sqrtf(SQ(normal[0]) + SQ(normal[1]) + SQ(normal[2]));
+    if (faceScale <= 1e-6f) return FALSE;
+    for (int i = 0; i < 3; ++i) normal[i] /= faceScale;
+    /* A proper rotation keeps the dial and clock readable on a reflected glove. */
+    side[0] = along[1]*normal[2] - along[2]*normal[1];
+    side[1] = along[2]*normal[0] - along[0]*normal[2];
+    side[2] = along[0]*normal[1] - along[1]*normal[0];
+    *scale = wristScale;
+    return TRUE;
+}
+
+s32 gevrTacticalTrackedWatch(Mtxf *glove, GevrTacticalWatchMount *mount)
+{
+    if (!g_gevrStereo || !g_CurrentPlayer || g_CurrentPlayer->bonddead
+        || g_CurrentPlayer->watch_animation_state || !sysArgCheck("--tactical-physical")
+        || !gevrStereoWatchItem(getCurrentPlayerWeaponId(GUNRIGHT))) return FALSE;
+    const s32 held = getCurrentPlayerWeaponId(GUNLEFT);
+    return (held == ITEM_UNARMED || held == ITEM_FIST || held == ITEM_SUIT_LF_HAND)
+        && gevrStereoTacticalHandMatrix(0, glove)
+        && gevrTacticalGloveWatchMount(-1, TACTICAL_GLOVE_OPEN, FALSE, mount)
+        && gevrTacticalOriginalWatchReady();
+}
+
+Gfx *gevrRenderTacticalWatch(Gfx *gdl, ModelRenderData *templ, const Mtxf *glove, const GevrTacticalWatchMount *mount)
+{
+    f32 along[3], normal[3], side[3], centre[3], wristScale;
+    if (!gevrTacticalWatchFrame(glove, mount, centre, along, normal, side, &wristScale)) return gdl;
+    const f32 scale = 21.f * wristScale / s_gevrWatchStatusRadius;
+    const f32 *pivot = (const f32 *)s_gevrWatchHeader.Switches[0]->Data;
+    Mtxf wrist;
+    matrix_4x4_set_identity(&wrist);
+    for (int i = 0; i < 3; ++i) {
+        wrist.m[0][i] = along[i] * scale;
+        wrist.m[1][i] = normal[i] * scale;
+        wrist.m[2][i] = side[i] * scale;
+        wrist.m[3][i] = centre[i] - pivot[0]*wrist.m[0][i] - s_gevrWatchStatusPlane*wrist.m[1][i] - pivot[2]*wrist.m[2][i];
+    }
+    const s32 n = s_gevrWatchHeader.numMatrices;
+    Mtxf *matrices = dynAllocate(n * sizeof(*matrices));
+    for (s32 i = 0; i < n; ++i) matrices[i] = wrist;
+    gevrWatchArmHands(matrices, FALSE);
+    gdl = gevrDrawDetachedWatch(gdl, templ, matrices);
+    /* Like the glove and gauges, these poses already include the view scale.
+     * The ordinary model conversion applies the stage scale a second time. */
+    for (s32 i = 0; i < n; ++i) {
+        const Mtxf pose = matrices[i];
+        guMtxF2L((f32 (*)[4])pose.m, (Mtx *)&matrices[i]);
+    }
+
+    Mtxf face;
+    gevrWatchStatusMatrix(wrist.m, pivot, s_gevrWatchStatusPlane,
+        s_gevrWatchStatusRadius, FALSE, face.m);
+    return gevrDrawWatchGauges(gdl, &face, TRUE);
+}
+
 Gfx *gevrRenderGexWatch(Gfx *gdl, ModelRenderData *templ, const f32 pos[3], const f32 x[3], const f32 y[3])
 {
-    ModelRenderData renderdata;
     Mtxf want, inv, corr;
     Mtxf *matrices;
     f32 cm = GEVR_UNITS_PER_METRE * D_800364CC / 100.0f;
     f32 z[3], rs, s;
-    Gfx *saved[2];
     s32 n, i;
 
     if (!g_gevrStereo || !gevrLeftWatchLoad() || gevrWatchHandDl() == NULL)
@@ -2815,39 +3072,7 @@ Gfx *gevrRenderGexWatch(Gfx *gdl, ModelRenderData *templ, const f32 pos[3], cons
         }
     }
 
-    /* the face on; the sleeves (the cuffs, 4 on) and the hand off */
-    for (i = 3; i < s_gevrWatchHeader.numSwitches && i < 10; i++)
-    {
-        ModelRwData_SwitchRecord *sw = s_gevrWatchHeader.Switches[i] != NULL
-            ? (ModelRwData_SwitchRecord *)modelGetNodeRwData(&s_gevrWatchModel, (ModelNode *)s_gevrWatchHeader.Switches[i])
-            : NULL;
-
-        if (sw != NULL)
-        {
-            sw->visible = i == 3;
-        }
-    }
-    saved[0] = s_gevrWatchHandDl->Data->DisplayList.Primary;
-    saved[1] = s_gevrWatchHandDl->Data->DisplayList.Secondary;
-    s_gevrWatchHandDl->Data->DisplayList.Primary = NULL;
-    s_gevrWatchHandDl->Data->DisplayList.Secondary = NULL;
-
-    renderdata = *templ;
-    renderdata.flags = 3;
-    renderdata.zbufferenabled = 1;
-    renderdata.gdl = gdl;
-    renderdata.PropType = PROP_TYPE_WEAPON;
-    renderdata.envcolour.word = g_CurrentPlayer->tileColor.a
-                              | ((u32)g_CurrentPlayer->tileColor.r << 24)
-                              | ((u32)g_CurrentPlayer->tileColor.g << 16)
-                              | ((u32)g_CurrentPlayer->tileColor.b << 8);
-    renderdata.cullmode = CULLMODE_NONE;
-    gSPClearGeometryMode(renderdata.gdl++, G_CULL_BOTH);
-    subdraw(&renderdata, &s_gevrWatchModel);
-    gdl = renderdata.gdl;
-    gSPClearGeometryMode(gdl++, G_CULL_BOTH);
-    s_gevrWatchHandDl->Data->DisplayList.Primary = saved[0];
-    s_gevrWatchHandDl->Data->DisplayList.Secondary = saved[1];
+    gdl = gevrDrawDetachedWatch(gdl, templ, matrices);
     gdl = gevrRenderWatchStatus(gdl, &matrices[0]);
     bondviewTransformManyPosToViewMatrix(s_gevrWatchModel.render_pos, n);
     return gdl;
@@ -3220,6 +3445,51 @@ static s32 gevrAimLocksStep(void)
     return gevrAimLocksMove() || gevrScopeZoomStick();
 }
 
+static const GevrGearAssembly *gevrTacticalCarriedAssembly(int kind, s32 hand);
+static s32 *gevrTacticalCarriedBuild(int kind, s32 hand);
+
+s32 gevrTacticalMuzzle(s32 hand, f32 out[3])
+{
+    extern int gevrTacticalMode(void);
+    const s32 item = getCurrentPlayerWeaponId(hand);
+    Mtxf model;
+    const int kind = gevrTacticalItem(item);
+    if (!gevrTacticalMode() || kind < 0 || !gevrStereoGunMatrix(hand, &model)) return FALSE;
+    /* The barrel centre of each converted mesh, in the native G model units. */
+    f32 x = 0, y = item == ITEM_AK47 || item == ITEM_TACTICAL_AK74N ? 19 : item == ITEM_SPECTRE ? 13 : item == ITEM_MP5K ? 16 : 23;
+    f32 z = item == ITEM_AK47 ? 439 : item == ITEM_TACTICAL_AK74N ? 649 : item == ITEM_TT33 ? 54 : item == ITEM_SPECTRE ? 367 : item == ITEM_MP5K ? 256 : 181;
+    if (item == ITEM_SKORPION) {
+        y = GEVR_SKORPION_MUZZLE_Y;
+        z = GEVR_SKORPION_MUZZLE_Z;
+    }
+    if (item == ITEM_SNIPERRIFLE) {
+        y = GEVR_SVD_MUZZLE_Y;
+        z = GEVR_SVD_MUZZLE_Z;
+    }
+    if (kind == TACTICAL_GUN_RPG) {
+        y = GEVR_RPG_MUZZLE_Y;
+        z = GEVR_RPG_MUZZLE_Z;
+    }
+    if (item == ITEM_AK47 && sysArgCheck("--tactical-physical")) gevrTacticalScaleAkPoint(&x, &y, &z);
+    const GevrTacticalExpandedFit *fit = gevrTacticalExpandedFit(kind);
+    if (fit) {
+        x = fit->muzzle[0];
+        y = fit->muzzle[1];
+        z = fit->muzzle[2];
+    }
+    const GevrGearAssembly *assembly = gevrTacticalCarriedAssembly(kind, hand);
+    if (assembly && (fit || kind == TACTICAL_GUN_SVD || assembly ==
+        gevrTacticalGearDeployedAssembly(*gevrTacticalCarriedBuild(kind, hand)))) {
+        f32 muzzle[3];
+        if (gevrTacticalGearMuzzlePoint(kind, assembly, muzzle)) {
+            x = muzzle[0]; y = muzzle[1]; z = muzzle[2];
+        }
+    }
+    for (int k = 0; k < 3; k++)
+        out[k] = model.m[3][k] + .1f * (x * model.m[0][k] + y * model.m[1][k] + z * model.m[2][k]);
+    return TRUE;
+}
+
 /* gunfire.c: where this frame's muzzle flash node landed, camera space. */
 void gevrStereoNoteMuzzle(s32 handnum, f32 x, f32 y, f32 z)
 {
@@ -3228,6 +3498,7 @@ void gevrStereoNoteMuzzle(s32 handnum, f32 x, f32 y, f32 z)
         s_gevrMuzzle[handnum][0] = x;
         s_gevrMuzzle[handnum][1] = y;
         s_gevrMuzzle[handnum][2] = z;
+        gevrTacticalMuzzle(handnum, s_gevrMuzzle[handnum]);
         s_gevrMuzzleValid[handnum] = TRUE;
         s_gevrMuzzleItem[handnum] = getCurrentPlayerWeaponId(handnum);
     }
@@ -3245,7 +3516,7 @@ void gevrStereoNoteMuzzle(s32 handnum, f32 x, f32 y, f32 z)
  */
 s32 gevrStereoWatchItem(s32 item)
 {
-    if (!g_gevrStereo)
+    if (!g_gevrStereo || gevrTacticalHandheldDetonator(item))
     {
         return FALSE;
     }
@@ -3307,6 +3578,12 @@ static void gevrWatchAimAxis(const f32 up[3], f32 back[3])
  */
 static s32 gevrWatchFaceFrame(f32 o[3], f32 x[3], f32 y[3], f32 z[3])
 {
+    Mtxf glove;
+    GevrTacticalWatchMount mount;
+    f32 wristScale;
+    if (gevrTacticalTrackedWatch(&glove, &mount)
+        && gevrTacticalWatchFrame(&glove, &mount, o, x, y, z, &wristScale))
+        return TRUE;
     f32 pos[3], right[3], up[3], back[3];
     f32 unit = GEVR_UNITS_PER_METRE * D_800364CC / 100.0f * gevrGunSizeFactor();
     s32 i;
@@ -3480,8 +3757,15 @@ s32 gevrStereoWatchGrip(void)
 
 static s32 s_gevrTwoHand;
 static s32 s_gevrTwoHandResetDir;
+static s32 s_tacticalLeftSupportPress = ITEM_NOTHING;
 static s32 gevrGexPistolSupportAllowed(void);
 static s32 gevrGexPistolPoint(s32 support, f32 out[3]);
+
+static s32 gevrTacticalLeftWeaponGrip(s32 ctrl)
+{
+    return ctrl == (VrLeftHandedMode != 0) && g_gevrStereo && gevrTacticalMode()
+        && sysArgCheck("--tactical-physical");
+}
 
 /* Touch files/gevr_aimlog.txt to sample the grip/aim path in the app log. */
 static s32 gevrAimLogEnabled(void)
@@ -3505,6 +3789,7 @@ static s32 gevrAimLogEnabled(void)
 /* guns, and the launchers; not knives, gadgets, throwables or the watch items */
 s32 gevrStereoTwoHandItem(s32 item)
 {
+    if (item == ITEM_TACTICAL_KATANA) return gevrTacticalKatanaEnabled();
     switch (GEVR_ITEM_AS(item))
     {
         case ITEM_WPPK: case ITEM_WPPKSIL: case ITEM_TT33: case ITEM_SKORPION: case ITEM_AK47:
@@ -3623,6 +3908,8 @@ static s32 gevrTwoHandIsHandgun(s32 item)
         case ITEM_WPPK: case ITEM_WPPKSIL: case ITEM_TT33: case ITEM_RUGER: case ITEM_GOLDENGUN:
         case ITEM_SILVERWPPK: case ITEM_GOLDWPPK: case ITEM_FLAREPISTOL: case ITEM_TASER: case ITEM_LASER:
             return TRUE;
+        case ITEM_SKORPION:
+            return gevrTacticalSkorpionEnabled();
         default:
             return FALSE;
     }
@@ -3645,6 +3932,15 @@ extern s32 gevrGexForePoint(f32 out[3]);   /* gun.c: where GE-X's left hand hold
 s32 gevrGexHeldPalm(f32 out[3]);            /* below */
 extern int VrGexGuns;                       /* vr_settings_defaults.c: GoldenEye X's models */
 
+static void gevrKatanaViewPoint(const Mtxf *pose, const f32 assetPoint[3], f32 view[3])
+{
+    f32 point[3];
+    gevrTacticalKatanaGripPoint(assetPoint, point);
+    for (int axis = 0; axis < 3; ++axis)
+        view[axis] = pose->m[3][axis] + .1f * (point[0]*pose->m[0][axis]
+            + point[1]*pose->m[1][axis] + point[2]*pose->m[2][axis]);
+}
+
 static s32 gevrTwoHandBarrel(f32 opos[3], f32 snap[3], f32 *distcm, s32 drawn)
 {
     f32 gpos[3], right[3], up[3], back[3], ignore[3];
@@ -3658,6 +3954,39 @@ static s32 gevrTwoHandBarrel(f32 opos[3], f32 snap[3], f32 *distcm, s32 drawn)
     if (cm < 1e-6f || !gevrGripAxes(gunctrl, gpos, right, up, back) || !gevrGripAxesRaw(supportctrl, opos, ignore, ignore, ignore))
     {
         return FALSE;
+    }
+    if (getCurrentPlayerWeaponId(gun) == ITEM_TACTICAL_KATANA) {
+        Mtxf hilt;
+        const f32 supportGrip[3] = {0.f, -11.f, -108.f};
+        if (!gevrStereoGunMatrix(gun, &hilt)) return FALSE;
+        gevrKatanaViewPoint(&hilt, supportGrip, snap);
+        for (int axis = 0; axis < 3; ++axis) d[axis] = opos[axis] - snap[axis];
+        *distcm = sqrtf(SQ(d[0]) + SQ(d[1]) + SQ(d[2])) / cm;
+        return TRUE;
+    }
+    const GevrTacticalExpandedFit *fit = gevrTacticalExpandedFit(gevrTacticalItem(getCurrentPlayerWeaponId(gun)));
+    if (fit) {
+        Mtxf model;
+        if (!gevrStereoGunMatrix(gun, &model)) return FALSE;
+        for (int axis = 0; axis < 3; ++axis) {
+            snap[axis] = model.m[3][axis];
+            for (int k = 0; k < 3; ++k) snap[axis] += .1f * fit->support[k] * model.m[k][axis];
+            d[axis] = opos[axis] - snap[axis];
+        }
+        *distcm = sqrtf(SQ(d[0]) + SQ(d[1]) + SQ(d[2])) / cm;
+        return TRUE;
+    }
+    if (getCurrentPlayerWeaponId(gun) == ITEM_SKORPION && gevrTacticalSkorpionEnabled()) {
+        Mtxf gm;
+        const f32 side = gun == GUNRIGHT ? 1.f : -1.f;
+        if (!gevrStereoGunMatrix(gun, &gm)) return FALSE;
+        /* The compact support grip cups the firing hand, clear of the magazine. */
+        for (i = 0; i < 3; i++) {
+            snap[i] = gm.m[3][i] + .1f * (side * 39.f * gm.m[0][i] - 51.f * gm.m[1][i] - 30.f * gm.m[2][i]);
+            d[i] = opos[i] - snap[i];
+        }
+        *distcm = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]) / cm;
+        return TRUE;
     }
     if (gevrStereoClubBat(gun))
     {
@@ -3761,21 +4090,28 @@ static s32 gevrTwoHandBarrel(f32 opos[3], f32 snap[3], f32 *distcm, s32 drawn)
 }
 
 /* the off hand takes hold - of the gun with both hands, or a magazine: a short buzz in it (user) */
-static void gevrOffHandGripBuzz(void)
+static void gevrControllerGripBuzz(s32 ctrl)
 {
     extern s32 trigger_haptic_vibration_c(int hand_index, float amplitude, float duration);
     extern int vr_haptics_ready(void);   /* vr_input.cpp */
 
     if (vr_haptics_ready())
     {
-        trigger_haptic_vibration_c(gevrReloadSupportGun(), 0.35f, 0.04f);
+        trigger_haptic_vibration_c(ctrl, 0.35f, 0.04f);
     }
+}
+
+static void gevrOffHandGripBuzz(void)
+{
+    gevrControllerGripBuzz(gevrReloadSupportGun());
 }
 
 /* gunfire.c gunTickGameplay, each tick */
 s32 gevrStereoTwoHandUpdate(void)
 {
     extern _Bool get_button_state(int hand_index, const char *button_name);
+    extern s32 gevrTacticalHeldMagController(void);
+    extern s32 gevrTacticalActionController(void);
     s32 gun = gevrTwoHandGunCandidate();
     s32 item = gun >= 0 ? getCurrentPlayerWeaponId(gun) : ITEM_UNARMED;
     s32 was = s_gevrTwoHand;
@@ -3785,13 +4121,15 @@ s32 gevrStereoTwoHandUpdate(void)
 
     static s32 s_farFrames = 0;
     static s32 s_gripWas[2];
+    static s32 s_toggleItem = ITEM_NOTHING;
     s32 press;
 
     /* Remote players have no tracked hands on this headset. */
     if (netIsActive() && get_cur_playernum() != netGetLocalSlot())
         return FALSE;
 
-    if (gun >= 0 && gun != s_gevrTwoHandGun)
+    const s32 toggle = gun >= 0 && gevrTacticalLeftWeaponGrip(gun) && gevrStereoTwoHandItem(item);
+    if (gun >= 0 && (gun != s_gevrTwoHandGun || (toggle && item != s_toggleItem)))
     {
         s_gevrTwoHand = FALSE;
         s_gevrTwoHandAmt = 0.0f;
@@ -3799,8 +4137,11 @@ s32 gevrStereoTwoHandUpdate(void)
         s_farFrames = 0;
         s_gevrTwoHandGun = gun;
     }
+    s_toggleItem = toggle ? item : ITEM_NOTHING;
     const s32 supportctrl = s_gevrTwoHandGun;
-    press = get_button_state(supportctrl, "grip") && !s_gripWas[supportctrl];
+    const s32 grip = get_button_state(supportctrl, "grip");
+    press = toggle ? s_tacticalLeftSupportPress == item : grip && !s_gripWas[supportctrl];
+    s_tacticalLeftSupportPress = ITEM_NOTHING;
     s_gripWas[0] = get_button_state(0, "grip");
     s_gripWas[1] = get_button_state(1, "grip");
     s32 pistolSupport = gevrGexPistolSupportAllowed();
@@ -3813,13 +4154,29 @@ s32 gevrStereoTwoHandUpdate(void)
         s_farFrames = 0;
         why = ", not a two-handed gun now";
     }
-    else if (!get_button_state(supportctrl, "grip"))
+    else if (s_tacticalSupport.active && s_tacticalSupport.gun == gun && (toggle || grip))
+    {
+        /* The front hand owns the rifle while the trigger hand works the bolt. */
+        s_gevrTwoHand = TRUE;
+        s_farFrames = 0;
+    }
+    else if (toggle && s_gevrTwoHand)
+    {
+        if (press || gevrTacticalHeldMagController() == supportctrl
+            || gevrTacticalActionController() == supportctrl)
+        {
+            s_gevrTwoHand = FALSE;
+            why = press ? ", left grip toggled off" : ", reloading";
+        }
+        s_farFrames = 0;
+    }
+    else if (!toggle && !grip)
     {
         s_gevrTwoHand = FALSE;
         s_farFrames = 0;
         why = ", let go";
     }
-    else
+    else if (!toggle || press)
     {
         if (!gevrVrGripTracked(0) || !gevrVrGripTracked(1))
         {
@@ -3862,7 +4219,8 @@ s32 gevrStereoTwoHandUpdate(void)
             if (vr_haptics_ready()) trigger_haptic_vibration_c(supportctrl, 0.35f, 0.04f);
         }
         sysLogPrintf(LOG_NOTE, "stereo: two-handed hold %s (item %d, off hand %.1f cm from the barrel%s)",
-                     s_gevrTwoHand ? "on" : "off", item, dist, s_gevrTwoHand ? "" : why);
+                     s_gevrTwoHand ? "on" : "off", item, dist,
+                     s_gevrTwoHand ? (toggle ? ", left grip toggled on" : "") : why);
     }
     else if (press && !s_gevrTwoHand && (gevrStereoTwoHandItem(item) || gevrStereoHandClub(s_gevrTwoHandGun)))
     {
@@ -3986,14 +4344,38 @@ s32 gevrReloadHoldsHand(s32 ctrl);   /* below: the hand is reloading, it does no
 
 static s32 s_gevrThrowWindup[2];   /* below: the grip winds up a motion throw */
 
+static s32 gevrKatanaShoulderReach(s32 ctrl, const f32 at[3]);
+
+static s32 gevrBladeViewSegment(s32 hand, s32 sword, coord3d *base, coord3d *tip)
+{
+    Mtxf model;
+    if (!gevrStereoGunMatrix(hand, &model)) return FALSE;
+    if (sword) {
+        const f32 edge[3] = {0.f, -18.f, 102.f};
+        const f32 point[3] = {0.f, 94.f, 816.f};
+        gevrKatanaViewPoint(&model, edge, base->f);
+        gevrKatanaViewPoint(&model, point, tip->f);
+    } else {
+        for (int axis = 0; axis < 3; ++axis) {
+            const float grip = model.m[3][axis] - 2.93f * model.m[1][axis];
+            base->f[axis] = grip + 7.64f * model.m[2][axis];
+            tip->f[axis] = grip + 20.64f * model.m[2][axis];
+        }
+    }
+    return TRUE;
+}
+
 void gevrHandChopTick(s32 ctrl)
 {
-    if (gevrSpectating() || gevrCoopLocalDowned()) return;
+    if (gevrSpectating() || gevrCoopLocalDowned()) {
+        gevrRagdollReleaseBlade(ctrl);
+        return;
+    }
     extern float vr_ctrl_quat_play[2][4];     /* vr_input.cpp: the gesture frame, play space */
     extern float vr_ctrl_velocity_play[2][3];
     extern float vr_head_velocity_play[3];    /* vr_openxr.cpp */
     extern s32 gevrChopHit(const f32 from[3], const f32 to[3], f32 touch, const f32 dir[3], s32 item_id,
-                           const f32 vel[3], f32 need, s32 land, f32 *into);   /* chrprop.c */
+                           const f32 vel[3], f32 need, s32 land, s32 piercer, f32 *into); /* chrprop.c */
     extern s32 trigger_haptic_vibration_c(int hand_index, float amplitude, float duration);
     extern int vr_haptics_ready(void);        /* vr_input.cpp */
     extern int gevrBodySlotQuiet(int ctrl);   /* gevr_bodyslots.c */
@@ -4001,6 +4383,11 @@ void gevrHandChopTick(s32 ctrl)
     static s32 s_cool[2];    /* ticks until the hand's next blow can land */
     static s32 s_fast[2];    /* Perfect Dark's vr_hand_triggered: the hand has not slowed yet */
     static s32 s_told[2];    /* tuning: what this touch has logged, gevrChopHit's 1 or 2 */
+    static s32 s_swordSound[2];
+    static struct {
+        coord3d base, tip;
+        s32 tick, item;
+    } bladeTrace[2];
     static s32 s_pace[2] = { -1, -1 };   /* files/gevr_melee.txt: same hand, other hand */
     static u32 s_read;
     s32 hand = ctrl ? GUNRIGHT : GUNLEFT;
@@ -4008,10 +4395,14 @@ void gevrHandChopTick(s32 ctrl)
     s32 bare = item == ITEM_UNARMED || item == ITEM_FIST;
     s32 club = item == ITEM_FIST && g_CurrentPlayer->cur_item_weapon_getname == ITEM_SNIPERRIFLE;
     /* a throwing knife in the hand stabs as the knife does (user: not a punch) */
-    s32 knife = item == ITEM_KNIFE || item == ITEM_THROWKNIFE;
-    s32 damage = knife ? ITEM_KNIFE : ITEM_FIST;
+    const s32 sword = item == ITEM_TACTICAL_KATANA && gevrTacticalKatanaEnabled();
+    s32 knife = item == ITEM_KNIFE || item == ITEM_THROWKNIFE || sword;
+    const s32 huntsman = knife && !sword && gevrTacticalKnifeEnabled();
+    const s32 blade = sword || huntsman;
+    s32 damage = sword ? ITEM_TACTICAL_KATANA : knife ? ITEM_KNIFE : ITEM_FIST;
     f32 need = (bare || knife) ? GEVR_CHOP_HIT : GEVR_CHOP_HIT_ARMED;
     f32 rel[3], loc[3], vel[3], at[3], right[3], up[3], back[3], thrust, slash, speed;
+    f32 bladeThrust = 0.f;
     s32 fast;
     s32 i;
 
@@ -4044,17 +4435,21 @@ void gevrHandChopTick(s32 ctrl)
     {
         s_cool[ctrl] -= g_ClockTimer;
     }
+    if (s_swordSound[ctrl] > 0) s_swordSound[ctrl] -= g_ClockTimer;
+    if (!blade || !g_gevrStereo || g_CurrentPlayer->bonddead || g_PlayerIsInTank == 1)
+        gevrRagdollReleaseBlade(ctrl);
     /* the off hand on the gun, or either hand at the watch laser, is holding on */
     if (!g_gevrStereo || g_CurrentPlayer->bonddead || g_CurrentPlayer->watch_animation_state != 0
         || (netIsActive() && g_CurrentPlayer->mpmenuon)
         || g_PlayerIsInTank == 1 || gevrStereoWatchGrip() || (ctrl == gevrStereoTwoHandSupportCtrl() && gevrStereoTwoHandGrip())
-        || gevrReloadHoldsHand(ctrl) || gevrBodySlotQuiet(ctrl)   /* a reach for a body slot isn't a blow */
-        || s_gevrThrowWindup[hand]   /* winding up a throw (grip held): a throw, not a blow (user) */
+        || gevrReloadHoldsHand(ctrl)
+        || (!blade && (gevrBodySlotQuiet(ctrl) || s_gevrThrowWindup[hand]))
         || !gevrGripAxesRaw(ctrl, at, right, up, back))
     {
         s_whiff[ctrl] = 0;
         s_fast[ctrl] = TRUE;   /* a hand let go mid-swing is not a swing */
         s_told[ctrl] = 0;
+        bladeTrace[ctrl].item = 0;
         return;
     }
 
@@ -4068,10 +4463,65 @@ void gevrHandChopTick(s32 ctrl)
     {
         vel[i] = loc[0] * right[i] + loc[1] * back[i] - loc[2] * up[i];
     }
+    const float gripSpeed = sqrtf(SQ(rel[0]) + SQ(rel[1]) + SQ(rel[2]));
+    const float cm = GEVR_UNITS_PER_METRE * D_800364CC / 100.f;
+    coord3d bladeStart, bladeEnd, prevStart, prevEnd;
+    s32 sweep = FALSE;
+    if (blade && cm > 1e-6f) {
+        if (!gevrBladeViewSegment(hand, sword, &bladeStart, &bladeEnd)) return;
+        coord3d startWorld, endWorld;
+        float length2 = 0.f, forward = 0.f;
+        for (int axis = 0; axis < 3; ++axis) {
+            startWorld.f[axis] = bladeStart.f[axis] / D_800364CC;
+            endWorld.f[axis] = bladeEnd.f[axis] / D_800364CC;
+            const float edge = bladeEnd.f[axis] - bladeStart.f[axis];
+            length2 += edge * edge;
+            forward += edge * vel[axis];
+        }
+        if (length2 > 1e-6f) bladeThrust = forward / sqrtf(length2);
+        Mtxf *world = currentPlayerGetViewToWorldMtxf();
+        mtx4TransformVecInPlace(world, &startWorld);
+        mtx4TransformVecInPlace(world, &endWorld);
+        if (gevrRagdollBladePose(ctrl, damage, startWorld.f, endWorld.f)
+            || gevrBodySlotQuiet(ctrl) || s_gevrThrowWindup[hand]
+            || (sword && gevrKatanaShoulderReach(ctrl, at))) {
+            s_whiff[ctrl] = s_told[ctrl] = bladeTrace[ctrl].item = 0;
+            s_fast[ctrl] = TRUE;
+            return;
+        }
+        const s32 elapsed = g_GlobalTimer - bladeTrace[ctrl].tick;
+        if (bladeTrace[ctrl].item == damage && elapsed > 0 && elapsed <= 4) {
+            prevStart = bladeTrace[ctrl].base;
+            prevEnd = bladeTrace[ctrl].tip;
+            mtx4TransformVecInPlace(camGetWorldToScreenMtxf(), &prevStart);
+            mtx4TransformVecInPlace(camGetWorldToScreenMtxf(), &prevEnd);
+            for (int axis = 0; axis < 3; ++axis) {
+                prevStart.f[axis] *= D_800364CC;
+                prevEnd.f[axis] *= D_800364CC;
+                /* Add motion of the blade from a wrist turn to the tracked
+                 * controller velocity. Camera motion cancels out here. */
+                const float turn = (bladeEnd.f[axis] - bladeStart.f[axis])
+                    - (prevEnd.f[axis] - prevStart.f[axis]);
+                if (sword) vel[axis] += turn * 60.f / (100.f * cm * elapsed);
+            }
+            sweep = TRUE;
+        }
+        if (bladeTrace[ctrl].item != damage || elapsed != 0) {
+            bladeTrace[ctrl].base = startWorld;
+            bladeTrace[ctrl].tip = endWorld;
+            bladeTrace[ctrl].tick = g_GlobalTimer;
+            bladeTrace[ctrl].item = damage;
+        }
+    } else bladeTrace[ctrl].item = 0;
     speed = sqrtf(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]);
     thrust = -vel[2];
     slash = sqrtf(vel[0] * vel[0] + (vel[1] < 0.0f ? vel[1] * vel[1] : 0.0f));
-    if (bare || knife)
+    if (huntsman)
+    {
+        fast = bladeThrust > GEVR_CHOP_THRUST;
+    }
+    else if (sword) fast = gevrTacticalKatanaAudibleSwing(gripSpeed, speed, s_fast[ctrl]);
+    else if (bare || knife)
     {
         fast = thrust > GEVR_CHOP_THRUST || slash > GEVR_CHOP_SLASH;
     }
@@ -4085,24 +4535,24 @@ void gevrHandChopTick(s32 ctrl)
     {
         s_whiff[ctrl] = GEVR_CHOP_TICKS;
         s_gevrChopSwing[ctrl] = 3;   /* online the copies swing on it too (net_player_sync.c) */
-        if (knife)
+        if (knife && (!sword || s_swordSound[ctrl] <= 0))
         {
             /* the knife's own slash, as its trigger attack plays it (gunfire.c), no animation */
             extern struct sfx3 knife_throw_sounds;   /* gun.c */
 
             sndPlaySfx(g_musicSfxBufferPtr, knife_throw_sounds.half[randomGetNext() % 3U], NULL);
+            if (sword) s_swordSound[ctrl] = 27;
         }
     }
     s_fast[ctrl] = fast;
 
-    if (speed < need)
+    if (speed < need || cm <= 1e-6f || (huntsman && bladeThrust < need))
     {
         s_told[ctrl] = 0;
     }
     else
     {
         f32 end[3], dir[3], len, into;
-        f32 cm = GEVR_UNITS_PER_METRE * D_800364CC / 100.0f;
         s32 cycle = s_pace[0] >= 0 ? s_pace[0] : (knife || club) ? GEVR_CHOP_CYCLE_KNIFE : GEVR_CHOP_CYCLE_FIST;
         s32 other = s_pace[1] >= 0 ? s_pace[1] : cycle / 2;
         s32 got;
@@ -4124,6 +4574,11 @@ void gevrHandChopTick(s32 ctrl)
                                               + s_gevrClubButt[2] * g->m[2][i]);
             }
         }
+        else if (sword || huntsman)
+        {
+            memcpy(at, bladeStart.f, sizeof(bladeStart.f));
+            memcpy(end, bladeEnd.f, sizeof(bladeEnd.f));
+        }
         else if (!bare && !knife && s_gevrMuzzleValid[hand] && s_gevrMuzzleItem[hand] == item)
         {
             end[0] = s_gevrMuzzle[hand][0];
@@ -4133,9 +4588,25 @@ void gevrHandChopTick(s32 ctrl)
         len = sqrtf(end[0] * end[0] + end[1] * end[1] + end[2] * end[2]);
         for (i = 0; i < 3; i++)
         {
-            dir[i] = len > 1e-6f ? end[i] / len : (i == 2 ? -1.0f : 0.0f);
+            dir[i] = (sword || huntsman) ? vel[i] / speed : len > 1e-6f ? end[i] / len : (i == 2 ? -1.f : 0.f);
         }
-        got = gevrChopHit(at, end, GEVR_CHOP_TOUCH_CM * cm, dir, damage, vel, need, s_cool[ctrl] <= 0, &into);
+        const f32 touch = (huntsman || sword ? 3.f : GEVR_CHOP_TOUCH_CM) * cm;
+        const s32 piercer = (huntsman || (sword && bladeThrust >= need && bladeThrust >= .78f * gripSpeed))
+            ? ctrl + 1 : 0;
+        got = piercer ? gevrChopHit(at, end, touch, dir, damage, vel, need, s_cool[ctrl] <= 0, piercer, &into) : 0;
+        if (got != 2 && sweep && s_cool[ctrl] <= 0) {
+            for (int sample = 1; sample < 4 && got != 2; ++sample) {
+                f32 a[3], b[3];
+                const float t = sample * .25f;
+                for (int axis = 0; axis < 3; ++axis) {
+                    a[axis] = prevStart.f[axis] + t*(at[axis] - prevStart.f[axis]);
+                    b[axis] = prevEnd.f[axis] + t*(end[axis] - prevEnd.f[axis]);
+                }
+                got = gevrChopHit(a, b, touch, dir, damage, vel, need, TRUE, piercer, &into);
+            }
+        }
+        if (got != 2 && !piercer)
+            got = gevrChopHit(at, end, touch, dir, damage, vel, need, s_cool[ctrl] <= 0, 0, &into);
         if (got == 2 && s_cool[ctrl] <= 0)
         {
             f32 d[3];
@@ -4208,7 +4679,7 @@ void gevrHandChopTick(s32 ctrl)
 s32 gevrTaserTouch(s32 hand)
 {
     extern s32 gevrChopHit(const f32 from[3], const f32 to[3], f32 touch, const f32 dir[3], s32 item_id,
-                           const f32 vel[3], f32 need, s32 land, f32 *into);   /* chrprop.c */
+                           const f32 vel[3], f32 need, s32 land, s32 piercer, f32 *into); /* chrprop.c */
     const f32 still[3] = { 0.0f, 0.0f, 0.0f };
     f32 cm = GEVR_UNITS_PER_METRE * D_800364CC / 100.0f;
     f32 at[3], right[3], up[3], back[3], end[3], dir[3], len, into;
@@ -4230,7 +4701,7 @@ s32 gevrTaserTouch(s32 hand)
     {
         dir[i] = len > 1e-6f ? end[i] / len : (i == 2 ? -1.0f : 0.0f);
     }
-    if (gevrChopHit(at, end, GEVR_TASER_TOUCH_CM * cm, dir, ITEM_TASER, still, 0.0f, TRUE, &into) == 2)
+    if (gevrChopHit(at, end, GEVR_TASER_TOUCH_CM * cm, dir, ITEM_TASER, still, 0.0f, TRUE, 0, &into) == 2)
     {
         sysLogPrintf(LOG_NOTE, "stereo: taser touched a guard");
         return TRUE;
@@ -4325,7 +4796,8 @@ void gevrMotionThrowTick(s32 hand)
 
     /* Wait for the fresh press's decision. Once taken, the gesture owns
      * the whole squeeze, including a partial release below the button threshold. */
-    if (!gevrIsThrowable(item) || gevrBodySlotHoldsGrip(ctrl) || gevrGripGestureTaken(ctrl))
+    if (!gevrIsThrowable(item) || gevrTacticalGuidedThrow(item)
+        || gevrBodySlotHoldsGrip(ctrl) || gevrGripGestureTaken(ctrl))
     {
         s_gevrThrowWindup[hand] = 0;
         s_gevrGripArmed[hand] = 0;
@@ -4786,6 +5258,8 @@ s32 gevrStereoTwoHandClass(void)
 static f32 *gevrTwoHandTrimNow(void)
 {
     const s32 item = getCurrentPlayerWeaponId(s_gevrTwoHandGun);
+    static f32 swordGrip[6] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    if (item == ITEM_TACTICAL_KATANA) return swordGrip;
     const f32 *own = gevrGripTrimOwnOf(gevrFitLook(s_gevrTwoHandGun), item);
 
     return own != NULL ? (f32 *)own : s_gevrTwoHandTrim[gevrTwoHandIsHandgun(item) ? 0 : 1];
@@ -5321,6 +5795,8 @@ static void gevrTwoHandAim(const f32 pos[3], f32 right[3], f32 up[3], f32 back[3
         s_twoHandBatFresh = TRUE;
         s_gevrTwoHandResetDir = FALSE;
     }
+    /* With a sword the support hand braces the hilt behind the lead hand. */
+    if (getCurrentPlayerWeaponId(s_gevrTwoHandGun) == ITEM_TACTICAL_KATANA) return;
     if (gevrStereoClubBat(s_gevrTwoHandGun))
     {
         gevrTwoHandBatAim(pos, right, up, back, s_twoHandBatFresh);
@@ -5389,6 +5865,10 @@ static void gevrTwoHandAim(const f32 pos[3], f32 right[3], f32 up[3], f32 back[3
             if (tdeg > 1.0f) tdeg = 1.0f;
             alpha = 0.15f + (1.0f - 0.15f) * tdeg;
         }
+
+        const f32 handling = gevrTacticalHandling(1 - s_gevrTwoHandGun);
+        if (handling > 0.f && deg > 1.f)
+            alpha = fmaxf(1.f - 6.f / deg, alpha * (1.f - handling * fminf(1.f, (deg - 1.f) * .5f)));
 
         for (i = 0; i < 3; i++)
         {
@@ -5682,6 +6162,34 @@ static s32 gevrRemoteCopyShot(s32 handnum, struct coord3d *origin, struct coord3
     return TRUE;
 }
 
+/* Degrees are relative to the barrel: a negative value lowers the shot.
+ * Read infrequently so a headset trial can be adjusted without a rebuild. */
+static f32 gevrTacticalAkZeroSlope(void)
+{
+    static u32 ticks;
+    static f32 slope = GEVR_AK_SIGHT_UP_SLOPE;
+    if ((ticks++ % 120) == 0) {
+        FILE *f = gevrTacticalOpenAsset("gevr_ak_zero.txt", "r");
+        f32 degrees;
+        if (f) {
+            if (fscanf(f, "%f", &degrees) == 1 && isfinite(degrees) && degrees >= -6 && degrees <= 6) {
+                f32 next = tanf(degrees * (M_PI_F / 180.0f));
+                if (fabsf(next - slope) > .00001f) {
+                    slope = next;
+                    sysLogPrintf(LOG_NOTE, "tactical: AK zero %.2f degrees", (double)degrees);
+                }
+            }
+            fclose(f);
+        }
+    }
+    return slope;
+}
+static void gevrTacticalAkZeroDirection(const f32 back[3], const f32 up[3], f32 out[3])
+{
+    f32 slope = gevrTacticalAkZeroSlope();
+    for (int k = 0; k < 3; k++) out[k] = -back[k] + slope * up[k];
+}
+
 s32 gevrStereoShot(s32 handnum, coord2d *spreadpos, struct coord3d *origin, struct coord3d *dir);
 
 /*
@@ -5782,7 +6290,9 @@ s32 gevrStereoShot(s32 handnum, coord2d *spreadpos, struct coord3d *origin, stru
         return FALSE;
     }
 
-    if (handnum == GUNRIGHT && ctrl == 0)
+    {
+        if (gevrTacticalMuzzle(handnum, origin->f)) {}
+        else if (handnum == GUNRIGHT && ctrl == 0)
     {
         /* issue #31: from the watch, out of its twelve o'clock edge */
         gevrWatchAimAxis(up, back);
@@ -5803,6 +6313,7 @@ s32 gevrStereoShot(s32 handnum, coord2d *spreadpos, struct coord3d *origin, stru
         origin->y = pos[1];
         origin->z = pos[2];
     }
+    }
 
     /* The barrel target, 1000 units out along the barrel from the muzzle (a
      * target on the grip's line converged on the barrel only far away, and
@@ -5810,7 +6321,27 @@ s32 gevrStereoShot(s32 handnum, coord2d *spreadpos, struct coord3d *origin, stru
     far.x = origin->x - back[0] * 1000.0f;
     far.y = origin->y - back[1] * 1000.0f;
     far.z = origin->z - back[2] * 1000.0f;
-    if (far.z < -1.0f && spreadpos != NULL)
+    if (sysArgCheck("--tactical-physical") && gevrTacticalMode()
+        && getCurrentPlayerWeaponId(handnum) == ITEM_AK47) {
+        f32 aim[3]; gevrTacticalAkZeroDirection(back, up, aim);
+        far.x = origin->x + aim[0] * 1000.0f;
+        far.y = origin->y + aim[1] * 1000.0f;
+        far.z = origin->z + aim[2] * 1000.0f;
+    }
+    const s32 item = getCurrentPlayerWeaponId(handnum);
+    const GevrWeaponStats *stats = spreadpos ? gevrTacticalHeldStats(handnum, item) : NULL;
+    if (stats) {
+        const s32 shotgun = GEVR_ITEM_AS(item) == ITEM_SHOTGUN || GEVR_ITEM_AS(item) == ITEM_AUTOSHOT;
+        const f32 supported = handnum == s_gevrTwoHandGun && gevrStereoTwoHandGrip() ? .72f : 1.f;
+        const f32 bloom = 1.f + .045f * fminf(8.f, g_CurrentPlayer->hands[handnum].volley);
+        const f32 radial = tanf(DegToRad(stats->spread)) * 1000.f * (shotgun ? 1.f : supported * bloom);
+        const f32 direction = M_TAU_F * RANDOMFRAC();
+        const f32 radius = sqrtf(RANDOMFRAC()) * radial;
+        const f32 dx = radius * cosf(direction), dy = radius * sinf(direction);
+        for (int k = 0; k < 3; ++k)
+            far.f[k] += dx * right[k] + dy * up[k];
+    }
+    else if (far.z < -1.0f && spreadpos != NULL)
     {
         /* the two-handed hold (#35) steadies the aim and the kick, so it
          * tightens the game's spread too (user); not a shotgun's, whose
@@ -5866,6 +6397,13 @@ s32 gevrStereoAimTarget(struct coord3d *target)
     target->x = pos[0] - back[0] * 1000.0f;
     target->y = pos[1] - back[1] * 1000.0f;
     target->z = pos[2] - back[2] * 1000.0f;
+    if (sysArgCheck("--tactical-physical") && gevrTacticalMode()
+        && getCurrentPlayerWeaponId(GUNRIGHT) == ITEM_AK47) {
+        f32 aim[3]; gevrTacticalAkZeroDirection(back, up, aim);
+        target->x = pos[0] + aim[0] * 1000.0f;
+        target->y = pos[1] + aim[1] * 1000.0f;
+        target->z = pos[2] + aim[2] * 1000.0f;
+    }
 
     /* Pointing behind the camera: no screen position; let the game keep its own. */
     return target->z < -1.0f;
@@ -5996,6 +6534,7 @@ void gevrReloadFitDistances(f32 *grab, f32 *belt);
 static const struct GevrScope *gevrScopeFor(s32 item)
 {
     s32 i;
+    if (item == ITEM_SNIPERRIFLE && gevrTacticalSvdEnabled() && gevrTacticalGearStockAssembly(TACTICAL_GUN_SVD)) return NULL;
 
     for (i = 0; i < (s32) (sizeof(s_gevrScopes) / sizeof(s_gevrScopes[0])); i++)
     {
@@ -6114,7 +6653,7 @@ s32 gevrGripSteadyOn(void)
  */
 s32 gevrScopeZoomStick(void)
 {
-    return g_gevrStereo && g_CurrentPlayer != NULL && g_CurrentPlayer->insightaimmode
+    return g_gevrStereo && g_CurrentPlayer != NULL && g_CurrentPlayer->insightaimmode && !gevrTacticalSvdEnabled()
         && (getCurrentPlayerWeaponId(GUNRIGHT) == ITEM_SNIPERRIFLE
             || getCurrentPlayerWeaponId(GUNLEFT) == ITEM_SNIPERRIFLE);
 }
@@ -6300,6 +6839,9 @@ static s32 gevrScopeBeginHand(s32 hand)
     s32 on = FALSE;
     s32 item = g_CurrentPlayer != NULL ? getCurrentPlayerWeaponId(hand) : ITEM_UNARMED;
     const struct GevrScope *sc = gevrScopeFor(item);
+    /* The tactical AK has real modelled irons, not the base KF7's synthetic
+     * close-eye scope overlay. Keep the original behavior for other builds. */
+    if ((item == ITEM_AK47 || (item == ITEM_TACTICAL_AK74N && sysArgCheck("--tactical-variety"))) && sysArgCheck("--tactical-physical")) sc = NULL;
     f32 eye = 0.0f;
     s32 i;
 
@@ -10748,13 +11290,13 @@ void bondviewWatchAnimationTick(void)
      */
     if (gevrCoopActive())
     {
-        if (g_CurrentPlayer->watch_animation_state == WATCH_ANIMATION_0x5)
+        if (get_cur_playernum() == netGetLocalSlot()
+            && g_CurrentPlayer->watch_animation_state == WATCH_ANIMATION_0x5)
         {
             sub_GAME_7F0A6A80();
         }
-        lvlSetControlsLockedFlag(FALSE);
+        return;
     }
-    else
 #endif
     if (g_CurrentPlayer->watch_animation_state == WATCH_ANIMATION_0x5)
     {
@@ -12001,8 +12543,8 @@ void bondviewProcessInput(s8 stick_x, s8 stick_y, u16 buttons, u16 oldbuttons)
                 && g_CurrentPlayer->open_close_solo_watch_menu)
         )
 #ifdef GEVR
-        /* co-op (#94): the solo watch, not the deathmatch menu */
-        && gevrSoloRules())
+        /* The co-op watch belongs only to this controller. */
+        && gevrSoloRules() && (!gevrCoopActive() || get_cur_playernum() == netGetLocalSlot()))
 #else
         && (getPlayerCount() == 1))
 #endif
@@ -12582,6 +13124,12 @@ void bondviewProcessInput(s8 stick_x, s8 stick_y, u16 buttons, u16 oldbuttons)
             if (getCurrentPlayerWeaponId(GUNRIGHT) == ITEM_TANKSHELLS)
             {
                 spF4->unkD8 += get_ammo_in_hands_magazine(GUNRIGHT);
+#ifdef GEVR
+                if (gevrTacticalGadgetsEnabled()) {
+                    g_CurrentPlayer->hands[GUNRIGHT].weapon_ammo_in_magazine = 0;
+                    gevrTacticalReleaseGadget(GUNRIGHT);
+                } else
+#endif
                 autoadvance_on_deplete_all_ammo();
             }
 
@@ -12605,6 +13153,9 @@ void bondviewProcessInput(s8 stick_x, s8 stick_y, u16 buttons, u16 oldbuttons)
             && g_BondCanEnterTank
 #ifdef GEVR
             && !gevrCoopTankTaken(g_PlayerTankProp)
+            && (!gevrTacticalGadgetsEnabled()
+                || (gevrRomCars() && g_PlayerTankProp->obj->obj != PROP_TANK)
+                || gevrTacticalPrepareWatchItem(ITEM_TANKSHELLS))
 #endif
             )
         {
@@ -12616,6 +13167,14 @@ void bondviewProcessInput(s8 stick_x, s8 stick_y, u16 buttons, u16 oldbuttons)
             {
                 bondinvAddInvItem(ITEM_TANKSHELLS);
                 add_ammo_to_weapon(ITEM_TANKSHELLS, spEC->unkD8);
+                if (gevrTacticalGadgetsEnabled()) {
+                    currentPlayerUnEquipWeaponWrapper(GUNRIGHT, ITEM_TANKSHELLS);
+                    if (getCurrentPlayerWeaponId(GUNLEFT) != ITEM_UNARMED)
+                        currentPlayerUnEquipWeaponWrapper(GUNLEFT, ITEM_UNARMED);
+                    if (sysArgCheck("--tactical-sim") && sysArgCheck("--input-script"))
+                        sysLogPrintf(LOG_NOTE, "tactical sim: tank boarded with %d shells, item %d",
+                            get_ammo_count_for_weapon(ITEM_TANKSHELLS), getCurrentPlayerWeaponId(GUNRIGHT));
+                }
             }
 #else
             bondinvAddInvItem(ITEM_TANKSHELLS);
@@ -14048,6 +14607,11 @@ void MoveBond(s8 stick_x, s8 stick_y, u16 buttons, u16 oldbuttons)
     bondviewProcessInput(stick_x, stick_y, buttons, oldbuttons);
 
 #ifdef GEVR
+    if (g_PlayerIsInTank != 1) {
+        const f32 weight = gevrTacticalMoveScale();
+        g_CurrentPlayer->speedforwards *= weight;
+        g_CurrentPlayer->speedsideways *= weight;
+    }
     if (netIsActive() && get_cur_playernum() == netGetLocalSlot() &&
         (g_CurrentPlayer->mpmenuon ||
          /* co-op (#94): the watch is up and the mission goes on: this player stands */
@@ -16819,7 +17383,30 @@ static Gfx *gevrRenderWatchStatus(Gfx *gdl, const Mtxf *wrist)
  * the face at GEVR_WATCH_STATUS_UNITS a radius, its last the dial's centre */
 static Gfx *gevrRenderWatchStatusAt(Gfx *gdl, const Mtxf *transform)
 {
-    if (!g_gevrStereo || gevrWatchStatusChoice(VrWatchFaceStatus) == GEVR_WATCH_FACE_OFF
+    return g_gevrStereo ? gevrDrawWatchGauges(gdl, transform, FALSE) : gdl;
+}
+
+/* Use the pause watch's translucent green display over the live dial. */
+static Gfx *gevrDrawTacticalWatchPanel(Gfx *gdl, f32 scale)
+{
+    enum { WATCH_PANEL_SEGMENTS = 30, WATCH_PANEL_VERTICES = 19 };
+    struct WatchVertex *vertices = dynAllocate(WATCH_PANEL_VERTICES * sizeof(*vertices));
+    Gfx *panel = dynAllocate(48 * sizeof(*panel));
+    sub_GAME_7F0A33F8(vertices, WATCH_PANEL_SEGMENTS, .90f, TRUE);
+    for (s32 i = 0; i < WATCH_PANEL_VERTICES; ++i) {
+        struct coord16 *point = &vertices[i].coord1;
+        point->x = (s16)lroundf((point->x - 1) * scale);
+        point->y = (s16)lroundf(-point->z * scale);
+        point->z = 0;
+    }
+    draw_watch_background(panel, vertices, WATCH_PANEL_SEGMENTS, TRUE);
+    gSPDisplayList(gdl++, osVirtualToPhysical(panel));
+    return gdl;
+}
+
+static Gfx *gevrDrawWatchGauges(Gfx *gdl, const Mtxf *transform, s32 originalDial)
+{
+    if (gevrWatchStatusChoice(VrWatchFaceStatus) == GEVR_WATCH_FACE_OFF
         || gevrSpectating() || gevrCoopLocalDowned()) return gdl;
     struct player *player = g_CurrentPlayer;
     if (netIsActive()) {
@@ -16837,10 +17424,18 @@ static Gfx *gevrRenderWatchStatusAt(Gfx *gdl, const Mtxf *transform)
     hudMakeDamageSegments(v + 46, 46, 1, player->bondarmour);
     const f32 radarRadius = GEVR_WATCH_STATUS_UNITS * 0.64f;
     const s16 dotRadius = (s16)lroundf(GEVR_WATCH_STATUS_UNITS * 0.032f);
+    /* The pause watch maps native gauge positions into dial space at 1/4 size. */
+    const f32 dialScale = originalDial ? .25f * GEVR_WATCH_STATUS_UNITS / s_gevrWatchStatusRadius : 0.f;
     for (s32 i = 0; i < 92; i++) {
         f32 x, y;
-        gevrRadarGaugePoint(v[i].pos.x, v[i].pos.z, radarRadius,
-                           i < 46 ? 17.5f : -17.5f, &x, &y);
+        if (originalDial) {
+            /* Keep the source game's arcs centred on the watch pivot. */
+            x = (v[i].pos.x - 1) * dialScale;
+            y = v[i].pos.z * dialScale;
+        } else {
+            gevrRadarGaugePoint(v[i].pos.x, v[i].pos.z, radarRadius,
+                               i < 46 ? 17.5f : -17.5f, &x, &y);
+        }
         v[i].pos.x = (s16)lroundf(x);
         v[i].pos.y = (s16)lroundf(-y); /* gauge helper uses screen-down Y */
         v[i].pos.z = 0;
@@ -16856,6 +17451,7 @@ static Gfx *gevrRenderWatchStatusAt(Gfx *gdl, const Mtxf *transform)
     gDPSetRenderMode(gdl++, G_RM_AA_ZB_XLU_SURF, G_RM_AA_ZB_XLU_SURF2);
     gDPSetAlphaCompare(gdl++, G_AC_NONE);
     gDPSetCombineMode(gdl++, G_CC_SHADE, G_CC_SHADE);
+    if (originalDial) gdl = gevrDrawTacticalWatchPanel(gdl, dialScale);
     gSPDisplayList(gdl++, osVirtualToPhysical(health));
     gSPDisplayList(gdl++, osVirtualToPhysical(armor));
     GevrPauseRadarView radar;
@@ -18402,8 +18998,10 @@ static s32 gevrKeepAutoPick(s32 hand)
     return age < (u64) VrAutoSwitchKeepMs * 1000;
 }
 
+extern int gevrTacticalMode(void);
 void gevrCycleHandWeapon(s32 hand, s32 dir)
 {
+    if (gevrTacticalMode() && sysArgCheck("--tactical-physical")) return;
     if (gevrKeepAutoPick(hand)) return;
     gevrCycleHandWeaponInternal(hand, dir, FALSE);
 }
@@ -18411,6 +19009,7 @@ void gevrCycleHandWeapon(s32 hand, s32 dir)
 void gevrAutoAdvanceHand(s32 hand)
 {
     s32 item;
+    if (gevrTacticalMode() && sysArgCheck("--tactical-physical")) return;
     if (!g_gevrStereo || !g_CurrentPlayer || (hand != GUNRIGHT && hand != GUNLEFT)
         || gevrSpectating() || g_CurrentPlayer->bonddead
         || (netIsActive() && get_cur_playernum() != netGetLocalSlot())
@@ -18468,6 +19067,7 @@ void gevrAutoAdvanceHand(s32 hand)
  */
 #include "gevr_grip_gesture.h"
 #include "gevr_pull.h"
+#include "gevr_tactical_rig_bounds.h"
 
 extern int VrGestureGripUse, VrGestureMineGrab;
 extern int VrForcePull;   /* force pull (gevr_forcepull.c) */
@@ -18489,6 +19089,12 @@ static f32 s_gevrGestureTune[GEVR_GT_COUNT] = {
 
 static s32 s_gevrGripGesture[2];   /* per controller: 0 idle, 1 a press to decide, 2 taken until let go, 3 aims */
 static s32 s_gevrGripPendAge[2];
+static s32 gevrPhysicalGripInput(s32 ctrl, s32 pressed, s32 held);
+static s32 gevrPhysicalPickupAllowed(s32 ctrl, s32 item);
+static void gevrPhysicalTakeBlade(s32 hand, s32 item);
+static int gevrPhysicalPrimaryAssigned(s32 hand, s32 item);
+static s32 gevrPhysicalTryDrawPistol(s32 ctrl, const f32 at[3]);
+s32 gevrTacticalHeldMagController(void);
 #define GEVR_GRIP_PEND_POLLS 30   /* pad reads, about half a second */
 
 void gevrGripGestureInput(s32 ctrl, s32 pressed, s32 held)
@@ -18498,6 +19104,20 @@ void gevrGripGestureInput(s32 ctrl, s32 pressed, s32 held)
     if (ctrl < 0 || ctrl > 1)
     {
         return;
+    }
+    if (gevrPhysicalGripInput(ctrl, pressed, held)) {
+        s_gevrGripGesture[ctrl] = held ? 2 : 0;
+        return;
+    }
+    if (pressed && gevrTacticalLeftWeaponGrip(ctrl) && gevrTwoHandGunCandidate() == ctrl) {
+        const s32 item = getCurrentPlayerWeaponId(ctrl);
+        if (gevrStereoTwoHandItem(item)) {
+            s_tacticalLeftSupportPress = item;
+            if (s_gevrTwoHand && s_gevrTwoHandGun == ctrl) {
+                s_gevrGripGesture[ctrl] = 2;
+                return;
+            }
+        }
     }
     gevrPullGripInput(ctrl, held);
     if (!held)
@@ -18624,6 +19244,16 @@ static s32 gevrHandOnBody(s32 ctrl, const f32 at[3], f32 *dropOut, f32 *sideOut,
 /* a gun just picked up goes into the hand that took it, where the rules allow */
 static void gevrGripEquip(s32 hand, s32 item)
 {
+    if (gevrPhysicalPrimaryAssigned(hand, item)) {
+        gunRequestHandWeaponChange(hand, item, 1);
+        return;
+    }
+    if (sysArgCheck("--tactical-physical") && ((item == ITEM_KNIFE && gevrTacticalKnifeEnabled())
+        || (item == ITEM_TACTICAL_KATANA && gevrTacticalKatanaEnabled()))) {
+        gevrPhysicalTakeBlade(hand, item);
+        return;
+    }
+    if (item == ITEM_THROWKNIFE && gevrTacticalKnifeEnabled()) return;
     if (!((GEVR_ITEM_AS(item) >= ITEM_WPPK && GEVR_ITEM_AS(item) <= ITEM_ROCKETLAUNCH && GEVR_ITEM_AS(item) != ITEM_WATCHLASER) || item == ITEM_KNIFE)
         || !gevrLeftHasGun(item))
     {
@@ -18649,6 +19279,19 @@ static s32 gevrHordeGripWorld(const f32 p[3], coord3d *world)
     return TRUE;
 }
 
+static PropRecord *gevrPhysicalContactPickup(const f32 wrist[3], const f32 tip[3], f32 cm)
+{
+    PropRecord *prop = gevrHandFindProp(tip, s_gevrGestureTune[GEVR_GT_PICKUP] * cm, GEVR_HAND_PICKUP_CONTACT);
+    if (prop) return prop;
+    Mtxf *view = currentPlayerGetViewToWorldMtxf();
+    if (view && view->m[2][1] > .55f) {
+        const f32 down = ((wrist[0] - tip[0]) * view->m[0][1] + (wrist[1] - tip[1]) * view->m[1][1]
+            + (wrist[2] - tip[2]) * view->m[2][1]) / cm;
+        if (down > 3.f) return gevrHandFindProp(tip, .8f * s_gevrGestureTune[GEVR_GT_PICKUP] * cm, GEVR_HAND_PICKUP);
+    }
+    return NULL;
+}
+
 s32 gevrPullHandFree(s32 ctrl);
 extern s32 gevrPullGrab(s32 ctrl, PropRecord *prop);   /* gevr_forcepull.c */
 
@@ -18660,6 +19303,8 @@ static s32 gevrGripGestureTry(s32 ctrl)
     s32 hand = ctrl ? GUNRIGHT : GUNLEFT;
     f32 cm = GEVR_UNITS_PER_METRE * D_800364CC / 100.0f;
     f32 at[3], right[3], up[3], back[3], p[3];
+    f32 pickupPoint[3];
+    const s32 physical = sysArgCheck("--tactical-physical") && gevrTacticalMode();
     PropRecord *prop;
     s32 done = -1;
     s32 item;
@@ -18719,6 +19364,11 @@ static s32 gevrGripGestureTry(s32 ctrl)
     {
         p[i] = at[i] - back[i] * GEVR_GESTURE_FINGERS_CM * cm;
     }
+    if (physical)
+        gevrTacticalFingertip(at, right, up, back, cm, gevrGunSizeFactor(),
+            (VrLeftHandedMode != 0) != (ctrl == 0), pickupPoint);
+    else
+        memcpy(pickupPoint, p, sizeof(pickupPoint));
     {
         coord3d world;
         if (gevrDamBoatTryHand(p) || (gevrHordeGripWorld(p,&world) && gevrHordeOnGrip(ctrl,world.f)))
@@ -18751,18 +19401,33 @@ static s32 gevrGripGestureTry(s32 ctrl)
         }
         s_gevrGripGrabbing = FALSE;
     }
-    if (done < 0
-        && (prop = gevrHandFindProp(p, s_gevrGestureTune[GEVR_GT_PICKUP] * cm, GEVR_HAND_PICKUP)) != NULL)
+    prop = NULL;
+    if (done < 0 && physical)
+    {
+        /* A loose item within reach takes precedence over the hip. Only use
+         * the seated projection first when both head and fingers point down. */
+        prop = gevrPhysicalContactPickup(at, pickupPoint, cm);
+        if (!prop && gevrPhysicalTryDrawPistol(ctrl, at)) return TRUE;
+    }
+    if (done < 0 && (prop || (prop = gevrHandFindProp(pickupPoint,
+        s_gevrGestureTune[GEVR_GT_PICKUP] * cm, GEVR_HAND_PICKUP)) != NULL))
     {
         s32 got = prop->type == PROP_TYPE_WEAPON && prop->weapon != NULL ? prop->weapon->weaponnum : -1;
 
+        if (physical && !gevrPhysicalPickupAllowed(ctrl, got)) {
+            sysLogPrintf(LOG_NOTE, "tactical: pickup of item %d blocked for hand %d", got, hand);
+            return TRUE;
+        }
+
+        if (physical && gevrTacticalLootClaimProp(prop, ctrl)) return TRUE;
+
         s_gevrGripGrabbing = TRUE;
-        if (gevrHandPickup(prop, FALSE))
+        if (gevrHandPickupIntoHand(prop, ctrl))
         {
             done = 2;
             gevrGripEquip(hand, got);
         }
-        else if (got >= 0 && gevrLeftHasGun(got))
+        else if (!sysArgCheck("--tactical-physical") && got >= 0 && gevrLeftHasGun(got))
         {
             /* the game leaves it (full ammo, the pair already carried), as walking
              * over it does; the hand still takes the gun the player carries */
@@ -18974,12 +19639,14 @@ s32 gevrPullHandRay(s32 ctrl, f32 p[3], f32 f[3])
 }
 
 /* collected as Grip to hand collects (the walk-over auto-equip held back: the pull picks the hand) */
-s32 gevrPullCollect(PropRecord *prop)
+s32 gevrPullCollect(PropRecord *prop, s32 ctrl)
 {
+    const s32 item = prop && prop->type == PROP_TYPE_WEAPON && prop->weapon ? prop->weapon->weaponnum : ITEM_NOTHING;
+    if (!gevrPhysicalPickupAllowed(ctrl, item)) return FALSE;
     s32 got;
 
     s_gevrGripGrabbing = TRUE;
-    got = gevrHandPickup(prop, FALSE);
+    got = gevrHandPickupIntoHand(prop, ctrl);
     s_gevrGripGrabbing = FALSE;
     return got;
 }
@@ -18996,6 +19663,11 @@ s32 gevrPullEquip(s32 ctrl, s32 item)
     s32 hand = ctrl ? GUNRIGHT : GUNLEFT;
     s32 pulling, chosen;
 
+    if (gevrPhysicalPrimaryAssigned(hand, item)) {
+        g_gevrSwitchInstant[hand] = 1;
+        gunRequestHandWeaponChange(hand, item, 1);
+        return hand;
+    }
     if (!((GEVR_ITEM_AS(item) >= ITEM_WPPK && GEVR_ITEM_AS(item) <= ITEM_ROCKETLAUNCH && GEVR_ITEM_AS(item) != ITEM_WATCHLASER) || item == ITEM_KNIFE)
         || !gevrLeftHasGun(item))
     {
@@ -19050,12 +19722,2275 @@ extern float VrReloadGrab[2][3], VrReloadBelt[3], VrGexHeldMag[3];   /* vr_setti
 extern float VrBeanReloadGrab[3];   /* and Bean's models' grab */
 
 extern int VrManualReloading;
-/* Hand reload needs a model set with magazines to take out (user): GoldenEye
- * X's, whose reloads are its magazines and hands, or with GE-X off Bean's, cut
- * from its guns (gevr_beanmag.h; user, 2026-11-18). The setting is kept; with
- * neither set the game reloads itself. */
+#define GEVR_TACTICAL_RIG_DROP_CM 43.0f
+#define GEVR_TACTICAL_RIG_AHEAD_CM 4.0f
+#define GEVR_TACTICAL_RIG_GRAB_RADIUS_CM 8.0f
+#define GEVR_TACTICAL_RIG_SURFACE_CM 2.5f
+#define GEVR_TACTICAL_HIP_DROP_CM 55.0f
+#define GEVR_TACTICAL_HIP_SIDE_CM 20.0f
+static const f32 s_tacticalKnifeFit[3] = {78.f, 25.f, 2.f};
+static s32 s_tacticalKnifeHand = -1;
+static s32 s_tacticalKatanaHand = -1;
+static s32 s_tacticalKatanaNearTick = -1;
+
+static s32 gevrKatanaShoulderReach(s32 ctrl, const f32 at[3])
+{
+    extern int gevrBodyReloadLocal(int ctrl, const float at[3], float out[3]);
+    f32 local[3];
+    const int side = ((ctrl == 0) != (VrLeftHandedMode != 0)) ? -1 : 1;
+    return gevrBodyReloadLocal(ctrl, at, local) && gevrTacticalKatanaAtMount(local, side);
+}
+
+static void gevrPhysicalTakeBlade(s32 hand, s32 item)
+{
+    s32 *gripped = item == ITEM_TACTICAL_KATANA ? &s_tacticalKatanaHand : &s_tacticalKnifeHand;
+    if (item == ITEM_TACTICAL_KATANA) s_tacticalKatanaNearTick = -1;
+    *gripped = hand;
+    gunRequestHandWeaponChange(hand, item, TRUE);
+}
+static const f32 s_tacticalRigSide[5] = { -10, 0, 10, -24, 24 };
+static TacticalSession s_tactical;
+static s32 s_tacticalStarted, s_tacticalModemPrepared, s_tacticalTestStereoOff;
+static s32 s_tacticalClaim;
+static s32 s_tacticalReleaseWas;
+/* Inventory has one loose magazine transaction at a time. The controller
+ * that took it keeps ownership across weapon and support-hand changes. */
+static s32 s_tacticalMagCtrl = -1;
+static s32 s_tacticalMagNeedsRegrip;
+static s32 s_tacticalTriggerWas[2], s_tacticalTriggerPressed[2];
+static f32 s_tacticalActionCm;
+static s32 s_tacticalActionAsset = -1;
+static struct TacticalShotMotion {
+    s32 item, tick, duration;
+} s_tacticalShotMotion[2];
+static s32 s_tacticalActionCtrl = -1;
+static f32 s_tacticalActionBasis[3][3];
+typedef struct GevrWorldMagazine {
+    TacticalMagazine mag;
+    coord3d pos;
+    uint32_t netId;
+    f32 speed, ground, vx, vz, clearance;
+    int falling, flat, magnetThrough;
+} GevrWorldMagazine;
+static GevrWorldMagazine s_tacticalWorldMags[GEVR_WORLD_MAGAZINE_CAPACITY];
+typedef struct GevrNativeMagazineState {
+    s32 rounds, missing;
+} GevrNativeMagazineState;
+typedef struct GevrPhysicalRifle {
+    s32 item, build, fireMode;
+    TacticalStoredGun gun;
+    GevrNativeMagazineState native;
+} GevrPhysicalRifle;
+static struct {
+    PropRecord *prop;
+    TacticalStoredGun gun;
+    GevrNativeMagazineState native;
+    s32 item, build, fireMode;
+    uint32_t netId;
+} s_physicalRifles[MAX_WEAPON_SLOTS];
+static struct GuardIssuedWeapon {
+    PropRecord *prop;
+    WeaponObjRecord *weapon;
+    int item, build;
+    TacticalMagazine magazine;
+} s_issuedGuardWeapons[512];
+static int s_issuedGuardCount;
+
+static int gevrGuardIssueValid(const struct GuardIssuedWeapon *issued)
+{
+    return issued->prop && issued->prop->type == PROP_TYPE_WEAPON
+        && issued->prop->weapon == issued->weapon && issued->weapon->weaponnum == issued->item;
+}
+
+static struct GuardIssuedWeapon *gevrGuardIssue(const PropRecord *prop)
+{
+    if (!prop) return NULL;
+    for (int i = 0; i < s_issuedGuardCount; ++i) {
+        struct GuardIssuedWeapon *issued = &s_issuedGuardWeapons[i];
+        if (issued->prop == prop && gevrGuardIssueValid(issued)) return issued;
+    }
+    return NULL;
+}
+
+void gevrTacticalGuardIssueReset(void)
+{
+    s_issuedGuardCount = 0;
+}
+
+void gevrTacticalForgetIssuedGear(const PropRecord *prop)
+{
+    if (prop->type == PROP_TYPE_WEAPON) {
+        for (int i = 0; i < s_issuedGuardCount; ++i)
+            if (s_issuedGuardWeapons[i].prop == prop) {
+                s_issuedGuardWeapons[i] = s_issuedGuardWeapons[--s_issuedGuardCount];
+                break;
+            }
+        for (int i = 0; i < (int)ARRAYCOUNT(s_physicalRifles); ++i)
+            if (s_physicalRifles[i].prop == prop) {
+                s_physicalRifles[i].prop = NULL;
+                s_physicalRifles[i].netId = 0;
+                break;
+            }
+    } else if (prop->type == PROP_TYPE_OBJ && prop->obj && prop->obj->type == PROPDEF_HAT) {
+        gevrTacticalHelmetForget(prop->obj);
+    }
+}
+
+void gevrTacticalGuardIssueBuild(PropRecord *prop, int build)
+{
+    const GevrGearAssembly *assembly = gevrTacticalGearDeployedAssembly(build);
+    if (!assembly || !prop || !prop->weapon) return;
+    const int item = prop->weapon->weaponnum;
+    const int gun = gevrTacticalItem(item);
+    if (gun < 0) return;
+    const GevrGearMount *mount = gevrTacticalGearFindMount(assembly, "mod_magazine");
+    const GevrGearPart *part = mount ? gevrTacticalGearPart(mount->part) : NULL;
+    const int ppk = sysArgCheck("--tactical-ppk");
+    const unsigned capacity = part && part->capacity > 0 ? part->capacity : tacticalGunCapacity(gun, ppk);
+    const int loaded = capacity && (!mount || mount->part >= 0);
+
+    struct GuardIssuedWeapon *slot = gevrGuardIssue(prop);
+    if (!slot) {
+        for (int i = 0; i < s_issuedGuardCount; ++i)
+            if (!gevrGuardIssueValid(&s_issuedGuardWeapons[i])) { slot = &s_issuedGuardWeapons[i]; break; }
+        if (!slot && s_issuedGuardCount < (int)ARRAYCOUNT(s_issuedGuardWeapons))
+            slot = &s_issuedGuardWeapons[s_issuedGuardCount++];
+    }
+    if (!slot) return;
+    *slot = (struct GuardIssuedWeapon){.prop = prop, .weapon = prop->weapon, .item = item, .build = build};
+    if (loaded) slot->magazine = (TacticalMagazine){
+        .id = UINT32_MAX, .type = tacticalGunMagazineType(gun, ppk ? 4u : 2u),
+        .capacity = capacity, .rounds = capacity - 1,
+        .mag_class = tacticalGunIsPistol(gun) ? TACTICAL_MAG_PISTOL : TACTICAL_MAG_PRIMARY,
+        .gear_part = part && part->capacity > 0 ? (unsigned)mount->part + 1 : 0,
+    };
+    sysLogPrintf(LOG_NOTE, "tactical guard: issued build %d for item %d, %d parts, %u round magazine, suppressed %d",
+        build, item, assembly->count - 1, slot->magazine.capacity, gevrTacticalGearAssemblySuppressed(assembly));
+}
+
+void gevrTacticalGuardIssueM4(PropRecord *prop)
+{
+    gevrTacticalGuardIssueBuild(prop, GEVR_GEAR_JANUS_M4);
+}
+
+void gevrTacticalGuardCopyBuild(PropRecord *target, const PropRecord *source)
+{
+    const struct GuardIssuedWeapon *issued = gevrGuardIssue(source);
+    if (issued && target && target->weapon && issued->item == target->weapon->weaponnum)
+        gevrTacticalGuardIssueBuild(target, issued->build);
+}
+
+int gevrTacticalGuardIssuedBuild(const PropRecord *prop)
+{
+    const struct GuardIssuedWeapon *issued = gevrGuardIssue(prop);
+    return issued ? issued->build : -1;
+}
+
+const TacticalMagazine *gevrTacticalGuardMagazine(const PropRecord *prop)
+{
+    const struct GuardIssuedWeapon *issued = gevrGuardIssue(prop);
+    return issued && issued->magazine.capacity ? &issued->magazine : NULL;
+}
+
+int gevrTacticalGuardWeaponSuppressed(const PropRecord *prop)
+{
+    const struct GuardIssuedWeapon *issued = gevrGuardIssue(prop);
+    return issued && gevrTacticalGearAssemblySuppressed(gevrTacticalGearDeployedAssembly(issued->build));
+}
+static struct { s32 item, build, fireMode; TacticalStoredGun gun; } s_physicalPistols[2];
+static GevrPhysicalRifle s_physicalShoulder;
+static s32 s_physicalPrimary[2], s_physicalGunGrip[2], s_physicalLeaving[2];
+static s32 s_physicalFreshPrimary, s_physicalFreshPistol;
+static struct {
+    GevrNativeMagazineState magazine;
+    s32 item;
+    u32 at;
+} s_nativePending[2] = {{.item = ITEM_NOTHING}, {.item = ITEM_NOTHING}};
+static GevrNativeMagazineState gevrTacticalReadNativeMagazine(s32 hand);
+static s32 s_gearMissionActive, s_carriedPrimaryBuild[2] = {-1, -1}, s_carriedPistolBuild = -1;
+static s32 s_leftPrimaryKind = -1;
+static TacticalInteraction s_leftPrimaryInteraction;
+static s32 s_focusedOptic = -1;
+static u32 s_focusedOpticFrame;
+static s32 s_physicalSimGrip;
+static struct TacticalFireHand {
+    s32 item, mode;
+    GevrFireClock clock;
+} s_tacticalFireHand[2];
+static struct TacticalStatsCache {
+    const GevrGearAssembly *assembly;
+    unsigned revision;
+    int key, valid;
+    GevrWeaponStats stats;
+} s_tacticalStatsCache[2];
+static struct {
+    s32 item, build;
+    float mass;
+} s_tacticalStowedMass[3];
+static s32 s_tacticalFireNoticeHand, s_tacticalFireNoticeUntil;
+
+static void gevrTacticalRestoreFireMode(s32 hand, s32 item, s32 mode)
+{
+    s_tacticalFireHand[hand] = (struct TacticalFireHand){.item = item, .mode = mode};
+}
+
+static void gevrTacticalTick(void);
+int gevrTacticalAk74ModelHeader(ModelFileHeader *header)
+{
+    extern ModelFileHeader tacticalak74n_header;
+    if (header == &tacticalak74n_header) return TRUE;
+    if (g_CurrentPlayer) for (int hand=0; hand<2; hand++)
+        if (header == &g_CurrentPlayer->copy_of_body_obj_header[hand]
+            && g_CurrentPlayer->field_2A44[hand] == ITEM_TACTICAL_AK74N) return TRUE;
+    return FALSE;
+}
+int gevrTacticalItem(int item)
+{
+    if (gevrTacticalExpandedEnabled()) {
+        switch (item) {
+#define TACTICAL_EXPANDED(id, group, native, gun, prop, capacity, cadence, name) \
+        case ITEM_TACTICAL_##id: \
+            return gevrTacticalGearBuildAvailable(gevrTacticalGearKey(TACTICAL_GUN_##id)) \
+                ? TACTICAL_GUN_##id : -1;
+#include "gevr_tactical_expanded.inc.h"
+#undef TACTICAL_EXPANDED
+        default: break;
+        }
+    }
+    if (item == ITEM_AK47) return TACTICAL_GUN_AK;
+    if (item == ITEM_TACTICAL_AK74N && sysArgCheck("--tactical-variety")) return TACTICAL_GUN_AK74N;
+    if (item == ITEM_TT33 && sysArgCheck("--tactical-variety")) return TACTICAL_GUN_MAKAROV;
+    if (item == ITEM_WPPK || item == ITEM_WPPKSIL) return TACTICAL_GUN_USP;
+    if (item == ITEM_SPECTRE) return TACTICAL_GUN_MP5;
+    if (item == ITEM_MP5K) return TACTICAL_GUN_MP5K;
+    if (item == ITEM_SKORPION && gevrTacticalSkorpionEnabled()) return TACTICAL_GUN_SKORPION;
+    if (item == ITEM_SNIPERRIFLE && gevrTacticalSvdEnabled()) return TACTICAL_GUN_SVD;
+    if (item == ITEM_ROCKETLAUNCH && gevrTacticalRpgEnabled()) return TACTICAL_GUN_RPG;
+    return -1;
+}
+int gevrTacticalUnmirroredItem(int item)
+{
+    return sysArgCheck("--tactical-mesh") && gevrTacticalCampaignRules()
+        && (gevrTacticalItem(item) >= 0
+            || ((item == ITEM_KNIFE || item == ITEM_THROWKNIFE) && gevrTacticalKnifeEnabled()));
+}
+static int gevrTacticalIsPistol(int gun) { return tacticalGunIsPistol(gun); }
+static int gevrTacticalIsAk(int gun) { return gun == TACTICAL_GUN_AK || gun == TACTICAL_GUN_AK74N; }
+static int gevrTacticalIsLongGun(int gun) { return gun >= 0 && !gevrTacticalIsPistol(gun); }
+int gevrTacticalNativeRifle(int item)
+{
+    return sysArgCheck("--tactical-campaign-gear") && gevrTacticalNativeMagazineGun(item) >= 0;
+}
+static int gevrTacticalLongItem(int item)
+{
+    return gevrTacticalNativeRifle(item) || gevrTacticalIsLongGun(gevrTacticalItem(item));
+}
+static int gevrPhysicalPrimaryAssigned(s32 hand, s32 item)
+{
+    return item > ITEM_UNARMED && s_physicalPrimary[hand] == item;
+}
+static s32 *gevrTacticalCarriedBuild(int kind, s32 hand)
+{
+    return gevrTacticalIsPistol(kind) ? &s_carriedPistolBuild : &s_carriedPrimaryBuild[hand];
+}
+
+static int gevrTacticalHandWell(int kind, s32 hand)
+{
+    if (gevrTacticalIsPistol(kind)) return TACTICAL_RIGHT_PISTOL_WELL;
+    return hand == GUNLEFT && sysArgCheck("--tactical-physical") ? TACTICAL_LEFT_PRIMARY_WELL : TACTICAL_PRIMARY_WELL;
+}
+
+static int gevrTacticalHandLoadedKind(int kind, s32 hand)
+{
+    const int well = gevrTacticalHandWell(kind, hand);
+    return well == TACTICAL_LEFT_PRIMARY_WELL ? s_leftPrimaryKind : s_tactical.active[gevrTacticalIsPistol(kind)];
+}
+
+static TacticalInteraction *gevrTacticalHandInteraction(int kind, s32 hand)
+{
+    return gevrTacticalHandWell(kind, hand) == TACTICAL_LEFT_PRIMARY_WELL
+        ? &s_leftPrimaryInteraction : &s_tactical.interaction[kind];
+}
+
+static unsigned gevrTacticalHandRounds(int well)
+{
+    return s_tactical.inv.slots[well].rounds + s_tactical.inv.chambered[well];
+}
+
+static int gevrTacticalHandInteract(int kind, s32 hand, const TacticalInteractionInput *in,
+    TacticalMagazine *dropped, unsigned int *ejected, unsigned int *shown)
+{
+    return tacticalSessionInteractAtWell(&s_tactical, kind, gevrTacticalHandInteraction(kind, hand),
+        in, dropped, ejected, shown);
+}
+static PROP gevrTacticalDroppedProp(int item)
+{
+    switch (item) {
+        case ITEM_AK47: return PROP_CHRKALASH;
+        case ITEM_TACTICAL_AK74N: return PROP_TACTICAL_AK74N;
+#define TACTICAL_EXPANDED(id, group, native, gun, prop, capacity, cadence, name) \
+        case ITEM_TACTICAL_##id: return PROP_TACTICAL_##id;
+#include "gevr_tactical_expanded.inc.h"
+#undef TACTICAL_EXPANDED
+        case ITEM_SPECTRE: return PROP_CHRSPECTRE;
+        case ITEM_MP5K: return PROP_CHRMP5K;
+        case ITEM_SKORPION: return PROP_CHRSKORPION;
+        case ITEM_M16: return PROP_CHRM16;
+        case ITEM_UZI: return PROP_CHRUZI;
+        case ITEM_FNP90: return PROP_CHRFNP90;
+        case ITEM_MP5KSIL: return PROP_CHRMP5KSIL;
+        case ITEM_SNIPERRIFLE: return PROP_CHRSNIPERRIFLE;
+        case ITEM_ROCKETLAUNCH: return PROP_CHRROCKETLAUNCH;
+        case ITEM_TT33: return PROP_CHRTT33;
+        case ITEM_WPPKSIL: return PROP_CHRWPPKSIL;
+        default: return PROP_CHRWPPK;
+    }
+}
+static unsigned int gevrTacticalCapacity(int gun)
+{
+    return tacticalGunCapacity(gun, sysArgCheck("--tactical-ppk"));
+}
+static int gevrTacticalSoundBase(int kind)
+{
+    if (!sysArgCheck("--tactical-physical")) return -1;
+    if (gevrTacticalIsAk(kind) || kind == TACTICAL_GUN_SVD || kind == TACTICAL_GUN_PKM || tacticalGunIsAr(kind)) return 0;
+    if (gevrTacticalIsPistol(kind) && sysArgCheck("--tactical-ppk")) return 4;
+    if (kind == TACTICAL_GUN_SKORPION || tacticalGunIsExpanded(kind)) return TACT_AUDIO_SKORPION_BASE;
+    return -1;
+}
+static void gevrTacticalSoundEvent(int kind, s32 hand, int event, unsigned int beforeWell)
+{
+    int base = gevrTacticalSoundBase(kind);
+    int well = gevrTacticalHandWell(kind, hand);
+    if (base < 0) return;
+    if (event == TACTICAL_EVENT_MAG_TAKEN && beforeWell && !s_tactical.inv.slots[well].id)
+        audioTacticalPlay(base);
+    else if (event == TACTICAL_EVENT_MAG_SEATED) audioTacticalPlay(base + 1);
+    else if (event == TACTICAL_EVENT_RACKED) audioTacticalPlay(base + 2);
+}
+static const char *gevrTacticalGunName(int gun)
+{
+    static const char *names[] = {
+        "AK", "USP", "MP5", "MP5K", "AK-74N", "Makarov", "Skorpion vz. 61", "SVD Dragunov",
+        [TACTICAL_GUN_RPG] = "RPG-7V2",
+#define TACTICAL_EXPANDED(id, group, native, model, prop, capacity, cadence, name) [TACTICAL_GUN_##id] = name,
+#include "gevr_tactical_expanded.inc.h"
+#undef TACTICAL_EXPANDED
+    };
+    if (gun == TACTICAL_GUN_USP && sysArgCheck("--tactical-ppk")) return "PPK";
+    return gun >= 0 && gun < TACTICAL_GUN_COUNT ? names[gun] : "unknown";
+}
+int gevrTacticalMode(void)
+{
+    return sysArgCheck("--tactical-interactions")
+        && (g_gevrStereo || (sysArgCheck("--tactical-sim") && sysArgCheck("--input-script") && !s_tacticalTestStereoOff)) && g_CurrentPlayer
+        && gevrTacticalLocalPlayer();
+}
+
+s32 gevrTacticalGadgetsEnabled(void)
+{
+    /* The tactical session remains active while the pause watch is open. */
+    return s_tacticalStarted && sysArgCheck("--tactical-interactions") && sysArgCheck("--tactical-physical")
+        && g_CurrentPlayer && gevrTacticalLocalPlayer();
+}
+
+s32 gevrTacticalHandheldDetonator(s32 item)
+{
+    return !g_gevrStereo && item == ITEM_TRIGGER && gevrTacticalGadgetsEnabled();
+}
+
+s32 gevrTacticalGuidedThrow(s32 item)
+{
+    switch (item) {
+    case ITEM_BUG:
+    case ITEM_REMOTEMINE:
+    case ITEM_TIMEDMINE:
+    case ITEM_PROXIMITYMINE:
+    case ITEM_PLASTIQUE:
+    case ITEM_BOMBCASE:
+    case ITEM_MICROCAMERA:
+    case ITEM_GOLDENEYEKEY:
+        return gevrTacticalGadgetsEnabled();
+    default:
+        return FALSE;
+    }
+}
+
+static s32 gevrTacticalHandEmpty(s32 ctrl)
+{
+    const s32 hand = ctrl ? GUNRIGHT : GUNLEFT;
+    const s32 item = getCurrentPlayerWeaponId(hand);
+    const struct hand *state = &g_CurrentPlayer->hands[hand];
+    if (item != ITEM_FIST && item != ITEM_UNARMED) return FALSE;
+    return !state->weapon_animation_trigger || state->weapon_next_weapon == ITEM_FIST
+        || state->weapon_next_weapon == ITEM_UNARMED;
+}
+
+s32 gevrTacticalHeldMagController(void)
+{
+    if (!gevrTacticalMode() || !s_tacticalStarted || !s_tactical.inv.slots[TACTICAL_LEFT_HAND].id)
+        return -1;
+    return s_tacticalMagCtrl >= 0 ? s_tacticalMagCtrl : gevrReloadSupportGun();
+}
+
+static s32 gevrPhysicalDrawPistolAt(s32 ctrl, const f32 local[3])
+{
+    const s32 hand = ctrl ? GUNRIGHT : GUNLEFT;
+    const f32 bodySide = ((ctrl == 0) != (VrLeftHandedMode != 0)) ? -local[1] : local[1];
+    const int hip = bodySide < 0 ? 0 : 1;
+    const f32 down = (local[0] - GEVR_TACTICAL_HIP_DROP_CM) / 14.f;
+    const f32 side = (fabsf(bodySide) - GEVR_TACTICAL_HIP_SIDE_CM) / 13.f;
+    const f32 forward = local[2] / 11.f;
+    const s32 draw = s_physicalPistols[hip].item;
+    if (!draw || s_physicalLeaving[hand] || !gevrTacticalHandEmpty(ctrl)
+        || gevrTacticalHeldMagController() == ctrl || down*down + side*side + forward*forward > 1.f)
+        return FALSE;
+
+    const int kind = gevrTacticalItem(draw);
+    s_tactical.stored[kind] = s_physicalPistols[hip].gun;
+    s_tactical.initialized[kind] = TRUE;
+    s_carriedPistolBuild = s_physicalPistols[hip].build;
+    gevrTacticalRestoreFireMode(hand, draw, s_physicalPistols[hip].fireMode);
+    s_physicalPistols[hip].item = 0;
+    bondinvAddInvItem(draw);
+    s_physicalGunGrip[ctrl] = TRUE;
+    gunRequestHandWeaponChange(hand, draw, 1);
+    sysLogPrintf(LOG_NOTE, "tactical: drew pistol %d from hip %d", draw, hip);
+    return TRUE;
+}
+
+static s32 gevrPhysicalTryDrawPistol(s32 ctrl, const f32 at[3])
+{
+    extern int gevrBodyReloadLocal(int ctrl, const float at[3], float out[3]);
+    f32 local[3];
+    return s_tacticalStarted && gevrBodyReloadLocal(ctrl, at, local)
+        && gevrPhysicalDrawPistolAt(ctrl, local);
+}
+
+static s32 s_tacticalDecoderHand = -1;
+static s32 s_tacticalDecoderStarted;
+static s32 s_tacticalGadgetTriggerWas[2];
+static s32 s_tacticalWatchReleaseAt;
+static s32 s_tacticalMineTriggerUsed[2];
+static s32 s_tacticalTestGadgetTrigger = -1;
+
+static DoorRecord *gevrTacticalFacilityDecoderDoor(void)
+{
+    if (bossGetStageNum() != LEVELID_FACILITY) return NULL;
+    /* Facility's native decoder AI list (0x1007) uses this tagged lock. */
+    ObjectRecord *obj = objFindByTagId(0x26);
+    return obj && obj->prop && obj->prop->type == PROP_TYPE_DOOR ? obj->prop->door : NULL;
+}
+
+static bool gevrTacticalIsDecoderDoor(const DoorRecord *decoder, const DoorRecord *target)
+{
+    return decoder && (target == decoder || target == decoder->linkedDoor);
+}
+
+/* Score the actual moving door bounds along the gadget's pointing direction.
+ * A close touch also works when the controller points down or to the side. */
+static f32 gevrTacticalDoorReach(PropRecord *prop, const f32 tip[3], const f32 back[3], f32 cm)
+{
+    extern f32 gevrHandPropDistance(PropRecord *prop, const f32 p[3]);
+    f32 touch = gevrHandPropDistance(prop, tip) / cm;
+    if (touch <= 23.f) return touch;
+    for (int reach = 8; reach <= 64; reach += 8) {
+        f32 point[3];
+        for (int i = 0; i < 3; ++i) point[i] = tip[i] - reach * cm * back[i];
+        if (gevrHandPropDistance(prop, point) <= 8.f * cm) return 23.f + reach;
+    }
+    return INFINITY;
+}
+
+static DoorRecord *gevrTacticalFacilityDoorTarget(GUNHAND hand, s32 item, DoorRecord *decoder)
+{
+    if (g_gevrStereo) {
+        const s32 ctrl = hand == GUNRIGHT ? 1 : 0;
+        f32 wrist[3], right[3], up[3], back[3], tip[3];
+        const f32 cm = GEVR_UNITS_PER_METRE * D_800364CC / 100.f;
+        if (cm > 1e-6f && gevrVrGripTracked(ctrl) && gevrGripAxesRaw(ctrl, wrist, right, up, back)) {
+            gevrTacticalFingertip(wrist, right, up, back, cm, gevrGunSizeFactor(),
+                (VrLeftHandedMode != 0) != (ctrl == 0), tip);
+            DoorRecord *best = NULL;
+            f32 bestScore = INFINITY;
+            for (PropRecord **pp = g_OnScreenPropList; pp < g_LastOnScreenProp; ++pp) {
+                PropRecord *p = *pp;
+                if (!p || p->type != PROP_TYPE_DOOR) continue;
+                DoorRecord *door = p->door;
+                if (door->flags & PROPFLAG_CANNOT_ACTIVATE) continue;
+                const bool isDecoder = gevrTacticalIsDecoderDoor(decoder, door);
+                if (item == ITEM_DOORDECODER ? !isDecoder : (!isDecoder && !door->keyflags)) continue;
+                f32 score = gevrTacticalDoorReach(p, tip, back, cm);
+                if (score < bestScore) {
+                    best = door;
+                    bestScore = score;
+                }
+            }
+            if (best) return best;
+        }
+    }
+
+    PropRecord *focused = propFindForInteract();
+    if (focused && focused->type == PROP_TYPE_DOOR
+        && (gevrTacticalIsDecoderDoor(decoder, focused->door)
+            || (item == ITEM_KEYCARD && focused->door->keyflags))) return focused->door;
+
+    /* The decoder reader is on the jamb, outside the stock door's aim test.
+     * Let the player use it while beside the visible bottling-room door. */
+    if (decoder && (decoder->prop->flags & PROPFLAG_ONSCREEN)) {
+        const coord3d *player = &g_CurrentPlayer->prop->pos;
+        const coord3d *lock = &decoder->runtime_pos;
+        if (SQ(player->x - lock->x) + SQ(player->z - lock->z) < SQ(250.f)
+            && fabsf(player->y - lock->y) < 140.f) return decoder;
+    }
+    return NULL;
+}
+
+static void gevrTacticalUseFacilityGadget(GUNHAND hand, s32 item)
+{
+    DoorRecord *decoder = gevrTacticalFacilityDecoderDoor();
+    DoorRecord *door = gevrTacticalFacilityDoorTarget(hand, item, decoder);
+    if (!door) {
+        if (sysArgCheck("--input-script")) sysLogPrintf(LOG_NOTE, "tactical door: item %d found no lock", item);
+        HUDMESSAGEBOTTOM("Move closer and point at the door lock.");
+        return;
+    }
+
+    if (item == ITEM_KEYCARD) {
+        if (gevrTacticalIsDecoderDoor(decoder, door)) {
+            HUDMESSAGEBOTTOM("Use the door decoder on this lock.");
+            if (sysArgCheck("--input-script")) sysLogPrintf(LOG_NOTE, "tactical keycard: decoder lock requires decoder");
+            return;
+        }
+        const bool hasKey = bondinvCheckHasKeyFlags(door->keyflags);
+        gevrHandInteract(door->prop);
+        if (sysArgCheck("--input-script"))
+            sysLogPrintf(LOG_NOTE, "tactical keycard: pad %d, matching key %d, state %d",
+                door->pad, hasKey, door->openstate);
+        return;
+    }
+
+    if (s_tacticalDecoderHand >= 0 || decoder->openstate == DOORSTATE_OPENING
+        || decoder->openPosition > .01f) return;
+    /* Vanilla Facility AI grants the objective and unlocks the tagged leaf. */
+    decoder->state |= PROPSTATE_ACTIVATED;
+    gevrCoopReportGadgetUse((ObjectRecord *)decoder);
+    s_tacticalDecoderHand = hand;
+    sysLogPrintf(LOG_NOTE, "tactical decoder: engaged Facility lock");
+    s_tacticalDecoderStarted = g_GlobalTimer;
+}
+
+void gevrTacticalGadgetInput(s32 triggerOn[2])
+{
+    extern _Bool get_button_state(int hand_index, const char *button_name);
+    extern int gevrNativePauseOpen(void);
+    if (!gevrTacticalGadgetsEnabled()) return;
+
+    const bool canUse = !g_CurrentPlayer->bonddead && g_CurrentPlayer->watch_animation_state == 0
+        && !g_CurrentPlayer->mpmenuon && !lvlGetControlsLockedFlag()
+        && (!g_gevrStereo || (!gevrNativePauseOpen() && !gevrGunFitActive && !gevrWeaponPanelOpen));
+    const bool facility = bossGetStageNum() == LEVELID_FACILITY;
+
+    for (int hand = 0; hand < 2; ++hand) {
+        bool down = g_gevrStereo ? get_button_state(hand == GUNRIGHT ? 1 : 0, "trigger") : triggerOn[hand];
+        if (!g_gevrStereo && hand == GUNRIGHT && s_tacticalTestGadgetTrigger >= 0)
+            down = s_tacticalTestGadgetTrigger;
+        const bool pressed = down && !s_tacticalGadgetTriggerWas[hand];
+        s_tacticalGadgetTriggerWas[hand] = down;
+        const s32 item = getCurrentPlayerWeaponId(hand);
+        if (item == ITEM_TACTICAL_KATANA
+            || ((item == ITEM_KNIFE || item == ITEM_THROWKNIFE) && gevrTacticalKnifeEnabled())) {
+            triggerOn[hand] = 0;
+            continue;
+        }
+
+        if (item != ITEM_BUG && gevrTacticalGuidedThrow(item)) {
+            const struct hand *state = &g_CurrentPlayer->hands[hand];
+            /* A thrown gadget follows its own controller. Accept one use
+             * when ready, even if the press started during recovery. */
+            if (!down || !canUse) s_tacticalMineTriggerUsed[hand] = down;
+            const bool ready = state->weapon_action_state == GUN_ANIM_STATE_IDLE
+                && state->weapon_ammo_in_magazine > 0 && g_ClockTimer > 0;
+            triggerOn[hand] = canUse && down && ready && !s_tacticalMineTriggerUsed[hand];
+            if (triggerOn[hand]) s_tacticalMineTriggerUsed[hand] = TRUE;
+            continue;
+        }
+
+        s_tacticalMineTriggerUsed[hand] = down;
+        if (item == ITEM_TRIGGER) {
+            triggerOn[hand] = 0;
+            if (g_gevrStereo && hand == GUNRIGHT && s_tacticalWatchReleaseAt) {
+                if (g_GlobalTimer >= s_tacticalWatchReleaseAt) {
+                    s_tacticalWatchReleaseAt = 0;
+                    gevrTacticalReleaseGadget(hand);
+                }
+                continue;
+            }
+            if (pressed && canUse && (!g_gevrStereo || (hand == GUNRIGHT && gevrStereoWatchGrip()))) {
+                trigger_remote_mine_detonation();
+                if (g_gevrStereo) s_tacticalWatchReleaseAt = g_GlobalTimer + 12;
+                else gevrTacticalReleaseGadget(hand);
+                sysLogPrintf(LOG_NOTE, "tactical detonator: fired from hand %d, wrist %d",
+                    hand, g_gevrStereo != 0);
+            }
+        } else if (facility && (item == ITEM_DOORDECODER || item == ITEM_KEYCARD)) {
+            triggerOn[hand] = 0;
+            if (pressed && canUse) gevrTacticalUseFacilityGadget(hand, item);
+        }
+    }
+    if (getCurrentPlayerWeaponId(GUNRIGHT) != ITEM_TRIGGER) s_tacticalWatchReleaseAt = 0;
+}
+
+s32 gevrTacticalWatchPressAge(void)
+{
+    return s_tacticalWatchReleaseAt > g_GlobalTimer ? 13 - (s_tacticalWatchReleaseAt - g_GlobalTimer) : 0;
+}
+
+void gevrTacticalDecoderTick(GUNHAND hand)
+{
+    if (s_tacticalDecoderHand != hand) return;
+    DoorRecord *door = gevrTacticalFacilityDecoderDoor();
+    if (!door || !gevrTacticalGadgetsEnabled() || g_CurrentPlayer->bonddead
+        || getCurrentPlayerWeaponId(hand) != ITEM_DOORDECODER) {
+        s_tacticalDecoderHand = -1;
+        return;
+    }
+    /* The script checks that the decoder is still equipped before it opens
+     * the lock. Let its native delay and sounds finish before clearing. */
+    if (door->openstate == DOORSTATE_OPENING || door->openPosition > .01f) {
+        s_tacticalDecoderHand = -1;
+        gevrTacticalReleaseGadget(hand);
+        sysLogPrintf(LOG_NOTE, "tactical decoder: Facility door opened, hand %d released to %d",
+            hand, getCurrentPlayerWeaponId(hand));
+    } else if (g_GlobalTimer - s_tacticalDecoderStarted > 8 * 60) {
+        door->state &= ~PROPSTATE_ACTIVATED;
+        s_tacticalDecoderHand = -1;
+    }
+}
+
+/* Rifle state is bound to the dropped prop, not to the weapon type. That
+ * preserves a partially empty magazine and its chamber across a handoff. */
+static s32 gevrPhysicalPickupAllowed(s32 ctrl, s32 item)
+{
+    s32 hand = ctrl ? GUNRIGHT : GUNLEFT;
+    if (!gevrTacticalMode() || !sysArgCheck("--tactical-physical") || item < 0) return TRUE;
+    if (item == ITEM_KNIFE || item == ITEM_TACTICAL_KATANA)
+        return gevrTacticalHandEmpty(ctrl) && !bondinvHasInvItem(item);
+    /* Keys, records and gadgets go into the native mission inventory. */
+    if (!gevrCampaignGunIsFirearm(item)) return TRUE;
+    if (s_physicalLeaving[hand] || !gevrTacticalHandEmpty(ctrl) || gevrTacticalHeldMagController() == ctrl) return FALSE;
+    if (item == ITEM_GOLDENGUN || item == ITEM_LASER) return TRUE;
+    if (gevrTacticalLongItem(item)) return TRUE;
+    if (gevrTacticalIsPistol(gevrTacticalItem(item))) {
+        s32 other = getCurrentPlayerWeaponId(1 - hand);
+        return !(s_physicalPistols[0].item && s_physicalPistols[1].item)
+            && !gevrTacticalIsPistol(gevrTacticalItem(other));
+    }
+    return FALSE;
+}
+
+static void gevrTacticalQueueNativeMagazine(s32 hand, int item, GevrNativeMagazineState magazine)
+{
+    s_nativePending[hand].item = item;
+    s_nativePending[hand].magazine = magazine;
+    s_nativePending[hand].at = g_GlobalTimer;
+}
+
+static void gevrPhysicalLoadRifle(s32 hand, GevrPhysicalRifle rifle)
+{
+    const int kind = gevrTacticalItem(rifle.item);
+    s_physicalPrimary[hand] = rifle.item;
+    s_carriedPrimaryBuild[hand] = rifle.build;
+    gevrTacticalRestoreFireMode(hand, rifle.item, rifle.fireMode);
+    if (kind < 0) {
+        gevrTacticalQueueNativeMagazine(hand, rifle.item, rifle.native);
+        return;
+    }
+    const int well = gevrTacticalHandWell(kind, hand);
+    s_tactical.inv.well_type[well] = tacticalGunMagazineType(kind, s_tactical.pistol_mag_type);
+    s_tactical.inv.slots[well] = rifle.gun.magazine;
+    s_tactical.inv.chambered[well] = rifle.gun.chambered;
+    if (well == TACTICAL_LEFT_PRIMARY_WELL) s_leftPrimaryKind = kind;
+    else {
+        s_tactical.active[0] = kind;
+        s_tactical.initialized[kind] = TRUE;
+        s_tactical.stored[kind] = (TacticalStoredGun){0};
+    }
+    TacticalInteraction *interaction = gevrTacticalHandInteraction(kind, hand);
+    tacticalInteractionInit(interaction, well, TACTICAL_LEFT_HAND);
+    if (s_tactical.inv.slots[TACTICAL_LEFT_HAND].id) {
+        interaction->state = 2;
+        interaction->require_regrip = 1;
+    }
+}
+
+static GevrPhysicalRifle gevrPhysicalUnloadRifle(s32 hand, s32 item)
+{
+    GevrPhysicalRifle rifle = {.item = item, .build = s_carriedPrimaryBuild[hand]};
+    if (s_tacticalFireHand[hand].item == item) rifle.fireMode = s_tacticalFireHand[hand].mode;
+    gevrTacticalRestoreFireMode(hand, ITEM_NOTHING, 0);
+    const int kind = gevrTacticalItem(item);
+    if (kind < 0) {
+        rifle.native = s_nativePending[hand].item == item ? s_nativePending[hand].magazine
+            : gevrTacticalReadNativeMagazine(hand);
+    } else {
+        const int well = gevrTacticalHandWell(kind, hand);
+        if (gevrTacticalHandLoadedKind(kind, hand) == kind) {
+            rifle.gun = (TacticalStoredGun){s_tactical.inv.slots[well], s_tactical.inv.chambered[well]};
+            s_tactical.inv.slots[well] = (TacticalMagazine){0};
+            s_tactical.inv.chambered[well] = 0;
+            s_tactical.inv.well_type[well] = 0;
+            tacticalInteractionInit(gevrTacticalHandInteraction(kind, hand), well, TACTICAL_LEFT_HAND);
+            if (well == TACTICAL_LEFT_PRIMARY_WELL) s_leftPrimaryKind = -1;
+            else s_tactical.active[0] = -1;
+        }
+    }
+    s_nativePending[hand].item = ITEM_NOTHING;
+    s_tacticalShotMotion[hand].duration = 0;
+    g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = 0;
+    s_physicalPrimary[hand] = ITEM_UNARMED;
+    s_carriedPrimaryBuild[hand] = -1;
+    return rifle;
+}
+
+static void gevrPhysicalRemoveTakenRifle(s32 item)
+{
+    if (s_physicalShoulder.item != item && s_physicalPrimary[GUNRIGHT] != item && s_physicalPrimary[GUNLEFT] != item)
+        bondinvRemoveItemByID(item);
+}
+
+static void gevrPhysicalCarryPickup(int ctrl, GevrPhysicalRifle rifle, int fresh)
+{
+    const int kind = gevrTacticalItem(rifle.item);
+    const int hand = ctrl ? GUNRIGHT : GUNLEFT;
+    if (gevrTacticalNativeRifle(rifle.item) || gevrTacticalIsLongGun(kind)) {
+        gevrPhysicalLoadRifle(hand, rifle);
+    } else {
+        s_tactical.stored[kind] = rifle.gun;
+        s_tactical.initialized[kind] = !fresh;
+        s_carriedPistolBuild = rifle.build;
+        gevrTacticalRestoreFireMode(hand, rifle.item, rifle.fireMode);
+        s_physicalFreshPistol = fresh;
+    }
+    s_physicalGunGrip[ctrl] = TRUE;
+    s_physicalLeaving[hand] = FALSE;
+}
+
+void gevrTacticalAcceptWeaponPickup(PropRecord *prop, s32 ctrl, s32 item)
+{
+    if (!gevrTacticalMode() || !sysArgCheck("--tactical-physical")) return;
+    const int native = gevrTacticalNativeRifle(item);
+    const int kind = gevrTacticalItem(item);
+    if (kind < 0 && !native) return;
+    GevrPhysicalRifle rifle = {.item = item, .build = -1};
+    int fresh = TRUE;
+    struct GuardIssuedWeapon *issued = gevrGuardIssue(prop);
+    if (issued) {
+        TacticalMagazine magazine = {0};
+        if (issued->magazine.id) {
+            magazine = tacticalSessionNewMagazine(&s_tactical, kind, issued->magazine.capacity, issued->magazine.rounds);
+            magazine.gear_part = issued->magazine.gear_part;
+        }
+        rifle.gun = (TacticalStoredGun){magazine, !!magazine.id};
+        rifle.build = issued->build;
+        fresh = FALSE;
+        issued->prop = NULL;
+        sysLogPrintf(LOG_NOTE, "tactical guard: recovered build %d with magazine %u", rifle.build, magazine.id);
+    }
+    for (int k = 0; fresh && k < (int)ARRAYCOUNT(s_physicalRifles); ++k) {
+        if (s_physicalRifles[k].prop != prop || s_physicalRifles[k].item != item) continue;
+        rifle.native = s_physicalRifles[k].native;
+        rifle.gun = s_physicalRifles[k].gun;
+        rifle.build = s_physicalRifles[k].build;
+        rifle.fireMode = s_physicalRifles[k].fireMode;
+        s_physicalRifles[k].prop = NULL;
+        s_physicalRifles[k].netId = 0;
+        fresh = FALSE;
+        break;
+    }
+    if (native || gevrTacticalIsLongGun(kind)) {
+        if (fresh && native) {
+            const WeaponStats *stats = get_ptr_item_statistics((ITEM_IDS)item);
+            rifle.native.rounds = stats ? stats->MagSize : 0;
+        } else if (fresh) {
+            const unsigned capacity = gevrTacticalCapacity(kind);
+            rifle.gun.chambered = capacity != 0;
+            if (capacity && kind != TACTICAL_GUN_RPG)
+                rifle.gun.magazine = tacticalSessionNewMagazine(&s_tactical, kind, capacity, capacity - 1);
+        }
+    }
+    gevrPhysicalCarryPickup(ctrl, rifle, fresh);
+    sysLogPrintf(LOG_NOTE, "tactical: picked up %s item %d in hand %d", fresh ? "new" : "previously dropped", item, ctrl ? GUNRIGHT : GUNLEFT);
+}
+
+static void gevrTacticalSaveDroppedGun(int slot, PropRecord *prop, int item, int kind, int hand)
+{
+    s_physicalRifles[slot].prop = prop;
+    s_physicalRifles[slot].item = item;
+    s_physicalRifles[slot].netId = 0;
+    if (kind < 0 || gevrTacticalIsLongGun(kind)) {
+        const GevrPhysicalRifle rifle = gevrPhysicalUnloadRifle(hand, item);
+        s_physicalRifles[slot].native = rifle.native;
+        s_physicalRifles[slot].gun = rifle.gun;
+        s_physicalRifles[slot].build = rifle.build;
+        s_physicalRifles[slot].fireMode = rifle.fireMode;
+        return;
+    }
+    tacticalSessionStow(&s_tactical, kind);
+    s_physicalRifles[slot].gun = s_tactical.stored[kind];
+    s32 *build = gevrTacticalCarriedBuild(kind, hand);
+    s_physicalRifles[slot].build = *build;
+    s_physicalRifles[slot].fireMode = s_tacticalFireHand[hand].item == item ? s_tacticalFireHand[hand].mode : 0;
+    gevrTacticalRestoreFireMode(hand, ITEM_NOTHING, 0);
+    *build = -1;
+}
+
+static void gevrTacticalPublishWorldGun(int slot)
+{
+    if (!gevrTacticalLootEnabled()) return;
+    const PropRecord *prop = s_physicalRifles[slot].prop;
+    GevrSharedLoot loot = {
+        .kind = GEVR_LOOT_GUN, .item = s_physicalRifles[slot].item,
+        .build = s_physicalRifles[slot].build, .fireMode = s_physicalRifles[slot].fireMode,
+        .chamber = s_physicalRifles[slot].gun.chambered,
+        .nativeRounds = s_physicalRifles[slot].native.rounds,
+        .nativeMissing = s_physicalRifles[slot].native.missing,
+        .magazine = s_physicalRifles[slot].gun.magazine,
+        .position = {prop->pos.x, prop->pos.y, prop->pos.z}
+    };
+    for (int row = 0; row < 3; ++row)
+        memcpy(loot.orientation[row], prop->obj->mtx.m[row], sizeof(loot.orientation[row]));
+    s_physicalRifles[slot].netId = gevrTacticalLootPublish(&loot);
+}
+
+void gevrTacticalLootPublishGuardDrop(PropRecord *prop)
+{
+    if (!prop || !prop->weapon || prop->parent || !gevrCoopIsHost() || !gevrTacticalLootEnabled()) return;
+    const int item = prop->weapon->weaponnum;
+    const int kind = gevrTacticalItem(item);
+    const int native = gevrTacticalNativeRifle(item);
+    if (kind < 0 && !native) return;
+    for (int i = 0; i < (int)ARRAYCOUNT(s_physicalRifles); ++i) {
+        if (s_physicalRifles[i].prop || !gevrTacticalLootCanPublish()) continue;
+        const struct GuardIssuedWeapon *issued = gevrGuardIssue(prop);
+        TacticalStoredGun gun = {0};
+        if (native) {
+            const WeaponStats *stats = get_ptr_item_statistics(item);
+            s_physicalRifles[i].native = (GevrNativeMagazineState){stats ? stats->MagSize : 0, FALSE};
+        } else {
+            const int ppk = sysArgCheck("--tactical-ppk");
+            const unsigned capacity = tacticalGunCapacity(kind, ppk);
+            gun.chambered = issued ? issued->magazine.id != 0 : capacity != 0;
+            if (issued) gun.magazine = issued->magazine;
+            else if (capacity && kind != TACTICAL_GUN_RPG)
+                gun.magazine = (TacticalMagazine){.id = 1, .type = tacticalGunMagazineType(kind, ppk ? 4u : 2u),
+                    .capacity = capacity, .rounds = capacity - 1,
+                    .mag_class = tacticalGunIsPistol(kind) ? TACTICAL_MAG_PISTOL : TACTICAL_MAG_PRIMARY};
+            s_physicalRifles[i].native = (GevrNativeMagazineState){0};
+        }
+        s_physicalRifles[i].prop = prop;
+        s_physicalRifles[i].item = item;
+        s_physicalRifles[i].build = issued ? issued->build : -1;
+        s_physicalRifles[i].gun = gun;
+        s_physicalRifles[i].fireMode = 0;
+        gevrTacticalPublishWorldGun(i);
+        return;
+    }
+}
+
+static void gevrTacticalPublishWorldMagazine(GevrWorldMagazine *mag)
+{
+    const GevrSharedLoot loot = {
+        .kind = GEVR_LOOT_MAG, .magazine = mag->mag, .flat = mag->flat, .magnet = mag->magnetThrough,
+        .position = {mag->pos.x, mag->pos.y, mag->pos.z}
+    };
+    mag->netId = gevrTacticalLootPublish(&loot);
+}
+
+uint32_t gevrTacticalLootPropId(const PropRecord *prop)
+{
+    if (!prop || !gevrTacticalLootEnabled()) return 0;
+    for (int i = 0; i < (int)ARRAYCOUNT(s_physicalRifles); ++i)
+        if (s_physicalRifles[i].prop == prop) return s_physicalRifles[i].netId;
+    return 0;
+}
+
+int gevrTacticalLootClaimProp(const PropRecord *prop, int ctrl)
+{
+    const uint32_t id = gevrTacticalLootPropId(prop);
+    if (!id) return FALSE;
+    gevrTacticalLootClaim(id, ctrl);
+    return TRUE;
+}
+
+int gevrTacticalLootPutWorld(const GevrSharedLoot *loot)
+{
+    extern ObjectRecord *create_new_item_instance_of_model(PROP modelnum, s32 weaponid);
+    extern void setupUpdateObjectRoomPosition(ObjectRecord *obj);
+    extern void chrpropActivate(PropRecord *prop);
+    extern void chrpropEnable(PropRecord *prop);
+    if (!s_tacticalStarted) return FALSE;
+    coord3d position = {.f = {loot->position[0], loot->position[1], loot->position[2]}};
+    if (loot->kind == GEVR_LOOT_MAG) {
+        for (int i = 0; i < (int)ARRAYCOUNT(s_tacticalWorldMags); ++i) {
+            if (s_tacticalWorldMags[i].mag.id) continue;
+            s_tacticalWorldMags[i] = (GevrWorldMagazine){.mag = loot->magazine, .netId = loot->id,
+                .pos = position, .flat = loot->flat, .magnetThrough = loot->magnet};
+            return TRUE;
+        }
+        return FALSE;
+    }
+    StandTile *tile = stanFindTileBelowPos(&position, NULL, NULL);
+    if (!tile || loot->kind != GEVR_LOOT_GUN) return FALSE;
+    for (int i = 0; i < (int)ARRAYCOUNT(s_physicalRifles); ++i) {
+        if (s_physicalRifles[i].prop) continue;
+        ObjectRecord *obj = create_new_item_instance_of_model(gevrTacticalDroppedProp(loot->item), loot->item);
+        if (!obj || !obj->prop || !obj->model) return FALSE;
+        obj->prop->pos = obj->runtime_pos = position;
+        obj->prop->stan = tile;
+        matrix_4x4_set_identity(&obj->mtx);
+        for (int row = 0; row < 3; ++row)
+            memcpy(obj->mtx.m[row], loot->orientation[row], sizeof(loot->orientation[row]));
+        setupUpdateObjectRoomPosition(obj);
+        chrpropActivate(obj->prop);
+        chrpropEnable(obj->prop);
+        s_physicalRifles[i].prop = obj->prop;
+        s_physicalRifles[i].item = loot->item;
+        s_physicalRifles[i].build = loot->build;
+        s_physicalRifles[i].gun = (TacticalStoredGun){loot->magazine, loot->chamber};
+        s_physicalRifles[i].native = (GevrNativeMagazineState){loot->nativeRounds, loot->nativeMissing};
+        s_physicalRifles[i].fireMode = loot->fireMode;
+        s_physicalRifles[i].netId = loot->id;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+int gevrTacticalLootSample(GevrSharedLoot *loot, int *moving)
+{
+    const uint32_t id = loot->id;
+    for (int i = 0; i < (int)ARRAYCOUNT(s_tacticalWorldMags); ++i) {
+        const GevrWorldMagazine *mag = &s_tacticalWorldMags[i];
+        if (mag->netId != id || !mag->mag.id) continue;
+        memcpy(loot->position, mag->pos.f, sizeof(mag->pos.f));
+        *moving = mag->falling;
+        return TRUE;
+    }
+    for (int i = 0; i < (int)ARRAYCOUNT(s_physicalRifles); ++i) {
+        const PropRecord *prop = s_physicalRifles[i].prop;
+        if (s_physicalRifles[i].netId != id || !prop || prop->parent || prop->type != PROP_TYPE_WEAPON) continue;
+        memcpy(loot->position, prop->pos.f, sizeof(prop->pos.f));
+        for (int row = 0; row < 3; ++row)
+            memcpy(loot->orientation[row], prop->obj->mtx.m[row], sizeof(loot->orientation[row]));
+        *moving = (prop->obj->runtime_bitflags & RUNTIMEBITFLAG_HASPROJECTILE) != 0;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+void gevrTacticalLootMoveWorld(const GevrSharedLoot *loot)
+{
+    extern void setupUpdateObjectRoomPosition(ObjectRecord *obj);
+    const uint32_t id = loot->id;
+    const float *position = loot->position;
+    for (int i = 0; i < (int)ARRAYCOUNT(s_tacticalWorldMags); ++i) {
+        GevrWorldMagazine *mag = &s_tacticalWorldMags[i];
+        if (mag->netId != id) continue;
+        memcpy(mag->pos.f, position, sizeof(mag->pos.f));
+        return;
+    }
+    for (int i = 0; i < (int)ARRAYCOUNT(s_physicalRifles); ++i) {
+        PropRecord *prop = s_physicalRifles[i].prop;
+        if (s_physicalRifles[i].netId != id || !prop || prop->parent || prop->type != PROP_TYPE_WEAPON) continue;
+        ObjectRecord *obj = prop->obj;
+        memcpy(prop->pos.f, position, sizeof(prop->pos.f));
+        obj->runtime_pos = prop->pos;
+        for (int row = 0; row < 3; ++row)
+            memcpy(obj->mtx.m[row], loot->orientation[row], sizeof(loot->orientation[row]));
+        StandTile *tile = stanFindTileBelowPos(&prop->pos, NULL, NULL);
+        if (tile) prop->stan = tile;
+        setupUpdateObjectRoomPosition(obj);
+        return;
+    }
+}
+
+void gevrTacticalLootEraseWorld(uint32_t id)
+{
+    for (int i = 0; i < (int)ARRAYCOUNT(s_tacticalWorldMags); ++i)
+        if (s_tacticalWorldMags[i].netId == id) {
+            s_tacticalWorldMags[i] = (GevrWorldMagazine){0};
+            return;
+        }
+    for (int i = 0; i < (int)ARRAYCOUNT(s_physicalRifles); ++i) {
+        PropRecord *prop = s_physicalRifles[i].prop;
+        if (s_physicalRifles[i].netId != id) continue;
+        s_physicalRifles[i].prop = NULL;
+        s_physicalRifles[i].netId = 0;
+        if (prop && prop->type == PROP_TYPE_WEAPON && !prop->parent) objFreePermanently(prop->obj, TRUE);
+        return;
+    }
+}
+
+void gevrTacticalLootUnshareWorld(uint32_t id)
+{
+    for (int i = 0; i < (int)ARRAYCOUNT(s_tacticalWorldMags); ++i)
+        if (s_tacticalWorldMags[i].netId == id) s_tacticalWorldMags[i].netId = 0;
+    for (int i = 0; i < (int)ARRAYCOUNT(s_physicalRifles); ++i)
+        if (s_physicalRifles[i].netId == id) s_physicalRifles[i].netId = 0;
+}
+
+int gevrTacticalLootTakeLocal(const GevrSharedLoot *loot, int ctrl)
+{
+    if (!s_tacticalStarted || !gevrTacticalMode() || !g_CurrentPlayer || !gevrTacticalHandEmpty(ctrl)
+        || g_CurrentPlayer->bonddead || g_CurrentPlayer->watch_animation_state || g_PlayerIsInTank == 1
+        || gevrCoopLocalDowned()) return FALSE;
+    TacticalMagazine mag = loot->magazine;
+    if (mag.id) {
+        TacticalMagazine local = tacticalSessionNewMagazine(&s_tactical, tacticalMagazineGun(&mag), mag.capacity, mag.rounds);
+        mag.id = local.id;
+    }
+    if (loot->kind == GEVR_LOOT_GUN) {
+        if (!gevrPhysicalPickupAllowed(ctrl, loot->item)) return FALSE;
+        if (!bondinvHasInvItem(loot->item) && !bondinvAddInvItem(loot->item)) return FALSE;
+        const GevrPhysicalRifle rifle = {
+            .item = loot->item, .build = loot->build, .fireMode = loot->fireMode,
+            .gun = {mag, loot->chamber}, .native = {loot->nativeRounds, loot->nativeMissing}
+        };
+        gevrPhysicalCarryPickup(ctrl, rifle, FALSE);
+        gevrGripEquip(ctrl ? GUNRIGHT : GUNLEFT, loot->item);
+    } else {
+        if (tacticalAddMagazine(&s_tactical.inv, TACTICAL_LEFT_HAND, mag) != TACTICAL_OK) return FALSE;
+        s_tacticalMagCtrl = ctrl;
+        s_tacticalMagNeedsRegrip = FALSE;
+    }
+    gevrControllerGripBuzz(ctrl);
+    sysLogPrintf(LOG_NOTE, "tactical co-op: took shared loot %u kind %d item %d build %d rounds %u chamber %d",
+        loot->id, loot->kind, loot->item, loot->build, mag.rounds, loot->chamber);
+    return TRUE;
+}
+
+int gevrTacticalRangePlaceGun(WeaponObjRecord *record, int item, const coord3d *pos, StandTile *tile, float angle)
+{
+    extern ObjectRecord *gevrCreateItemInstanceIn(WeaponObjRecord *obj, PROP modelnum, s32 weaponid);
+    extern void setupUpdateObjectRoomPosition(ObjectRecord *obj);
+    extern void chrpropActivate(PropRecord *prop);
+    extern void chrpropEnable(PropRecord *prop);
+    const int kind = gevrTacticalItem(item);
+    if (kind < 0 || !tile) return FALSE;
+    for (int slot = 0; slot < (int)ARRAYCOUNT(s_physicalRifles); ++slot) {
+        if (s_physicalRifles[slot].prop) continue;
+        ObjectRecord *obj = gevrCreateItemInstanceIn(record, gevrTacticalDroppedProp(item), item);
+        if (!obj) return FALSE;
+        obj->prop->pos = obj->runtime_pos = *pos;
+        obj->prop->stan = tile;
+        matrix_4x4_set_position_and_rotation_around_y(obj->runtime_pos.f, angle, &obj->mtx);
+        matrix_scalar_multiply(obj->model->scale, obj->mtx.m[0]);
+        setupUpdateObjectRoomPosition(obj);
+        chrpropActivate(obj->prop);
+        chrpropEnable(obj->prop);
+
+        const unsigned capacity = gevrTacticalCapacity(kind);
+        s_physicalRifles[slot].prop = obj->prop;
+        s_physicalRifles[slot].item = item;
+        s_physicalRifles[slot].build = -1;
+        s_physicalRifles[slot].fireMode = 0;
+        s_physicalRifles[slot].gun = (TacticalStoredGun){.chambered = TRUE};
+        if (kind != TACTICAL_GUN_RPG)
+            s_physicalRifles[slot].gun.magazine = tacticalSessionNewMagazine(&s_tactical, kind, capacity, capacity - 1);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static int gevrTacticalPlaceSupplyMagazine(int kind, unsigned rounds, const coord3d *surface,
+    int flat, int magnetThrough)
+{
+    if (kind < 0 || !rounds) return FALSE;
+    const unsigned capacity = gevrTacticalCapacity(kind);
+    for (int slot = 0; slot < (int)ARRAYCOUNT(s_tacticalWorldMags); ++slot) {
+        if (s_tacticalWorldMags[slot].mag.id) continue;
+        const TacticalMagazine mag = tacticalSessionNewMagazine(&s_tactical, kind, capacity, rounds);
+        float low[3], high[3];
+        if (!gevrTacticalLooseMagBounds(0, tacticalMagazineGun(&mag), low, high)) return FALSE;
+        GevrWorldMagazine *world = &s_tacticalWorldMags[slot];
+        *world = (GevrWorldMagazine){.mag = mag, .pos = *surface, .flat = flat, .magnetThrough = magnetThrough};
+        world->pos.y += 1.f + .1f * (flat ? high[2] : -low[1]);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static float gevrTacticalMagazineClearance(TacticalMagazine mag, int flat)
+{
+    float low[3], high[3];
+    if (!gevrTacticalLooseMagBounds(mag.gear_part, tacticalMagazineGun(&mag), low, high)) return 2.f;
+    return 1.f + .1f * (flat ? high[2] : -low[1]);
+}
+
+int gevrTacticalDropCorpseMagazine(const coord3d *at, TacticalMagazine mag)
+{
+    coord3d from = *at;
+    from.y += 12.f;
+    f32 floor;
+    if (!stanFindTileBelowPos(&from, NULL, &floor) || from.y - floor > 180.f) return FALSE;
+    for (int i = 0; i < (int)ARRAYCOUNT(s_tacticalWorldMags); ++i) {
+        if (s_tacticalWorldMags[i].mag.id) continue;
+        s_tacticalWorldMags[i] = (GevrWorldMagazine){.mag = mag, .pos = from,
+            .ground = floor, .falling = TRUE, .flat = TRUE,
+            .clearance = gevrTacticalMagazineClearance(mag, TRUE)};
+        gevrTacticalPublishWorldMagazine(&s_tacticalWorldMags[i]);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+int gevrTacticalRangePlaceMagazine(int item, const coord3d *surface)
+{
+    const int kind = gevrTacticalItem(item);
+    return kind >= 0 && gevrTacticalPlaceSupplyMagazine(kind, gevrTacticalCapacity(kind), surface,
+        kind == TACTICAL_GUN_RPG, FALSE);
+}
+
+static int gevrTacticalSupplyKind(int ammo, const coord3d *at)
+{
+    if (ammo == AMMO_9MM_2) ammo = AMMO_9MM;
+    int kind = -1;
+    f32 closest = SQ(275.f);
+    for (PropDefHeaderRecord *def = g_CurrentSetup.propDefs; def && def->type != PROPDEF_END;
+         def += sizepropdef(def)) {
+        if (def->type != PROPDEF_COLLECTABLE) continue;
+        const WeaponObjRecord *gun = (const WeaponObjRecord *)def;
+        if (gun->pad < 0 || !gun->prop || gun->prop->parent) continue;
+        const int type = get_ammo_type_for_weapon(gun->weaponnum);
+        if (type != ammo && !(type == AMMO_9MM_2 && ammo == AMMO_9MM)) continue;
+        int candidate = gevrTacticalItem(gun->weaponnum);
+        if (candidate < 0) candidate = gevrTacticalNativeMagazineGun(gun->weaponnum);
+        if (candidate < 0) continue;
+        const coord3d *pos = &gun->prop->pos;
+        const f32 dist = SQ(at->x - pos->x) + SQ(at->y - pos->y) + SQ(at->z - pos->z);
+        if (dist < closest) {
+            closest = dist;
+            kind = candidate;
+        }
+    }
+    if (kind >= 0) return kind;
+    switch (ammo) {
+    case AMMO_9MM: return TACTICAL_GUN_USP;
+    case AMMO_RIFLE: return TACTICAL_GUN_AK;
+    case AMMO_SHOTGUN: return gevrTacticalItem(ITEM_TACTICAL_SAIGA12K);
+    case AMMO_ROCKETS: return gevrTacticalItem(ITEM_ROCKETLAUNCH);
+    case AMMO_GRENADEROUND: return gevrTacticalItem(ITEM_TACTICAL_M32A1);
+    case AMMO_MAGNUM: return gevrTacticalItem(ITEM_TACTICAL_DEAGLE);
+    default: return -1;
+    }
+}
+
+static unsigned gevrTacticalPlaceSupplyRounds(int ammo, unsigned quantity, coord3d *surface,
+    unsigned freeSlots, int magnetThrough)
+{
+    const int kind = gevrTacticalSupplyKind(ammo, surface);
+    if (kind < 0 || !quantity) return 0;
+    const unsigned capacity = gevrTacticalCapacity(kind);
+    if (!capacity) return 0;
+    const unsigned count = (quantity + capacity - 1u) / capacity;
+    if (count > freeSlots) return 0;
+
+    unsigned rounds = quantity;
+    for (unsigned i = 0; i < count; ++i) {
+        const unsigned fill = rounds < capacity ? rounds : capacity;
+        if (!gevrTacticalPlaceSupplyMagazine(kind, fill, surface, TRUE, magnetThrough)) return 0;
+        rounds -= fill;
+        surface->x += 8.f;
+    }
+    sysLogPrintf(LOG_NOTE, "tactical supply: placed %u %s magazines with %u rounds",
+        count, gevrTacticalGunName(kind), quantity);
+    return count;
+}
+
+static void gevrTacticalStockMissionMagazines(void)
+{
+    extern s32 get_ammo_in_magazine(AmmoCrateRecord *crate);
+    extern void propExecuteTickOperation(PropRecord *prop, TICKOP op);
+    unsigned freeSlots = ARRAYCOUNT(s_tacticalWorldMags) - 32;
+    for (PropDefHeaderRecord *def = g_CurrentSetup.propDefs; def && def->type != PROPDEF_END;
+         def += sizepropdef(def)) {
+        if (def->type != PROPDEF_MAGAZINE && def->type != PROPDEF_AMMO) continue;
+        ObjectRecord *source = (ObjectRecord *)def;
+        PropRecord *prop = source->prop;
+        if (source->pad < 0 || !prop || prop->parent || !(prop->flags & PROPFLAG_ENABLED)
+            || source->flags & PROPFLAG_UNCOLLECTABLE) continue;
+        const PadRecord *pad = gevrWarpPad(source->pad);
+        if (!pad) continue;
+
+        coord3d surface = prop->pos;
+        if (def->type == PROPDEF_MAGAZINE) {
+            AmmoCrateRecord *mag = (AmmoCrateRecord *)def;
+            const int quantity = get_ammo_in_magazine(mag);
+            if (quantity <= 0) continue;
+            coord3d probe = surface;
+            probe.y = fmaxf(pad->pos.y, surface.y) + 65.f;
+            float floor = pad->pos.y;
+            stanFindTileBelowPos(&probe, NULL, &floor);
+            surface.y = gevrTacticalSurfaceY(&surface, probe.y, floor, prop);
+            const unsigned count = gevrTacticalPlaceSupplyRounds(mag->ammoType, quantity, &surface,
+                freeSlots, !!(source->flags2 & 0x1000));
+            if (!count) continue;
+            freeSlots -= count;
+            propExecuteTickOperation(prop, TICKOP_DISABLE);
+            sysLogPrintf(LOG_NOTE, "tactical supply: pad %d placed %u physical magazines, surface %.1f, floor %.1f",
+                mag->pad, count, (double)surface.y, (double)floor);
+        } else {
+            /* Keep the crate itself and its gadget supplies available to scripts. */
+            MultiAmmoCrateRecord *crate = (MultiAmmoCrateRecord *)def;
+            surface = pad->pos;
+            surface.x += 28.f * pad->look.x;
+            surface.z += 28.f * pad->look.z;
+            StandTile *tile = pad->stan;
+            if (tile && stanTestLineUnobstructed(&tile, pad->pos.x, pad->pos.z, surface.x, surface.z,
+                CDTYPE_DOORS | CDTYPE_PATHBLOCKER, 0, 1, 0, 1) && tile)
+                surface.y = bondviewYPositionRelated(tile, surface.x, surface.z);
+            else surface = pad->pos;
+            for (int slot = 0; slot < AMMOTYPE_GLOBAL_MAX; ++slot) {
+                const unsigned count = gevrTacticalPlaceSupplyRounds(slot + 1, crate->slots[slot].quantity,
+                    &surface, freeSlots, FALSE);
+                if (!count) continue;
+                crate->slots[slot].quantity = 0;
+                freeSlots -= count;
+                sysLogPrintf(LOG_NOTE, "tactical supply: crate pad %d placed %u physical magazines",
+                    crate->pad, count);
+            }
+        }
+    }
+}
+
+/* Place a magnetized supply within the ordinary hand pickup reach. */
+static StandTile *gevrTacticalMagnetDestination(coord3d *out)
+{
+    const PropRecord *player = getCurrentPlayerProp();
+    const Mtxf *view = currentPlayerGetViewToWorldMtxf();
+    if (!player || !player->stan || !view) return NULL;
+    *out = player->pos;
+    const f32 horizontal = sqrtf(SQ(view->m[2][0]) + SQ(view->m[2][2]));
+    if (horizontal > .1f) {
+        out->x -= 48.f * view->m[2][0] / horizontal;
+        out->z -= 48.f * view->m[2][2] / horizontal;
+    }
+    StandTile *tile = player->stan;
+    if (!stanTestLineUnobstructed(&tile, player->pos.x, player->pos.z, out->x, out->z,
+        CDTYPE_OBJS | CDTYPE_DOORS | CDTYPE_PATHBLOCKER, 0, 1, 0, 1) || !tile) {
+        *out = player->pos;
+        tile = player->stan;
+    }
+    out->y = bondviewYPositionRelated(tile, out->x, out->z);
+    return tile;
+}
+
+void gevrTacticalMoveMagneticWeapon(PropRecord *prop)
+{
+    extern void setupUpdateObjectRoomPosition(ObjectRecord *obj);
+    coord3d at;
+    StandTile *tile = gevrTacticalMagnetDestination(&at);
+    if (!tile) return;
+    at.y += 6.f;
+    const PropRecord *player = getCurrentPlayerProp();
+    const f32 dx = prop->pos.x - player->pos.x, dz = prop->pos.z - player->pos.z;
+    if (prop->stan == tile && SQ(dx) + SQ(dz) <= SQ(58.f) && fabsf(prop->pos.y - at.y) <= 24.f) return;
+    WeaponObjRecord *weapon = prop->weapon;
+    prop->pos = weapon->runtime_pos = at;
+    prop->stan = tile;
+    for (int k = 0; k < 3; ++k) weapon->mtx.m[3][k] = at.f[k];
+    setupUpdateObjectRoomPosition(prop->obj);
+    sysLogPrintf(LOG_NOTE, "tactical magnet: brought item %d within reach", weapon->weaponnum);
+}
+
+static void gevrTacticalMoveMagneticMagazines(void)
+{
+    const PropRecord *player = getCurrentPlayerProp();
+    coord3d anchor;
+    StandTile *tile = gevrTacticalMagnetDestination(&anchor);
+    if (!tile) return;
+    unsigned count = 0;
+    for (int k = 0; k < (int)ARRAYCOUNT(s_tacticalWorldMags); ++k) {
+        GevrWorldMagazine *world = &s_tacticalWorldMags[k];
+        if (!world->mag.id || world->flat != 1) continue;
+        const f32 dx = world->pos.x - player->pos.x, dz = world->pos.z - player->pos.z;
+        if (SQ(dx) + SQ(dz) > SQ(350.f) || fabsf(world->pos.y - player->pos.y) > 500.f) continue;
+        StandTile *line = player->stan;
+        if (!world->magnetThrough && !stanTestLineUnobstructed(&line, player->pos.x, player->pos.z,
+            world->pos.x, world->pos.z, CDTYPE_OBJS | CDTYPE_DOORS | CDTYPE_PATHBLOCKER, 0, 1, 0, 1))
+            continue;
+        const int kind = tacticalMagazineGun(&world->mag);
+        float low[3], high[3];
+        if (!gevrTacticalLooseMagBounds(world->mag.gear_part, kind, low, high)) continue;
+        world->pos = anchor;
+        world->pos.x += 8.f * (count % 4);
+        world->pos.z += 7.f * (count / 4);
+        world->pos.y += 1.f + .1f * high[2];
+        world->magnetThrough = 0;
+        world->flat = 2; /* retain the laid pose after leaving its supply position */
+        ++count;
+    }
+    if (count) sysLogPrintf(LOG_NOTE, "tactical magnet: brought %u physical magazines within reach", count);
+}
+
+static const GevrGearAssembly *gevrTacticalCarriedAssembly(int kind, s32 hand)
+{
+    const int key = kind == TACTICAL_GUN_USP && getCurrentPlayerWeaponId(hand) == ITEM_WPPKSIL
+        ? GEVR_GEAR_PPK_SUPPRESSED : gevrTacticalGearKey(kind);
+    const int carried = *gevrTacticalCarriedBuild(kind, hand);
+    const int base = gevrTacticalGearBaseBuild(carried);
+    if (base == key || (kind == TACTICAL_GUN_USP && (base == GEVR_GEAR_PPK_SUPPRESSED || base == TACTICAL_GUN_USP))) {
+        const GevrGearAssembly *assembly = gevrTacticalGearDeployedAssembly(carried);
+        if (assembly) return assembly;
+    }
+    return gevrTacticalGearStockAssembly(key);
+}
+
+void gevrTacticalDrawPlayerAccessories(void)
+{
+    if (!s_tacticalStarted || !g_CurrentPlayer || !g_CurrentPlayer->prop || !gevrTacticalLocalPlayer()) return;
+    const int room = g_CurrentPlayer->prop->stan ? getTileRoom(g_CurrentPlayer->prop->stan) : -1;
+    for (int hand = 0; hand < 2; ++hand) {
+        const int kind = gevrTacticalItem(getCurrentPlayerWeaponId(hand));
+        Mtxf gun;
+        const int valid = kind >= 0 && !s_physicalLeaving[hand] && gevrStereoGunMatrix(hand, &gun);
+        const GevrGearAssembly *assembly = valid ? gevrTacticalCarriedAssembly(kind, hand) : NULL;
+        gevrTacticalPlayerAccessories(assembly, hand, kind, valid ? gun.m : NULL, room);
+    }
+}
+
+static int gevrTacticalStatKey(int item, int kind, int build)
+{
+    if (kind != TACTICAL_GUN_USP) return gevrTacticalGearKey(kind);
+    const int base = gevrTacticalGearBaseBuild(build);
+    if (base == GEVR_GEAR_PPK_SUPPRESSED || base == TACTICAL_GUN_USP) return base;
+    return item == ITEM_WPPKSIL ? GEVR_GEAR_PPK_SUPPRESSED : TACTICAL_GUN_USP;
+}
+
+const GevrWeaponStats *gevrTacticalHeldStats(int hand, int item)
+{
+    if (hand < 0 || hand > 1 || !s_tacticalStarted || !gevrTacticalMode()
+        || !sysArgCheck("--tactical-physical") || item != getCurrentPlayerWeaponId(hand))
+        return NULL;
+    const int kind = gevrTacticalItem(item);
+    if (kind < 0) return NULL;
+    const int key = gevrTacticalStatKey(item, kind, *gevrTacticalCarriedBuild(kind, hand));
+    const GevrGearAssembly *assembly = gevrTacticalCarriedAssembly(kind, hand);
+    const unsigned revision = assembly ? assembly->revision : 0;
+    struct TacticalStatsCache *cache = &s_tacticalStatsCache[hand];
+    if (cache->key != key || cache->assembly != assembly || cache->revision != revision || !cache->valid) {
+        cache->key = key;
+        cache->assembly = assembly;
+        cache->revision = revision;
+        cache->valid = gevrWeaponStats(key, assembly, &cache->stats) ? 1 : -1;
+    }
+    return cache->valid > 0 ? &cache->stats : NULL;
+}
+
+int gevrTacticalFireRequest(int hand, int item, int trigger, int ready, int loaded)
+{
+    const GevrWeaponStats *stats = gevrTacticalHeldStats(hand, item);
+    if (!stats) return -1;
+    if (s_physicalLeaving[hand]) return GEVR_FIRE_WAIT;
+    if (s_tacticalFireHand[hand].item != item) gevrTacticalRestoreFireMode(hand, item, 0);
+    struct TacticalFireHand *state = &s_tacticalFireHand[hand];
+    if (trigger && !state->clock.trigger && !state->clock.burstLeft) g_CurrentPlayer->hands[hand].volley = 0;
+    state->mode = gevrFireMode(stats, state->mode);
+    const int request = gevrFireStep(&state->clock, stats, state->mode,
+        (double)g_GlobalTimer / 60.0, trigger, ready, loaded);
+    return request;
+}
+
+static int gevrTacticalChangeFireMode(s32 hand)
+{
+    const s32 item = getCurrentPlayerWeaponId(hand);
+    const GevrWeaponStats *stats = gevrTacticalHeldStats(hand, item);
+    if (!stats || !(stats->modes & (stats->modes - 1))) return FALSE;
+    struct TacticalFireHand *state = &s_tacticalFireHand[hand];
+    if (state->item != item) gevrTacticalRestoreFireMode(hand, item, 0);
+    state->mode = gevrNextFireMode(stats, state->mode);
+    state->clock.burstLeft = 0;
+    s_tacticalFireNoticeHand = hand;
+    s_tacticalFireNoticeUntil = g_GlobalTimer + 75;
+    sysLogPrintf(LOG_NOTE, "tactical fire: hand %d item %d %s", hand, item, gevrFireModeName(state->mode));
+    return TRUE;
+}
+
+int gevrTacticalFireSelectorPressed(void)
+{
+    if (!g_CurrentPlayer || g_CurrentPlayer->bonddead || g_CurrentPlayer->watch_animation_state
+        || g_CurrentPlayer->mpmenuon || lvlGetControlsLockedFlag()) return FALSE;
+    const s32 hand = gevrReloadSupportGun();
+    if (s_physicalLeaving[hand] || !gevrTacticalChangeFireMode(hand)) return FALSE;
+    if (g_gevrStereo) gevrControllerGripBuzz(gevrTacticalWeaponController(hand));
+    return TRUE;
+}
+
+const char *gevrTacticalFireNotice(void)
+{
+    if (g_GlobalTimer >= s_tacticalFireNoticeUntil || !g_CurrentPlayer || g_CurrentPlayer->bonddead
+        || g_CurrentPlayer->watch_animation_state || g_CurrentPlayer->mpmenuon) return NULL;
+    const struct TacticalFireHand *state = &s_tacticalFireHand[s_tacticalFireNoticeHand];
+    return state->item == getCurrentPlayerWeaponId(s_tacticalFireNoticeHand) ? gevrFireModeName(state->mode) : NULL;
+}
+
+float gevrTacticalShotDamage(int hand, int item, float fallback)
+{
+    const GevrWeaponStats *stats = gevrTacticalHeldStats(hand, item);
+    return stats ? stats->damage : fallback;
+}
+
+float gevrTacticalHandling(int ctrl)
+{
+    const s32 hand = 1 - ctrl;
+    if (!g_CurrentPlayer || ctrl < 0 || ctrl > 1) return 0.f;
+    const GevrWeaponStats *stats = gevrTacticalHeldStats(hand, getCurrentPlayerWeaponId(hand));
+    return stats ? fminf(.62f, fmaxf(0.f, .070f * stats->mass + .005f * (70.f - stats->ergo) - .06f)) : 0.f;
+}
+
+static float gevrTacticalStowedMass(s32 item, s32 build)
+{
+    const int kind = gevrTacticalItem(item);
+    if (kind < 0) return gevrTacticalNativeRifle(item) ? 3.f : 0.f;
+    const GevrGearAssembly *assembly = gevrTacticalGearDeployedAssembly(build);
+    GevrWeaponStats stats;
+    const int key = gevrTacticalStatKey(item, kind, build);
+    return gevrWeaponStats(key, assembly, &stats) ? stats.mass : 0.f;
+}
+
+static float gevrTacticalMoveScale(void)
+{
+    if (!gevrTacticalMode() || !s_tacticalStarted || !sysArgCheck("--tactical-physical")) return 1.f;
+    float mass = 0.f;
+    for (s32 hand = 0; hand < 2; ++hand) {
+        const s32 item = getCurrentPlayerWeaponId(hand);
+        if (s_physicalLeaving[hand]) continue;
+        const GevrWeaponStats *stats = gevrTacticalHeldStats(hand, item);
+        mass += stats ? stats->mass : gevrTacticalNativeRifle(item) ? 3.f : 0.f;
+    }
+    /* Stowed gear only changes on a draw, swap or stow. Deployed assemblies
+     * are immutable during a mission, so cache by their instance IDs. */
+    const s32 items[] = {s_physicalShoulder.item, s_physicalPistols[0].item, s_physicalPistols[1].item};
+    const s32 builds[] = {s_physicalShoulder.build, s_physicalPistols[0].build, s_physicalPistols[1].build};
+    for (int i = 0; i < 3; ++i) {
+        if (s_tacticalStowedMass[i].item != items[i] || s_tacticalStowedMass[i].build != builds[i]) {
+            s_tacticalStowedMass[i].item = items[i];
+            s_tacticalStowedMass[i].build = builds[i];
+            s_tacticalStowedMass[i].mass = gevrTacticalStowedMass(items[i], builds[i]);
+        }
+        mass += s_tacticalStowedMass[i].mass;
+    }
+    return fmaxf(.76f, 1.f - .022f * fmaxf(0.f, mass - 1.7f));
+}
+
+int gevrTacticalWeaponSuppressed(int item, s32 hand)
+{
+    if (!g_CurrentPlayer) return FALSE;
+    if (netCoopSession() && gevrTacticalCampaignRules() && get_cur_playernum() != netGetLocalSlot())
+        return netRemoteWeapon(get_cur_playernum(), hand) == item && netRemoteSuppressed(get_cur_playernum(), hand);
+    if (!gevrTacticalLocalPlayer() || !sysArgCheck("--tactical-gear")
+        || item == ITEM_WPPKSIL || item == ITEM_MP5KSIL
+        || getCurrentPlayerWeaponId(hand) != item) return FALSE;
+    const int kind = gevrTacticalItem(item);
+    if (kind < 0) return FALSE;
+    return gevrTacticalGearAssemblySuppressed(gevrTacticalCarriedAssembly(kind, hand));
+}
+
+const TacticalMagazine *gevrTacticalGearModelMagazine(const Model *model, int kind, int *build)
+{
+    if (!model || kind < 0 || kind >= TACTICAL_GUN_COUNT) return NULL;
+    const GevrVisualWeapon *remote = gevrTacticalRemoteWeapon(model);
+    if (remote && gevrTacticalItem(remote->item) == kind) {
+        *build = remote->build;
+        return &remote->magazine;
+    }
+    for (int i = 0; i < s_issuedGuardCount; ++i) {
+        const struct GuardIssuedWeapon *issued = &s_issuedGuardWeapons[i];
+        if (gevrGuardIssueValid(issued) && model == issued->weapon->model && gevrTacticalItem(issued->item) == kind) {
+            *build = issued->build;
+            return &issued->magazine;
+        }
+    }
+    if (!g_CurrentPlayer || (!s_gearMissionActive && !tacticalGunIsExpanded(kind)
+        && s_carriedPrimaryBuild[GUNRIGHT] < 0 && s_carriedPrimaryBuild[GUNLEFT] < 0
+        && s_carriedPistolBuild < 0 && !sysArgCheck("--tactical-loadout-editor"))) return NULL;
+    if (tacticalGunIsExpanded(kind) && !s_tacticalStarted) return NULL;
+    for (int hand = 0; hand < 2; ++hand) {
+        if (model == &g_CurrentPlayer->hands[hand].weaponModel
+            && gevrTacticalItem(getCurrentPlayerWeaponId(hand)) == kind) {
+            const int well = gevrTacticalHandWell(kind, hand);
+            *build = *gevrTacticalCarriedBuild(kind, hand);
+            if (gevrTacticalHandLoadedKind(kind, hand) == kind) return &s_tactical.inv.slots[well];
+            if (well == TACTICAL_LEFT_PRIMARY_WELL) return NULL;
+            if (!s_tactical.initialized[kind]) return NULL;
+            return &s_tactical.stored[kind].magazine;
+        }
+    }
+    /* This is a physical object identity, rather than a model header: world
+     * rifles can share headers with the rifle built at the briefing. */
+    for (int k = 0; k < (int)ARRAYCOUNT(s_physicalRifles); ++k) {
+        const PropRecord *prop = s_physicalRifles[k].prop;
+        if (prop && prop->type == PROP_TYPE_WEAPON && !prop->parent && prop->weapon
+            && prop->weapon->weaponnum == s_physicalRifles[k].item && prop->obj->model == model) {
+            *build = s_physicalRifles[k].build;
+            return &s_physicalRifles[k].gun.magazine;
+        }
+    }
+    return NULL;
+}
+
+static const GevrGearAssembly *tacticalVisualGear(GevrVisualWeapon *gun, int carried)
+{
+    const int kind = gevrTacticalItem(gun->item);
+    if (kind < 0) return NULL;
+    const int key = kind == TACTICAL_GUN_USP && gun->item == ITEM_WPPKSIL
+        ? GEVR_GEAR_PPK_SUPPRESSED : gevrTacticalGearKey(kind);
+    const int base = gevrTacticalGearBaseBuild(carried);
+    const GevrGearAssembly *assembly = NULL;
+    if (base == key || (kind == TACTICAL_GUN_USP
+        && (base == TACTICAL_GUN_USP || base == GEVR_GEAR_PPK_SUPPRESSED)))
+        assembly = gevrTacticalGearDeployedAssembly(carried);
+    if (!assembly) {
+        carried = key;
+        gun->stock = 1;
+        assembly = gevrTacticalGearStockAssembly(key);
+    }
+    if (assembly && assembly->count > 1) gun->build = carried;
+    return assembly;
+}
+
+static void tacticalVisualStored(GevrVisualWeapon *visual, int item, int build, const TacticalStoredGun *gun)
+{
+    visual->item = item;
+    visual->build = -1;
+    visual->magazine = gun->magazine;
+    const GevrGearAssembly *assembly = tacticalVisualGear(visual, build);
+    if (gun->chambered) visual->flags |= GEVR_VIS_CHAMBER;
+    if (item == ITEM_WPPKSIL || item == ITEM_MP5KSIL || gevrTacticalGearAssemblySuppressed(assembly))
+        visual->flags |= GEVR_VIS_SUPPRESSED;
+}
+
+extern float gevrTacticalManualMotion(int asset, s32 hand);
+extern float gevrTacticalActionMotion(int asset, s32 hand);
+extern int gevrTacticalChamberState(int kind, s32 hand);
+
+void gevrTacticalCollectVisual(GevrTacticalVisual *visual)
+{
+    for (int i = 0; i < GEVR_VIS_GUNS; ++i) visual->weapons[i].build = -1;
+    if (!s_tacticalStarted || !g_CurrentPlayer || g_CurrentPlayer->bonddead) return;
+
+    for (int hand = GUNRIGHT; hand <= GUNLEFT; ++hand) {
+        GevrVisualWeapon *gun = &visual->weapons[hand];
+        gun->item = s_physicalLeaving[hand] ? ITEM_NOTHING : getCurrentPlayerWeaponId(hand);
+        const int kind = gevrTacticalItem(gun->item);
+        if (kind < 0) continue;
+
+        const GevrGearAssembly *assembly = tacticalVisualGear(gun, *gevrTacticalCarriedBuild(kind, hand));
+        if (gevrTacticalHandLoadedKind(kind, hand) == kind)
+            gun->magazine = s_tactical.inv.slots[gevrTacticalHandWell(kind, hand)];
+        else if (s_tactical.initialized[kind])
+            gun->magazine = s_tactical.stored[kind].magazine;
+        if (gevrTacticalChamberState(kind, hand)) gun->flags |= GEVR_VIS_CHAMBER;
+        if (gun->item == ITEM_WPPKSIL || gun->item == ITEM_MP5KSIL || gevrTacticalGearAssemblySuppressed(assembly))
+            gun->flags |= GEVR_VIS_SUPPRESSED;
+        gun->action = (u8)roundf(fminf(10.f, fmaxf(0.f, gevrTacticalActionMotion(kind, hand))) * 10.f);
+        gun->manual = (u8)roundf(fminf(5.f, fmaxf(0.f, gevrTacticalManualMotion(kind, hand))) * 10.f);
+        gun->shots = gevrHollywoodShotSerial(hand);
+        gevrTacticalCollectMountVisual(assembly, hand, gun->mounts);
+    }
+
+    tacticalVisualStored(&visual->weapons[GEVR_VIS_SHOULDER], s_physicalShoulder.item,
+        s_physicalShoulder.build, &s_physicalShoulder.gun);
+    for (int hip = 0; hip < 2; ++hip)
+        tacticalVisualStored(&visual->weapons[GEVR_VIS_HIP_LEFT + hip], s_physicalPistols[hip].item,
+            s_physicalPistols[hip].build, &s_physicalPistols[hip].gun);
+
+    for (int i = 0; i < GEVR_VIS_RIG_MAGS; ++i)
+        visual->magazines[i] = s_tactical.inv.slots[TACTICAL_RIG_PRIMARY_1 + i];
+    const int controller = gevrTacticalHeldMagController();
+    if (controller >= 0)
+        visual->magazines[controller ? GEVR_VIS_MAG_RIGHT : GEVR_VIS_MAG_LEFT] = s_tactical.inv.slots[TACTICAL_LEFT_HAND];
+    if (s_tacticalKnifeHand < 0 && bondinvHasInvItem(ITEM_KNIFE)) visual->body |= GEVR_VIS_KNIFE;
+    if (s_tacticalKatanaHand < 0 && bondinvHasInvItem(ITEM_TACTICAL_KATANA)) visual->body |= GEVR_VIS_KATANA;
+    if (VrLeftHandedMode) visual->body |= GEVR_VIS_LEFT_HANDED;
+}
+
+int gevrTacticalRpgHasRound(const Model *model)
+{
+    const GevrVisualWeapon *remote = gevrTacticalRemoteWeapon(model);
+    if (remote) return (remote->flags & GEVR_VIS_CHAMBER) != 0;
+    if (g_CurrentPlayer) {
+        for (int hand = 0; hand < 2; ++hand) {
+            if (model == &g_CurrentPlayer->hands[hand].weaponModel)
+                return g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine > 0;
+        }
+    }
+    for (int i = 0; i < (int)ARRAYCOUNT(s_physicalRifles); ++i) {
+        const PropRecord *prop = s_physicalRifles[i].prop;
+        if (prop && prop->type == PROP_TYPE_WEAPON && !prop->parent && prop->weapon
+            && prop->weapon->weaponnum == ITEM_ROCKETLAUNCH && prop->obj->model == model)
+            return s_physicalRifles[i].gun.chambered;
+    }
+    return TRUE;
+}
+
+int gevrTacticalOpticsWantScope(void)
+{
+    if (!g_CurrentPlayer || g_CurrentPlayer->bonddead || g_CurrentPlayer->watch_animation_state)
+        return FALSE;
+    for (s32 hand = GUNRIGHT; hand <= GUNLEFT; ++hand) {
+        const int kind = gevrTacticalItem(getCurrentPlayerWeaponId(hand));
+        if (s_physicalLeaving[hand] || !gevrTacticalIsLongGun(kind)) continue;
+        const GevrGearAssembly *assembly = gevrTacticalCarriedAssembly(kind, hand);
+        if (!assembly) continue;
+        for (int i = 1; i < assembly->count; ++i) {
+            const GevrOpticMode *mode = gevrTacticalOpticMode(assembly->mounts[i].part, NULL);
+            if (mode && mode->kind != GEVR_OPTIC_COLLIMATOR) return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+void gevrTacticalOpticFocus(int part)
+{
+    s_focusedOptic = part;
+    s_focusedOpticFrame = g_GlobalTimer;
+}
+
+int gevrTacticalOpticInput(int enabled, int click, float y)
+{
+    static int active = -1, scrolled;
+    static u32 started, lastAdjust;
+    const int svd = enabled && g_gevrStereo && g_CurrentPlayer && (getCurrentPlayerWeaponId(GUNRIGHT) == ITEM_SNIPERRIFLE
+        || getCurrentPlayerWeaponId(GUNLEFT) == ITEM_SNIPERRIFLE) && gevrTacticalSvdEnabled();
+    const int valid = enabled && g_gevrStereo && g_GlobalTimer - s_focusedOpticFrame < 5
+        && (s_carriedPrimaryBuild[GUNRIGHT] >= 0 || s_carriedPrimaryBuild[GUNLEFT] >= 0 || svd);
+    if (!valid) {
+        active = -1;
+        return FALSE;
+    }
+    if (active >= 0) {
+        if (!click) {
+            if (!scrolled && g_GlobalTimer - started < 40) gevrTacticalOpticCycle(active);
+            active = -1;
+        } else if (fabsf(y) > .25f && lastAdjust != g_GlobalTimer) {
+            scrolled |= gevrTacticalOpticAdjustZoom(active, .026f*y);
+            lastAdjust = g_GlobalTimer;
+        }
+        return TRUE;
+    }
+    if (!click || !gevrTacticalOpticCanAdjust(s_focusedOptic)) return FALSE;
+    active = s_focusedOptic;
+    started = lastAdjust = g_GlobalTimer;
+    scrolled = FALSE;
+    return TRUE;
+}
+
+static s32 gevrPhysicalGripInput(s32 ctrl, s32 pressed, s32 held)
+{
+    extern int gevrBodyReloadLocal(int ctrl, const float at[3], float out[3]);
+    extern ObjectRecord *create_new_item_instance_of_model(PROP modelnum, s32 weaponid);
+    extern void setupUpdateObjectRoomPosition(ObjectRecord *obj);
+    extern void chrpropActivate(PropRecord *prop);
+    extern void chrpropEnable(PropRecord *prop);
+    extern void matrix_4x4_set_position_and_rotation_around_y(f32 *position, f32 angle, Mtxf *matrix);
+    extern void matrix_scalar_multiply(f32 scalar, f32 *matrix);
+    extern void gevrPullFlingFromHand(PropRecord *prop, s32 ctrl);
+    extern _Bool get_button_state(int hand_index, const char *button_name);
+    const int bodySideSign = ((ctrl == 0) != (VrLeftHandedMode != 0)) ? -1 : 1;
+    f32 at[3], right[3], up[3], back[3], local[3];
+    s32 item;
+    if (!gevrTacticalMode() || !sysArgCheck("--tactical-physical") || !s_tacticalStarted
+        || g_CurrentPlayer->bonddead || g_CurrentPlayer->watch_animation_state || g_CurrentPlayer->mpmenuon) return FALSE;
+    const s32 knifeHand = ctrl ? GUNRIGHT : GUNLEFT;
+    const int sword = s_tacticalKatanaHand == knifeHand;
+    if (sword || s_tacticalKnifeHand == knifeHand) {
+        const int blade = sword ? ITEM_TACTICAL_KATANA : ITEM_KNIFE;
+        s32 *gripped = sword ? &s_tacticalKatanaHand : &s_tacticalKnifeHand;
+        if (held) {
+            if (sword && gevrGripAxesRaw(ctrl, at, right, up, back) && gevrKatanaShoulderReach(ctrl, at))
+                s_tacticalKatanaNearTick = g_GlobalTimer;
+            return TRUE;
+        }
+        if (getCurrentPlayerWeaponId(knifeHand) != blade) {
+            if (g_CurrentPlayer->hands[knifeHand].weapon_next_weapon == blade) return TRUE;
+            *gripped = -1;
+            return FALSE;
+        }
+        s32 tracked = TRUE;
+        if (s_physicalSimGrip >= 5) {
+            at[0] = 0; at[1] = 0; at[2] = -10 * D_800364CC;
+            memcpy(local, sword ? gevrTacticalKatanaMount : s_tacticalKnifeFit, sizeof(local));
+            local[1] *= sword ? -bodySideSign : bodySideSign;
+            if (s_physicalSimGrip == 7) local[2] += 60.f;
+        } else {
+            tracked = gevrGripAxesRaw(ctrl, at, right, up, back) && gevrBodyReloadLocal(ctrl, at, local);
+        }
+        /* Inside-out tracking can briefly lose the grip as it goes behind the
+         * shoulder. Keep the last valid contact through that release. */
+        const int recentContact = sword && s_tacticalKatanaNearTick >= 0
+            && g_GlobalTimer - s_tacticalKatanaNearTick <= 9;
+        const int atMount = sword ? (tracked ? gevrTacticalKatanaAtMount(local, bodySideSign) : recentContact)
+            : tracked && fabsf(local[0] - s_tacticalKnifeFit[0]) < 13.f
+                && fabsf(local[1]*bodySideSign - s_tacticalKnifeFit[1]) < 14.f
+                && fabsf(local[2] - s_tacticalKnifeFit[2]) < 18.f;
+        if (!tracked && !atMount) return TRUE;
+        if (!atMount) {
+            coord3d world;
+            if (!gevrHordeGripWorld(at, &world)) return TRUE;
+            ObjectRecord *obj = create_new_item_instance_of_model(
+                sword ? PROP_TACTICAL_KATANA : PROP_CHRKNIFE, blade);
+            if (!obj || !obj->prop || !obj->model) return TRUE;
+            obj->prop->pos = obj->runtime_pos = world;
+            obj->prop->stan = stanFindTileBelowPos(&world, NULL, NULL);
+            if (!obj->prop->stan) obj->prop->stan = g_CurrentPlayer->prop->stan;
+            matrix_4x4_set_position_and_rotation_around_y(world.f, 0, &obj->mtx);
+            matrix_scalar_multiply(obj->model->scale, obj->mtx.m[0]);
+            setupUpdateObjectRoomPosition(obj);
+            chrpropActivate(obj->prop); chrpropEnable(obj->prop);
+            bondinvRemoveItemByID(blade);
+            gevrPullFlingFromHand(obj->prop, ctrl);
+        }
+        *gripped = -1;
+        if (sword) s_tacticalKatanaNearTick = -1;
+        gevrRagdollReleaseBlade(ctrl);
+        gevrTacticalReleaseGadget(knifeHand);
+        sysLogPrintf(LOG_NOTE, "tactical melee: %s %s", sword ? "katana" : "Huntsman",
+            atMount ? "stowed" : "dropped");
+        return TRUE;
+    }
+    if (gevrTacticalHeldMagController() == ctrl) return TRUE;
+    const s32 toggle = gevrTacticalLeftWeaponGrip(ctrl);
+    const s32 supportGrip = s_tacticalSupport.active && ctrl == s_tacticalSupport.ctrl;
+    if (toggle && s_physicalGunGrip[ctrl] && !supportGrip) {
+        const s32 current = getCurrentPlayerWeaponId(knifeHand);
+        if (gevrTacticalItem(current) < 0 && !gevrTacticalNativeRifle(current)) {
+            const struct hand *state = &g_CurrentPlayer->hands[knifeHand];
+            const s32 next = state->weapon_next_weapon;
+            if (state->weapon_animation_trigger && (gevrTacticalItem(next) >= 0 || gevrTacticalNativeRifle(next)))
+                return TRUE;
+            s_physicalGunGrip[ctrl] = FALSE;
+        }
+    }
+    if (toggle && (supportGrip || s_physicalGunGrip[ctrl])) {
+        if (!pressed) return TRUE;
+        pressed = held = FALSE;
+    }
+    const s32 supportRelease = supportGrip && !held;
+    const s32 hand = supportRelease ? s_tacticalSupport.gun : knifeHand;
+    item = getCurrentPlayerWeaponId(hand);
+    if (pressed && g_PlayerIsInTank != 1
+        && ((item >= ITEM_BOMBCASE && item <= ITEM_KEYBOLT)
+            || item == ITEM_TRIGGER || item == ITEM_WATCHLASER || gevrTacticalGuidedThrow(item))
+        && g_CurrentPlayer->hands[hand].weapon_action_state == GUN_ANIM_STATE_IDLE) {
+        gevrTacticalReleaseGadget(hand);
+        return TRUE;
+    }
+    if (s_tacticalSupport.active && ctrl == s_tacticalSupport.ctrl && held) return TRUE;
+    if (s_tacticalSupport.active && ctrl != s_tacticalSupport.ctrl) {
+        if (pressed) {
+            Mtxf gm; f32 gp[3], gr[3], gu[3], gb[3], d2 = 0;
+            f32 cm = GEVR_UNITS_PER_METRE * D_800364CC / 100.0f;
+            if (gevrStereoGunMatrix(hand, &gm) && gevrGripAxesRaw(ctrl, gp, gr, gu, gb)) {
+                for (int k = 0; k < 3; k++) {
+                    f32 point = gm.m[3][k] + .1f * (-68.0f * gm.m[1][k] - 20.0f * gm.m[2][k]);
+                    d2 += (gp[k] - point) * (gp[k] - point);
+                }
+                if (cm > 0 && d2 <= 400.0f * cm * cm) {
+                    s_tacticalSupport.active = FALSE;
+                    s_physicalGunGrip[s_tacticalSupport.ctrl] = FALSE;
+                    s_physicalGunGrip[ctrl] = TRUE;
+                    sysLogPrintf(LOG_NOTE, "tactical: trigger hand regripped long gun");
+                    return TRUE;
+                }
+            }
+        }
+        return FALSE;
+    }
+    if (supportRelease && !toggle) {
+        s_tacticalSupport.active = FALSE;
+        s_physicalGunGrip[ctrl] = TRUE;
+        sysLogPrintf(LOG_NOTE, "tactical: support hand released long gun");
+    }
+    if (s_physicalSimGrip && sysArgCheck("--tactical-sim") && sysArgCheck("--input-script")) {
+        at[0] = 0; at[1] = 0; at[2] = -10 * D_800364CC;
+        local[0] = s_physicalSimGrip == 2 ? 13 : s_physicalSimGrip >= 3 ? GEVR_TACTICAL_HIP_DROP_CM : 35;
+        local[1] = s_physicalSimGrip == 2 ? 20 * bodySideSign
+            : s_physicalSimGrip == 3 ? GEVR_TACTICAL_HIP_SIDE_CM
+            : s_physicalSimGrip == 4 ? -GEVR_TACTICAL_HIP_SIDE_CM : 0;
+        local[2] = s_physicalSimGrip == 2 ? -8 : s_physicalSimGrip >= 3 ? 0 : 50;
+        if (s_physicalSimGrip == 5) {
+            memcpy(local, s_tacticalKnifeFit, sizeof(local));
+            local[1] *= bodySideSign;
+        } else if (s_physicalSimGrip == 6) {
+            memcpy(local, gevrTacticalKatanaMount, sizeof(local));
+            local[1] *= -bodySideSign;
+        }
+        else if (pressed && s_physicalSimGrip >= 3 && gevrPhysicalDrawPistolAt(ctrl, local)) return TRUE;
+    } else if (!gevrGripAxesRaw(ctrl, at, right, up, back) || !gevrBodyReloadLocal(ctrl, at, local)) return FALSE;
+    const f32 bodySide = local[1] * bodySideSign;
+    int hip = bodySide < 0 ? 0 : 1;
+    const int atShoulder = fabsf(local[0] - 13) < 24 && fabsf(bodySide - 20) < 24 && fabsf(local[2] + 8) < 25;
+    const int drawKnife = pressed && s_tacticalKnifeHand < 0 && g_PlayerIsInTank != 1 && gevrTacticalHandEmpty(ctrl)
+        && fabsf(local[0] - s_tacticalKnifeFit[0]) < 11.f && fabsf(bodySide - s_tacticalKnifeFit[1]) < 13.f
+        && fabsf(local[2] - s_tacticalKnifeFit[2]) < 17.f && gevrTacticalKnifeEnabled()
+        && bondinvHasInvItem(ITEM_KNIFE);
+    const int drawKatana = pressed && s_tacticalKatanaHand < 0 && g_PlayerIsInTank != 1 && gevrTacticalHandEmpty(ctrl)
+        && gevrTacticalKatanaAtMount(local, bodySideSign) && gevrTacticalKatanaEnabled()
+        && bondinvHasInvItem(ITEM_TACTICAL_KATANA);
+    const int drawShoulder = pressed && s_physicalShoulder.item && !s_physicalLeaving[hand]
+        && gevrTacticalHandEmpty(ctrl) && atShoulder;
+    if ((drawKnife || drawKatana || drawShoulder) && !s_physicalSimGrip) {
+        const f32 cm = GEVR_UNITS_PER_METRE * D_800364CC / 100.0f;
+        f32 tip[3];
+        gevrTacticalFingertip(at, right, up, back, cm, gevrGunSizeFactor(),
+            (VrLeftHandedMode != 0) != (ctrl == 0), tip);
+        const PropRecord *pickup = gevrPhysicalContactPickup(at, tip, cm);
+        if (pickup && pickup->type == PROP_TYPE_WEAPON && pickup->weapon
+            && (gevrCampaignGunIsFirearm(pickup->weapon->weaponnum)
+                || pickup->weapon->weaponnum == ITEM_KNIFE || pickup->weapon->weaponnum == ITEM_TACTICAL_KATANA)
+            && gevrPhysicalPickupAllowed(ctrl, pickup->weapon->weaponnum)) return FALSE;
+    }
+    if (drawKnife || drawKatana) {
+        gevrPhysicalTakeBlade(knifeHand, drawKatana ? ITEM_TACTICAL_KATANA : ITEM_KNIFE);
+        sysLogPrintf(LOG_NOTE, "tactical: drew %s", drawKatana ? "katana from left shoulder" : "Huntsman from right thigh");
+        return TRUE;
+    }
+    if (drawShoulder) {
+        const GevrPhysicalRifle draw = s_physicalShoulder;
+        s_physicalShoulder = (GevrPhysicalRifle){0};
+        s_physicalGunGrip[ctrl] = TRUE;
+        gevrPhysicalLoadRifle(hand, draw);
+        bondinvAddInvItem(draw.item);
+        gunRequestHandWeaponChange(hand, draw.item, 1);
+        sysLogPrintf(LOG_NOTE, "tactical: drew item %d from shoulder mount into hand %d", draw.item, hand);
+        return TRUE;
+    }
+    const int kind = gevrTacticalItem(item);
+    const int native = gevrTacticalNativeRifle(item);
+    if (pressed && (kind >= 0 || native) && !s_physicalLeaving[hand]) {
+        s_physicalGunGrip[ctrl] = TRUE;
+        return TRUE;
+    }
+    if (!supportRelease && !s_physicalGunGrip[ctrl]) return FALSE;
+    if (held) return TRUE;
+    if (!toggle) s_physicalGunGrip[ctrl] = FALSE;
+    if ((kind < 0 && !native) || s_physicalLeaving[hand]) return TRUE;
+    if (!supportRelease && gevrTacticalIsLongGun(kind) && gevrTacticalHandEmpty(1 - ctrl)
+        && gevrStereoTwoHandGrip() && s_gevrTwoHandGun == hand
+        && (gevrTacticalLeftWeaponGrip(hand) ? s_tacticalLeftSupportPress != item : get_button_state(hand, "grip"))
+        && gevrTacticalSupportTake(hand, hand)) {
+        s_physicalGunGrip[ctrl] = FALSE;
+        return TRUE;
+    }
+    s32 swapped = FALSE;
+    if ((gevrTacticalIsLongGun(kind) || native) && atShoulder) {
+        const GevrPhysicalRifle draw = s_physicalShoulder;
+        s_physicalShoulder = gevrPhysicalUnloadRifle(hand, item);
+        if (draw.item) {
+            swapped = TRUE;
+            gevrPhysicalLoadRifle(hand, draw);
+            if (draw.item != item) {
+                s_physicalLeaving[hand] = item;
+                gunRequestHandWeaponChange(hand, draw.item, 1);
+            } else if (!native) {
+                g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = gevrTacticalHandRounds(gevrTacticalHandWell(kind, hand));
+            }
+            sysLogPrintf(LOG_NOTE, "tactical: hand %d swapped item %d with slung item %d", hand, item, draw.item);
+        } else {
+            s_physicalLeaving[hand] = item;
+            gunRequestHandWeaponChange(hand, hand == GUNRIGHT ? ITEM_FIST : ITEM_UNARMED, 1);
+            sysLogPrintf(LOG_NOTE, "tactical: item %d placed on shoulder mount", item);
+        }
+    } else if (gevrTacticalIsPistol(kind) && fabsf(local[0] - GEVR_TACTICAL_HIP_DROP_CM) < 22
+        && fabsf(fabsf(bodySide) - GEVR_TACTICAL_HIP_SIDE_CM) < 22 && fabsf(local[2]) < 25) {
+        if (s_physicalPistols[hip].item) return TRUE;
+        tacticalSessionStow(&s_tactical, kind);
+        s_physicalPistols[hip].item = item;
+        s_physicalPistols[hip].gun = s_tactical.stored[kind];
+        s_physicalPistols[hip].build = s_carriedPistolBuild;
+        s_physicalPistols[hip].fireMode = s_tacticalFireHand[hand].item == item ? s_tacticalFireHand[hand].mode : 0;
+        gevrTacticalRestoreFireMode(hand, ITEM_NOTHING, 0);
+        s_carriedPistolBuild = -1;
+        s_physicalLeaving[hand] = item;
+        gunRequestHandWeaponChange(hand, hand == GUNRIGHT ? ITEM_FIST : ITEM_UNARMED, 1);
+        bondinvRemoveItemByID(item);
+        sysLogPrintf(LOG_NOTE, "tactical: pistol %d placed in hip %d", item, hip);
+    } else {
+        int slot = -1;
+        coord3d world;
+        ObjectRecord *obj;
+        f32 floor;
+        for (int k = 0; k < (int)ARRAYCOUNT(s_physicalRifles); k++) if (!s_physicalRifles[k].prop) { slot = k; break; }
+        if (slot < 0 || !gevrTacticalLootCanPublish() || !gevrHordeGripWorld(at, &world)) return TRUE;
+        obj = create_new_item_instance_of_model(gevrTacticalDroppedProp(item), item);
+        if (!obj || !obj->prop || !obj->model) return TRUE;
+        obj->prop->pos = obj->runtime_pos = world;
+        obj->prop->stan = stanFindTileBelowPos(&world, NULL, &floor);
+        if (!obj->prop->stan) obj->prop->stan = g_CurrentPlayer->prop->stan;
+        matrix_4x4_set_position_and_rotation_around_y(world.f, 0, &obj->mtx);
+        matrix_scalar_multiply(obj->model->scale, obj->mtx.m[0]);
+        setupUpdateObjectRoomPosition(obj);
+        chrpropActivate(obj->prop); chrpropEnable(obj->prop);
+        gevrTacticalSaveDroppedGun(slot, obj->prop, item, kind, hand);
+        s_physicalLeaving[hand] = item;
+        gunRequestHandWeaponChange(hand, hand == GUNRIGHT ? ITEM_FIST : ITEM_UNARMED, 1);
+        if (gevrTacticalIsLongGun(kind) || native) gevrPhysicalRemoveTakenRifle(item);
+        else bondinvRemoveItemByID(item);
+        gevrPullFlingFromHand(obj->prop, ctrl);
+        gevrTacticalPublishWorldGun(slot);
+        sysLogPrintf(LOG_NOTE, "tactical: released item %d prop with magazine %u", item, s_physicalRifles[slot].gun.magazine.id);
+    }
+    if (toggle) {
+        s_physicalGunGrip[ctrl] = swapped && !supportRelease;
+        if (supportRelease && !swapped) {
+            s_tacticalSupport.active = FALSE;
+            s_gevrTwoHand = FALSE;
+            sysLogPrintf(LOG_NOTE, "tactical: support hand toggled off long gun grip");
+        }
+    }
+    return TRUE;
+}
+/* A watch-selected mission gadget must not silently destroy a physical gun.
+ * Return false if no safe mount/drop can be created, leaving the watch open. */
+int gevrTacticalPrepareWatchItem(s32 selected)
+{
+    extern ObjectRecord *create_new_item_instance_of_model(PROP modelnum, s32 weaponid);
+    extern void setupUpdateObjectRoomPosition(ObjectRecord *obj);
+    extern void chrpropActivate(PropRecord *prop);
+    extern void chrpropEnable(PropRecord *prop);
+    extern void matrix_4x4_set_position_and_rotation_around_y(f32 *position, f32 angle, Mtxf *matrix);
+    extern void matrix_scalar_multiply(f32 scalar, f32 *matrix);
+    /* The watch intentionally switches the renderer out of stereo. Tactical
+     * session ownership survives that transition, even though
+     * gevrTacticalMode() returns false while the watch is open. */
+    if (!gevrTacticalGadgetsEnabled()) return TRUE;
+    sysLogPrintf(LOG_NOTE, "tactical watch: selecting item %d while stereo %d", selected, g_gevrStereo);
+    /* Guns are drawn from their physical mounts, not selected in the watch. */
+    if ((gevrCampaignGunIsFirearm(selected) && selected != ITEM_GOLDENGUN && selected != ITEM_LASER)
+        || selected == ITEM_TACTICAL_KATANA
+        || ((selected == ITEM_KNIFE || selected == ITEM_THROWKNIFE) && gevrTacticalKnifeEnabled()))
+        return FALSE;
+    if (gevrTacticalGuidedThrow(selected) && selected != ITEM_BUG
+        && get_ammo_count_for_weapon(selected) <= 0
+        && (getCurrentPlayerWeaponId(GUNRIGHT) != selected
+            || g_CurrentPlayer->hands[GUNRIGHT].weapon_ammo_in_magazine <= 0)) return FALSE;
+    if (selected == ITEM_BUG) {
+        const bool held = getCurrentPlayerWeaponId(GUNRIGHT) == ITEM_BUG
+            && g_CurrentPlayer->hands[GUNRIGHT].weapon_ammo_in_magazine > 0;
+        if (!held && g_CurrentPlayer->ammoheldarr[AMMO_BUG] <= 0) {
+            if (s_tacticalModemPrepared) return FALSE;
+            give_cur_player_ammo(AMMO_BUG, 1);
+        }
+        s_tacticalModemPrepared = TRUE;
+    }
+    for (int hand=0; hand<2; hand++) {
+        s32 item=getCurrentPlayerWeaponId(hand), kind=gevrTacticalItem(item);
+        const int native = gevrTacticalNativeRifle(item);
+        if (kind < 0 && !native) continue;
+        if (kind >= 0 && (gevrTacticalHandWell(kind, hand) == TACTICAL_LEFT_PRIMARY_WELL
+            ? s_leftPrimaryKind != kind : !s_tactical.initialized[kind])) return FALSE;
+        if ((gevrTacticalIsLongGun(kind) || native) && !s_physicalShoulder.item) {
+            s_physicalShoulder = gevrPhysicalUnloadRifle(hand, item);
+            sysLogPrintf(LOG_NOTE,"tactical watch: stowed item %d on right shoulder", item);
+        } else if (gevrTacticalIsPistol(kind) && (!s_physicalPistols[0].item || !s_physicalPistols[1].item)) {
+            int hip=!s_physicalPistols[1].item ? 1 : 0;
+            tacticalSessionStow(&s_tactical,kind);
+            g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = 0;
+            s_physicalPistols[hip].item=item;
+            s_physicalPistols[hip].gun=s_tactical.stored[kind];
+            s_physicalPistols[hip].build = s_carriedPistolBuild;
+            s_physicalPistols[hip].fireMode = s_tacticalFireHand[hand].item == item ? s_tacticalFireHand[hand].mode : 0;
+            gevrTacticalRestoreFireMode(hand, ITEM_NOTHING, 0);
+            s_carriedPistolBuild = -1;
+            bondinvRemoveItemByID(item);
+            sysLogPrintf(LOG_NOTE,"tactical watch: stowed pistol %d in hip %d with magazine %u",item,hip,s_physicalPistols[hip].gun.magazine.id);
+        } else {
+            int slot=-1; ObjectRecord *obj; f32 floor; coord3d world=g_CurrentPlayer->prop->pos;
+            for (int k = 0; k < (int)ARRAYCOUNT(s_physicalRifles); k++) if (!s_physicalRifles[k].prop) { slot = k; break; }
+            if (slot < 0 || !gevrTacticalLootCanPublish()) return FALSE;
+            obj=create_new_item_instance_of_model(gevrTacticalDroppedProp(item),item);
+            if(!obj || !obj->prop || !obj->model)return FALSE;
+            world.y+=15.0f; obj->prop->pos=obj->runtime_pos=world;
+            obj->prop->stan=stanFindTileBelowPos(&world,NULL,&floor);
+            if(!obj->prop->stan)obj->prop->stan=g_CurrentPlayer->prop->stan;
+            matrix_4x4_set_position_and_rotation_around_y(world.f,0,&obj->mtx);
+            matrix_scalar_multiply(obj->model->scale,obj->mtx.m[0]);
+            setupUpdateObjectRoomPosition(obj);chrpropActivate(obj->prop);chrpropEnable(obj->prop);
+            gevrTacticalSaveDroppedGun(slot, obj->prop, item, kind, hand);
+            g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = 0;
+            if (native || gevrTacticalIsLongGun(kind)) gevrPhysicalRemoveTakenRifle(item);
+            else bondinvRemoveItemByID(item);
+            gevrTacticalPublishWorldGun(slot);
+            sysLogPrintf(LOG_NOTE,"tactical watch: dropped item %d with magazine %u",item,s_physicalRifles[slot].gun.magazine.id);
+        }
+    }
+    s_tacticalSupport.active = FALSE;
+    s_tacticalLeftSupportPress = ITEM_NOTHING;
+    memset(s_physicalGunGrip, 0, sizeof(s_physicalGunGrip));
+    memset(s_physicalLeaving, 0, sizeof(s_physicalLeaving));
+    return TRUE;
+}
+/* Logical controller with the upper button reserved for magazine release;
+ * -1 keeps the ordinary menu/use behaviour outside active tactical play. */
+int gevrTacticalMagReleaseController(void)
+{
+    int hand, item;
+    if (!g_gevrStereo || !gevrTacticalMode() || g_CurrentPlayer->bonddead
+        || g_CurrentPlayer->watch_animation_state != 0 || g_CurrentPlayer->mpmenuon
+        || lvlGetControlsLockedFlag() || gevrGunFitActive == 1 || gevrWeaponPanelOpen) return -1;
+    hand = gevrReloadSupportGun(); item = gevrTacticalItem(getCurrentPlayerWeaponId(hand));
+    return item >= 0 && item != TACTICAL_GUN_RPG ? 1 - hand : -1;
+}
+static void gevrTacticalClearFirearmReserves(void)
+{
+    for (int item = ITEM_WPPK; item <= ITEM_ROCKETLAUNCH; item++) {
+        if (item == ITEM_WATCHLASER) continue;
+        WeaponStats *weapon = get_ptr_item_statistics(item);
+        if (weapon && weapon->AmmoType > 0)
+            g_CurrentPlayer->ammoheldarr[weapon->AmmoType] = 0;
+    }
+}
+
+static unsigned int gevrTacticalSeedGear(int kind, int build)
+{
+    const int pistol = gevrTacticalIsPistol(kind);
+    const int well = pistol ? TACTICAL_RIGHT_PISTOL_WELL : TACTICAL_PRIMARY_WELL;
+    const int rig = pistol ? TACTICAL_RIG_PISTOL_1 : TACTICAL_RIG_PRIMARY_1;
+    const int slots = tacticalGunRigSlots(kind);
+    const GevrGearMount *mount = gevrTacticalGearFindMount(gevrTacticalGearDeployedAssembly(build), "mod_magazine");
+    const GevrGearPart *part = mount ? gevrTacticalGearPart(mount->part) : NULL;
+    const GevrGearMount *stock = gevrTacticalGearFindMount(
+        gevrTacticalGearStockAssembly(gevrTacticalGearBaseBuild(build)), "mod_magazine");
+    const unsigned capacity = part && part->capacity > 0 ? (unsigned)part->capacity : gevrTacticalCapacity(kind);
+    unsigned reserve = slots * capacity, loaded;
+    tacticalSessionEquip(&s_tactical, kind, capacity, capacity, &reserve, &loaded);
+    TacticalMagazine *installed = &s_tactical.inv.slots[well];
+    if (part && part->capacity > 0 && (!stock || stock->part != mount->part || kind == TACTICAL_GUN_GLOCK19X)) {
+        installed->gear_part = (unsigned)mount->part + 1;
+        for (int k = 0; k < slots; ++k) s_tactical.inv.slots[rig + k].gear_part = installed->gear_part;
+    } else if (mount && mount->part < 0) {
+        *installed = (TacticalMagazine){0};
+        s_tactical.inv.chambered[well] = 0;
+        loaded = 0;
+    }
+    return loaded;
+}
+
+static int gevrTacticalEquipSelectedGear(void)
+{
+    int primary, secondary;
+    const int stage = bossGetStageNum();
+    if (!gevrTacticalGearLoadout(stage, &primary, &secondary)
+        && (!gevrCampaignTryDeployGear(stage) || !gevrTacticalGearLoadout(stage, &primary, &secondary))) return FALSE;
+    const int rifle = gevrTacticalItem(primary), pistol = gevrTacticalItem(secondary);
+    if ((primary != ITEM_NOTHING && !gevrTacticalIsLongGun(rifle))
+        || (secondary != ITEM_NOTHING && !gevrTacticalIsPistol(pistol))) return FALSE;
+
+    gevrTacticalClearFirearmReserves();
+    for (int item = ITEM_WPPK; item <= ITEM_ROCKETLAUNCH; item++)
+        if (item != ITEM_WATCHLASER) bondinvRemoveItemByID(item);
+    const int pistolBuild = gevrTacticalGearDeployedBuild(TRUE);
+    const GevrGearMount *muzzle = gevrTacticalGearFindMount(gevrTacticalGearDeployedAssembly(pistolBuild), "mod_muzzle");
+    if (pistol == TACTICAL_GUN_USP && muzzle) secondary = muzzle->part >= 0 ? ITEM_WPPKSIL : ITEM_WPPK;
+    const int hip = VrLeftHandedMode ? 0 : 1;
+    unsigned pistolLoaded = 0;
+    if (pistol >= 0) {
+        pistolLoaded = gevrTacticalSeedGear(pistol, pistolBuild);
+        tacticalSessionStow(&s_tactical, pistol);
+        s_physicalPistols[hip].item = secondary;
+        s_physicalPistols[hip].gun = s_tactical.stored[pistol];
+        s_physicalPistols[hip].build = pistolBuild;
+        s_physicalPistols[hip].fireMode = 0;
+    }
+    s_physicalPrimary[GUNRIGHT] = primary == ITEM_NOTHING ? 0 : primary;
+    s_carriedPrimaryBuild[GUNRIGHT] = gevrTacticalGearDeployedBuild(FALSE);
+    gevrTacticalRestoreFireMode(GUNRIGHT, primary, 0);
+    const unsigned loaded = rifle >= 0 ? gevrTacticalSeedGear(rifle, s_carriedPrimaryBuild[GUNRIGHT]) : 0;
+    s_gearMissionActive = TRUE;
+    if (primary != ITEM_NOTHING) bondinvAddInvItem(primary);
+    gunRequestHandWeaponChange(GUNRIGHT, primary != ITEM_NOTHING ? primary : ITEM_FIST, TRUE);
+    sysLogPrintf(LOG_NOTE, "tactical gear: spawned %s (%u) and holstered %s (%u) with %d primary and %d pistol spares",
+        rifle >= 0 ? gevrTacticalGunName(rifle) : "Empty", loaded,
+        pistol >= 0 ? gevrTacticalGunName(pistol) : "Empty", pistolLoaded,
+        rifle >= 0 ? tacticalGunRigSlots(rifle) : 0, pistol >= 0 ? tacticalGunRigSlots(pistol) : 0);
+    return TRUE;
+}
+
+static void gevrTacticalEnsureStarted(void)
+{
+    if (!gevrTacticalMode() || s_tacticalStarted || g_CurrentPlayer->bonddead
+        || !g_CurrentPlayer->prop || g_CurrentPlayer->cameramode == CAMERAMODE_INTRO) return;
+    const int physical = sysArgCheck("--tactical-physical");
+    tacticalSessionInit(&s_tactical);
+    s_tactical.physical_rig = physical != 0;
+    if (sysArgCheck("--tactical-ppk")) tacticalSessionSetPistolMagazineType(&s_tactical, 4u);
+    s_tacticalStarted = TRUE;
+    const int range = gevrTacticalRangeActive();
+    if (physical && !range) gevrTacticalStockMissionMagazines();
+    if (!range && !gevrTacticalMissionAllowsStartingKit(bossGetStageNum())) {
+        sysLogPrintf(LOG_NOTE, "tactical: using mission equipment for stage %d", bossGetStageNum());
+        return;
+    }
+    if (physical) {
+        if (sysArgCheck("--input-script") && sysArgCheck("--tactical-sim")
+            && sysArgCheck("--tactical-test-blade-kit")) {
+            gevrTacticalGearCommit(bossGetStageNum(), ITEM_NOTHING, ITEM_NOTHING, -1, -1);
+            gevrTacticalGearSetMelee(sysArgGetInt("--tactical-test-blade-kit", ITEM_NOTHING));
+        }
+        const int melee = gevrTacticalGearMelee(bossGetStageNum());
+        if (gevrTacticalKnifeEnabled()) {
+            bondinvRemoveItemByID(ITEM_THROWKNIFE);
+            bondinvRemoveItemByID(ITEM_KNIFE);
+            if (melee == GEVR_GEAR_MELEE_DEFAULT || melee == ITEM_KNIFE) bondinvAddInvItem(ITEM_KNIFE);
+            g_CurrentPlayer->ammoheldarr[AMMO_KNIFE] = 0;
+            for (PropDefHeaderRecord *def = g_CurrentSetup.propDefs; def && def->type != PROPDEF_END;
+                 def += sizepropdef(def)) {
+                if (def->type == PROPDEF_COLLECTABLE && ((WeaponObjRecord *)def)->weaponnum == ITEM_THROWKNIFE)
+                    ((WeaponObjRecord *)def)->weaponnum = ITEM_KNIFE;
+            }
+            gevrTacticalKnifeSheathList();
+        }
+        if (melee == ITEM_TACTICAL_KATANA && gevrTacticalKatanaEnabled()) {
+            bondinvAddInvItem(ITEM_TACTICAL_KATANA);
+            gevrTacticalKatanaScabbard();
+        }
+        if (bondinvHasInvItem(ITEM_REMOTEMINE)) bondinvAddInvItem(ITEM_TRIGGER);
+        if (gevrTacticalEquipSelectedGear()) {
+            if (gevrTacticalRangeActive()) gevrTacticalRangeStockTables();
+            return;
+        }
+        const int skorpionStart = sysArgCheck("--tactical-skorpion-start") && gevrTacticalSkorpionEnabled();
+        const int ppkStart = !skorpionStart && sysArgCheck("--tactical-ppk-start") && sysArgCheck("--tactical-ppk");
+        const int starter = skorpionStart ? ITEM_SKORPION : ppkStart ? ITEM_WPPKSIL : ITEM_AK47;
+        WeaponStats *st = get_ptr_item_statistics(starter);
+        gevrTacticalClearFirearmReserves();
+        if (ppkStart || skorpionStart) {
+            for (int item = ITEM_WPPK; item <= ITEM_ROCKETLAUNCH; item++)
+                if (item != starter && item != ITEM_WATCHLASER) bondinvRemoveItemByID(item);
+        }
+        if (gevrTacticalLongItem(starter)) s_physicalPrimary[GUNRIGHT] = starter;
+        if (skorpionStart) s_physicalFreshPrimary = TRUE;
+        bondinvAddInvItem(starter);
+        if (st && st->AmmoType > 0) give_cur_player_ammo(st->AmmoType, skorpionStart ? 80 : ppkStart ? 21 : 120);
+        gunRequestHandWeaponChange(GUNRIGHT, starter, 1);
+        sysLogPrintf(LOG_NOTE, "tactical: %s trial loadout requested",
+            skorpionStart ? "Skorpion vz. 61" : ppkStart ? "PPK and two spare magazines" : "AK");
+    }
+    if (sysArgCheck("--tactical-mp5-start")) {
+        bondinvAddInvItem(ITEM_SPECTRE); bondinvAddInvItem(ITEM_MP5K);
+        sysLogPrintf(LOG_NOTE, "tactical: prototype inventory MP5 %d MP5K %d",
+                     bondinvHasInvItem(ITEM_SPECTRE), bondinvHasInvItem(ITEM_MP5K));
+    }
+}
+s32 gevrTacticalManualOn(s32 hand)
+{
+    return gevrTacticalMode() && hand >= 0 && hand < 2
+        && gevrTacticalItem(getCurrentPlayerWeaponId(hand)) >= 0;
+}
+s32 gevrTacticalCanFire(s32 hand)
+{
+    int item;
+    if (!gevrTacticalManualOn(hand)) return TRUE;
+    if (s_physicalLeaving[hand] || (s_tacticalSupport.active && s_tacticalSupport.gun == hand)) return FALSE;
+    item = gevrTacticalItem(getCurrentPlayerWeaponId(hand));
+    if (s_tacticalActionAsset == item && s_tacticalActionCtrl >= 0
+        && gevrTacticalHandInteraction(item, hand)->state == 3) return FALSE;
+    return s_tacticalStarted && gevrTacticalHandLoadedKind(item, hand) == item
+        && s_tactical.inv.chambered[gevrTacticalHandWell(item, hand)];
+}
+void gevrTacticalShotFired(s32 hand)
+{
+    if (!gevrTacticalLocalPlayer()) return;
+    const s32 item = getCurrentPlayerWeaponId(hand);
+    const int kind = gevrTacticalItem(item);
+    if (kind < 0 || s_physicalLeaving[hand]) return;
+
+    int duration = tacticalGunIsPistol(kind) ? 7 : 6;
+    const GevrWeaponStats *stats = gevrTacticalHeldStats(hand, item);
+    if (stats && gevrFireMode(stats, s_tacticalFireHand[hand].mode) != GEVR_FIRE_SEMI && stats->rpm > 0)
+        duration = (int)fmaxf(3.f, fminf(duration, 3600.f / stats->rpm));
+    s_tacticalShotMotion[hand] = (struct TacticalShotMotion){item, g_GlobalTimer, duration};
+
+    if (!gevrTacticalManualOn(hand)) return;
+    const int well = gevrTacticalHandWell(kind, hand);
+    if (gevrTacticalHandLoadedKind(kind, hand) == kind && tacticalFire(&s_tactical.inv, well) == TACTICAL_OK)
+    {
+        const unsigned loaded = gevrTacticalHandRounds(well);
+        g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = (s32)loaded;
+        if (sysArgCheck("--tactical-sim") && sysArgCheck("--input-script"))
+            sysLogPrintf(LOG_NOTE, "tactical sim: %s fired, %u loaded", gevrTacticalGunName(kind), loaded);
+    }
+}
+float gevrTacticalManualMotion(int asset, s32 hand)
+{
+    if (!gevrTacticalMode() || asset < 0 || asset >= TACTICAL_GUN_COUNT) return 0;
+    return hand == gevrReloadSupportGun() && asset == s_tacticalActionAsset ? s_tacticalActionCm : 0;
+}
+/* Visual state only: the controller remains in charge of the actual rack. */
+int gevrTacticalRacking(void)
+{
+    if (!gevrTacticalMode() || !s_tacticalStarted) return FALSE;
+    const s32 hand = gevrReloadSupportGun();
+    const int kind = gevrTacticalItem(getCurrentPlayerWeaponId(hand));
+    return kind >= 0 && gevrTacticalHandLoadedKind(kind, hand) == kind
+        && gevrTacticalHandInteraction(kind, hand)->state == 3;
+}
+s32 gevrTacticalActionController(void)
+{
+    return gevrTacticalRacking() ? s_tacticalActionCtrl : -1;
+}
+
+int gevrTacticalChamberState(int kind, s32 hand)
+{
+    if (!gevrTacticalMode() || !s_tacticalStarted || kind < 0 || kind >= TACTICAL_GUN_COUNT
+        || gevrTacticalHandLoadedKind(kind, hand) != kind) return -1;
+    const int well = gevrTacticalHandWell(kind, hand);
+    return s_tactical.inv.chambered[well] != 0;
+}
+float gevrTacticalActionMotion(int asset, s32 hand)
+{
+    const f32 pull = gevrTacticalManualMotion(asset, hand);
+    if (!gevrTacticalMode() || asset < 0 || asset >= TACTICAL_GUN_COUNT || hand < 0 || hand > 1) return 0;
+    if (hand == gevrReloadSupportGun() && asset == s_tacticalActionAsset && s_tacticalActionCtrl >= 0) return pull;
+    const struct TacticalShotMotion *motion = &s_tacticalShotMotion[hand];
+    return motion->item == getCurrentPlayerWeaponId(hand)
+        ? fmaxf(pull, gevrTacticalShotTravel(asset, g_GlobalTimer - motion->tick, motion->duration)) : pull;
+}
+int gevrTacticalInstalledMag(int asset, s32 hand)
+{
+    if (!gevrTacticalMode() || !s_tacticalStarted || asset < 0 || asset >= TACTICAL_GUN_COUNT
+        || gevrTacticalHandLoadedKind(asset, hand) != asset) return TRUE;
+    return s_tactical.inv.slots[gevrTacticalHandWell(asset, hand)].id != 0;
+}
+int gevrTacticalLoadedMagAsset(int asset, s32 hand)
+{
+    if (!gevrTacticalMode() || !s_tacticalStarted || asset < 0 || asset >= TACTICAL_GUN_COUNT
+        || gevrTacticalHandLoadedKind(asset, hand) != asset) return asset;
+    return tacticalMagazineGun(&s_tactical.inv.slots[gevrTacticalHandWell(asset, hand)]);
+}
+unsigned gevrTacticalHeldMagRounds(void)
+{
+    return gevrTacticalMode() && s_tacticalStarted ? s_tactical.inv.slots[TACTICAL_LEFT_HAND].rounds : 0;
+}
+unsigned gevrTacticalHeldMagCapacity(void)
+{
+    return gevrTacticalMode() && s_tacticalStarted ? s_tactical.inv.slots[TACTICAL_LEFT_HAND].capacity : 0;
+}
+unsigned int gevrTacticalHeldGearMagazine(void)
+{
+    return gevrTacticalMode() && s_tacticalStarted ? s_tactical.inv.slots[TACTICAL_LEFT_HAND].gear_part : 0;
+}
+int gevrTacticalHeldMagAsset(void)
+{
+    TacticalMagazine *mag;
+    if (!gevrTacticalMode() || !s_tacticalStarted) return -1;
+    mag = &s_tactical.inv.slots[TACTICAL_LEFT_HAND];
+    return tacticalMagazineGun(mag);
+}
+/* Both GE-X and Bean have magazines that can be handled separately. */
 extern int gevrBeanIsEnabled(void);
-extern s32 gevrBeanMagHeld(s32 hand);   /* gun.c: the hand's Bean gun has a magazine to take out */
+extern s32 gevrBeanMagHeld(s32 hand);
 extern s32 gevrBeanMagPoints(f32 centre[3], f32 well[3], f32 held[3]);
 #define gevrHandReloadEnabled() (VrManualReloading && (VrGexGuns || gevrBeanIsEnabled()))
 
@@ -19064,12 +21999,6 @@ static s32 gevrReloadGun(s32 item)
     return GEVR_ITEM_AS(item) >= ITEM_WPPK && GEVR_ITEM_AS(item) <= ITEM_ROCKETLAUNCH && GEVR_ITEM_AS(item) != ITEM_WATCHLASER && GEVR_ITEM_AS(item) != ITEM_LASER;
 }
 
-/* By its item: reloaded by hand, so never by itself. Every gun is, with either
- * model set (user, 2026-11-18: "the reload that happens automatically when you
- * run out of ammo should be off when gesture reloading is on, just like Gex ...
- * it should force gestures"). A gun whose model has no magazine to take (Bean's
- * sniper rifle and Golden Gun, or one whose mesh could not be cut) reloads by
- * the belt's touch or the chest cross, the game's own reload from a gesture. */
 static s32 gevrReloadItemByHand(s32 item)
 {
     return gevrReloadGun(item) && (VrGexGuns || gevrBeanIsEnabled());
@@ -19092,9 +22021,11 @@ s32 gevrReloadSupportGun(void)
 /* the weapon wheel's rifles (gevrWeaponCategory) and the sniper rifle */
 static s32 gevrReloadMagazineFed(s32 item)
 {
+    const int kind = gevrTacticalItem(item);
+    if (tacticalGunIsExpanded(kind)) return !tacticalGunIsPistol(kind);
     switch (item)
     {
-        case ITEM_SKORPION: case ITEM_AK47: case ITEM_UZI: case ITEM_MP5K:
+        case ITEM_SKORPION: case ITEM_AK47: case ITEM_TACTICAL_AK74N: case ITEM_UZI: case ITEM_MP5K:
         case ITEM_MP5KSIL: case ITEM_SPECTRE: case ITEM_M16: case ITEM_FNP90:
         case ITEM_SNIPERRIFLE:
             return TRUE;
@@ -19103,15 +22034,12 @@ static s32 gevrReloadMagazineFed(s32 item)
     }
 }
 
-/* hand reload is on for the local player, whatever is in the hands */
 static s32 gevrHandReloadBase(void)
 {
     return g_gevrStereo && gevrHandReloadEnabled() && g_CurrentPlayer != NULL
         && (!netIsActive() || get_cur_playernum() == netGetLocalSlot());
 }
 
-/* gunfire.c and lv.c: the local player reloads by hand. With Bean's models
- * that is while a gun is out. */
 s32 gevrHandReloadActive(void)
 {
     return gevrHandReloadBase()
@@ -19121,12 +22049,9 @@ s32 gevrHandReloadActive(void)
 
 s32 gevrManualReloadOn(s32 hand)
 {
-    return gevrHandReloadBase() && gevrReloadItemByHand(getCurrentPlayerWeaponId(hand));
+    return gevrTacticalManualOn(hand) || (gevrHandReloadBase() && gevrReloadItemByHand(getCurrentPlayerWeaponId(hand)));
 }
 
-/* lv.c: B or Y is the hand reload's (a magazine drops out, gevrGexDropMagazine),
- * not the game's reload. With GoldenEye X that is every item, as it was; with
- * Bean's models only the guns that reload by hand. */
 s32 gevrReloadButtonDrops(s32 hand)
 {
     return gevrHandReloadActive() && (VrGexGuns || gevrManualReloadOn(hand));
@@ -19217,6 +22142,12 @@ static s32 s_gevrGexGripSpent;       /* the off hand's grip seated a magazine: h
 static s32 s_gevrReloadSeatTicks;
 static f32 s_gevrReloadSeatAt[3];
 static s32 s_gevrGexSeatedTicks[2];  /* the label's "in" after a magazine seats (gevrReloadLabel) */
+
+static GevrNativeMagazineState gevrTacticalReadNativeMagazine(s32 hand)
+{
+    const int missing = s_gevrGexMag[hand] == GEVR_GEXMAG_OUT || s_gevrGexMag[hand] == GEVR_GEXMAG_INHAND;
+    return (GevrNativeMagazineState){g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine, missing};
+}
 
 extern void sub_GAME_7F0649D8(enum GUNHAND hand);   /* gunfire.c: the reload's ammo move */
 extern void currentPlayerCreateRocket(GUNHAND hand); /* gun.c: the launcher's loaded rocket */
@@ -19366,7 +22297,26 @@ static void gevrGexHeldDropped(void)
 /* Loaded rounds belong to the holstered gun, not the shared reserve. Keep
  * each hand's copy separately, including an empty or missing magazine. */
 typedef struct { s32 valid, rounds, missing, ammoType; } GevrStoredMagazine;
-static GevrStoredMagazine s_gevrStoredMag[2][ITEM_ROCKETLAUNCH + 1];
+static GevrStoredMagazine s_gevrStoredMag[2][ITEM_IDS_MAX];
+
+static void gevrTacticalRestoreNativeMagazine(void)
+{
+    for (int hand = 0; hand < 2; ++hand) {
+        const int item = s_nativePending[hand].item;
+        if (item == ITEM_NOTHING) continue;
+        if (g_GlobalTimer - s_nativePending[hand].at > 180) {
+            s_nativePending[hand].item = ITEM_NOTHING;
+            continue;
+        }
+        if (getCurrentPlayerWeaponId(hand) != item
+            || g_CurrentPlayer->hands[hand].weapon_action_state != GUN_ANIM_STATE_IDLE) continue;
+        g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = s_nativePending[hand].magazine.rounds;
+        s_gevrGexMag[hand] = s_nativePending[hand].magazine.missing ? GEVR_GEXMAG_OUT : GEVR_GEXMAG_IN;
+        s_gevrGexMagItem[hand] = item;
+        s_gevrStoredMag[hand][item].valid = FALSE;
+        s_nativePending[hand].item = ITEM_NOTHING;
+    }
+}
 
 s32 gevrReloadStoredRounds(s32 hand, s32 item)
 {
@@ -19396,6 +22346,52 @@ s32 gevrReloadReservedRounds(s32 ammoType)
 
 void gevrReloadInventoryReset(void)
 {
+    extern void gevrEnemyRigReset(void);
+    extern void gevrAvatarGuardReset(void);
+    gevrEnemyRigReset();
+    gevrAvatarGuardReset();
+    tacticalSessionInit(&s_tactical);
+    s_tacticalStarted = s_tacticalClaim = s_tacticalReleaseWas = s_tacticalModemPrepared = s_tacticalTestStereoOff = 0;
+    s_tacticalDecoderHand = -1;
+    s_tacticalMagCtrl = -1;
+    memset(s_tacticalGadgetTriggerWas, 0, sizeof(s_tacticalGadgetTriggerWas));
+    s_tacticalWatchReleaseAt = 0;
+    memset(s_tacticalMineTriggerUsed, 0, sizeof(s_tacticalMineTriggerUsed));
+    s_tacticalTestGadgetTrigger = -1;
+    s_tacticalMagNeedsRegrip = FALSE;
+    memset(s_tacticalTriggerWas, 0, sizeof(s_tacticalTriggerWas));
+    memset(s_tacticalTriggerPressed, 0, sizeof(s_tacticalTriggerPressed));
+    s_tacticalActionCm = 0; s_tacticalActionAsset = -1;
+    s_tacticalActionCtrl = -1;
+    memset(s_tacticalShotMotion, 0, sizeof(s_tacticalShotMotion));
+    memset(s_tacticalWorldMags, 0, sizeof(s_tacticalWorldMags));
+    memset(s_physicalRifles, 0, sizeof(s_physicalRifles));
+    memset(s_physicalPistols, 0, sizeof(s_physicalPistols));
+    s_gearMissionActive = FALSE;
+    s_carriedPrimaryBuild[GUNRIGHT] = s_carriedPrimaryBuild[GUNLEFT] = s_carriedPistolBuild = -1;
+    memset(s_tacticalFireHand, 0, sizeof(s_tacticalFireHand));
+    memset(s_tacticalStatsCache, 0, sizeof(s_tacticalStatsCache));
+    memset(s_tacticalStowedMass, 0, sizeof(s_tacticalStowedMass));
+    s_tacticalFireNoticeUntil = 0;
+    s_focusedOptic = -1;
+    gevrTacticalOpticsReset();
+    memset(&s_tacticalSupport, 0, sizeof(s_tacticalSupport));
+    s_tacticalLeftSupportPress = ITEM_NOTHING;
+    s_gevrTwoHand = FALSE;
+    s_gevrTwoHandAmt = 0.0f;
+    s_gevrTwoHandResetDir = TRUE;
+    s_physicalShoulder = (GevrPhysicalRifle){0};
+    memset(s_physicalPrimary, 0, sizeof(s_physicalPrimary));
+    memset(s_physicalGunGrip, 0, sizeof(s_physicalGunGrip));
+    memset(s_physicalLeaving, 0, sizeof(s_physicalLeaving));
+    s_leftPrimaryKind = -1;
+    tacticalInteractionInit(&s_leftPrimaryInteraction, TACTICAL_LEFT_PRIMARY_WELL, TACTICAL_LEFT_HAND);
+    s_physicalFreshPrimary = s_physicalFreshPistol = 0;
+    s_tacticalKnifeHand = -1;
+    s_tacticalKatanaHand = -1;
+    s_tacticalKatanaNearTick = -1;
+    s_nativePending[GUNRIGHT].item = s_nativePending[GUNLEFT].item = ITEM_NOTHING;
+    s_physicalSimGrip = 0;
     memset(s_gevrStoredMag, 0, sizeof(s_gevrStoredMag));
     s_gevrGexMag[0] = s_gevrGexMag[1] = GEVR_GEXMAG_IN;
     s_gevrGexMagItem[0] = s_gevrGexMagItem[1] = -1;
@@ -19421,6 +22417,19 @@ static void gevrReloadInventoryRelease(void)
 s32 gevrReloadStow(s32 hand, s32 item)
 {
     GevrStoredMagazine *saved;
+    if (s_tacticalStarted && sysArgCheck("--tactical-physical") && gevrTacticalLongItem(item)
+        && (s_physicalPrimary[hand] == item || s_physicalLeaving[hand] == item)) {
+        /* The grip path has already saved the outgoing rifle. Its replacement
+         * may be installed in the same hand before the model finishes lowering. */
+        g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = 0;
+        return TRUE;
+    }
+    if (gevrTacticalMode() && gevrTacticalItem(item) >= 0 && s_tacticalStarted
+        && s_tactical.initialized[gevrTacticalItem(item)]) {
+        tacticalSessionStow(&s_tactical, gevrTacticalItem(item));
+        g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = 0;
+        return TRUE;
+    }
     if (!gevrHandReloadBase() || hand < 0 || hand > 1 || !gevrReloadItemByHand(item)) return FALSE;
     saved = &s_gevrStoredMag[hand][item];
     if (saved->valid) return TRUE;   /* SWITCH_LOWER already stored it */
@@ -19441,6 +22450,23 @@ s32 gevrReloadDraw(s32 hand)
 {
     s32 item;
     GevrStoredMagazine *saved;
+    if (gevrTacticalManualOn(hand)) {
+        int kind = gevrTacticalItem(getCurrentPlayerWeaponId(hand));
+        const int well = gevrTacticalHandWell(kind, hand);
+        WeaponStats *stats = get_ptr_item_statistics(getCurrentPlayerWeaponId(hand));
+        if (stats && (kind >= TACTICAL_GUN_MP5 || (kind == TACTICAL_GUN_USP && sysArgCheck("--tactical-ppk")))) stats->MagSize = gevrTacticalCapacity(kind);
+        if (s_tacticalStarted) {
+            unsigned int loose = 0, loaded = 0;
+            if (gevrTacticalHandLoadedKind(kind, hand) == kind
+                || (well != TACTICAL_LEFT_PRIMARY_WELL && s_tactical.initialized[kind]
+                    && tacticalSessionEquip(&s_tactical, kind, 0, gevrTacticalCapacity(kind), &loose, &loaded) == TACTICAL_OK)) {
+                loaded = gevrTacticalHandRounds(well);
+                g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = (s32)loaded;
+                if (kind == TACTICAL_GUN_RPG && loaded) currentPlayerCreateRocket(hand);
+                return TRUE;
+            }
+        }
+    }
     if (!gevrHandReloadBase() || hand < 0 || hand > 1) return FALSE;
     item = getCurrentPlayerWeaponId(hand);
     if (!gevrReloadItemByHand(item)) return FALSE;
@@ -19755,6 +22781,1472 @@ static void gevrReloadMagPoint(const f32 gun[3], const f32 gr[3], const f32 gu[3
     }
 }
 
+/* Experimental tracked interaction bridge. Zones are provisional and the
+ * world-magazine visual/physics renderer is still to be implemented. */
+static void gevrTacticalModelPoint(s32 hand, const Mtxf *model, const f32 point[3], f32 out[3])
+{
+    const f32 x = hand == GUNLEFT && !gevrTacticalUnmirroredItem(getCurrentPlayerWeaponId(hand))
+        ? -point[0] : point[0];
+    for (int j = 0; j < 3; ++j)
+        out[j] = model->m[3][j] + .1f * (x * model->m[0][j]
+            + point[1] * model->m[1][j] + point[2] * model->m[2][j]);
+}
+
+static void gevrTacticalActionContact(s32 hand, int kind, f32 out[3])
+{
+    gevrTacticalActionSocket(kind, sysArgCheck("--tactical-ppk"), sysArgCheck("--tactical-physical"), out);
+    if (kind == TACTICAL_GUN_SKORPION && gevrTacticalWeaponController(hand) == 0)
+        out[0] = -out[0];
+    if (kind == TACTICAL_GUN_SVD && gevrTacticalGearFindMount(gevrTacticalCarriedAssembly(kind, hand), "mod_barrel")) {
+        out[0] = -41.f; out[1] = 33.f; out[2] = 209.f;
+    }
+}
+
+static s32 gevrTacticalInteractionPoints(s32 hand, int kind, Mtxf *model, f32 mag[3], f32 action[3])
+{
+    static const f32 magazine[TACTICAL_GUN_COUNT][3] = {
+        {0, -89, 149}, {0, -38, 33}, {0, -104, 143}, {0, -63, 130}, {0,-93,146}, {0,-35,-60},
+        {0, GEVR_SKORPION_MAG_Y, GEVR_SKORPION_MAG_Z}, {0, GEVR_SVD_MAG_Y, GEVR_SVD_MAG_Z},
+        [TACTICAL_GUN_RPG] = {0, GEVR_RPG_MUZZLE_Y, GEVR_RPG_MUZZLE_Z}
+    };
+    if (kind < 0 || kind >= TACTICAL_GUN_COUNT || !gevrStereoGunMatrix(hand, model)) return FALSE;
+    f32 m[3] = {magazine[kind][0], magazine[kind][1], magazine[kind][2]};
+    if (tacticalGunIsExpanded(kind) || kind == TACTICAL_GUN_SVD) {
+        const int well = gevrTacticalHandWell(kind, hand);
+        const GevrGearAssembly *assembly = gevrTacticalCarriedAssembly(kind, hand);
+        if (tacticalGunIsExpanded(kind) || gevrTacticalGearFindMount(assembly, "mod_barrel"))
+            gevrTacticalGearMagazineContact(kind, assembly, s_tactical.inv.slots[well].gear_part, m);
+    }
+    f32 a[3];
+    const s32 physical = sysArgCheck("--tactical-physical");
+    if (kind == TACTICAL_GUN_AK && physical)
+        gevrTacticalScaleAkPoint(&m[0], &m[1], &m[2]);
+    gevrTacticalActionContact(hand, kind, a);
+    gevrTacticalModelPoint(hand, model, m, mag);
+    gevrTacticalModelPoint(hand, model, a, action);
+    return TRUE;
+}
+
+static void gevrTacticalCaptureActionHand(s32 ctrl, const Mtxf *gun)
+{
+    Mtxf glove;
+    if (!gevrStereoTacticalHandMatrix(ctrl, &glove)) return;
+    for (int axis = 0; axis < 3; ++axis) {
+        const f32 *v = gun->m[axis];
+        const f32 length2 = SQ(v[0]) + SQ(v[1]) + SQ(v[2]);
+        if (length2 <= 1e-8f) return;
+        for (int row = 0; row < 3; ++row)
+            s_tacticalActionBasis[row][axis] = (glove.m[row][0]*v[0]
+                + glove.m[row][1]*v[1] + glove.m[row][2]*v[2]) / length2;
+    }
+    s_tacticalActionCtrl = ctrl;
+}
+
+s32 gevrTacticalActionHandMatrix(Mtxf *out)
+{
+    Mtxf gun;
+    const s32 hand = gevrReloadSupportGun();
+    const int kind = s_tacticalActionAsset;
+    const s32 physical = sysArgCheck("--tactical-physical");
+    f32 local[3], contact[3];
+    if (gevrTacticalActionController() < 0 || kind < 0 || !gevrStereoGunMatrix(hand, &gun)) return FALSE;
+    gevrTacticalActionContact(hand, kind, local);
+    local[2] -= gevrTacticalActionShift(kind, s_tacticalActionCm, physical);
+    gevrTacticalModelPoint(hand, &gun, local, contact);
+    matrix_4x4_set_identity(out);
+    for (int col = 0; col < 3; ++col) {
+        for (int row = 0; row < 3; ++row)
+            out->m[row][col] = s_tacticalActionBasis[row][0] * gun.m[0][col]
+                + s_tacticalActionBasis[row][1] * gun.m[1][col]
+                + s_tacticalActionBasis[row][2] * gun.m[2][col];
+        out->m[3][col] = contact[col] - (gevrTacticalPinchPoint[0] * out->m[0][col]
+            + gevrTacticalPinchPoint[1] * out->m[1][col] + gevrTacticalPinchPoint[2] * out->m[2][col]);
+    }
+    return TRUE;
+}
+
+typedef struct GevrRigMagazineBounds {
+    int valid, asset;
+    unsigned int part;
+    f32 centre[3], halfCm[3];
+} GevrRigMagazineBounds;
+
+static const GevrRigMagazineBounds *gevrTacticalRigMagazineBounds(int slot, const TacticalMagazine *mag)
+{
+    static GevrRigMagazineBounds cache[5];
+    GevrRigMagazineBounds *bounds = &cache[slot];
+    const int asset = tacticalMagazineGun(mag);
+    if (asset < 0) return NULL;
+    if (bounds->valid && bounds->asset == asset && bounds->part == mag->gear_part) return bounds;
+
+    f32 low[3], high[3];
+    if (!gevrTacticalLooseMagBounds(mag->gear_part, asset, low, high)) return NULL;
+    bounds->valid = TRUE;
+    bounds->asset = asset;
+    bounds->part = mag->gear_part;
+    for (int axis = 0; axis < 3; ++axis) {
+        bounds->centre[axis] = .5f * (low[axis] + high[axis]);
+        bounds->halfCm[axis] = .5f * (high[axis] - low[axis]) * GEVR_VIEWMODEL_CM * .1f;
+    }
+    return bounds;
+}
+
+/* Keep the three rifle pouches side by side at the same height, with
+ * the pistol pouches outboard. Drawing and fingertip reach share this pose. */
+static s32 gevrTacticalRigPose(int slot, s32 physical, f32 pose[4][3])
+{
+    const f32 sideSign = VrLeftHandedMode ? -1.f : 1.f;
+    f32 fit[3] = {35.f, sideSign * s_tacticalRigSide[slot], 18.f};
+    if (physical) {
+        fit[0] = GEVR_TACTICAL_RIG_DROP_CM;
+        fit[2] = GEVR_TACTICAL_RIG_AHEAD_CM;
+    }
+    if (!gevrBodyReloadPose(1, fit, pose)) return FALSE;
+    if (physical) gevrTacticalFlatRigAxes(pose);
+    return TRUE;
+}
+
+static f32 gevrTacticalRigCentreDistance(const f32 at[3], const f32 centre[3], f32 cm)
+{
+    return sqrtf(SQ(at[0] - centre[0]) + SQ(at[1] - centre[1]) + SQ(at[2] - centre[2])) / cm;
+}
+
+static int gevrTacticalLegacyRigInput(s32 ctrl, const f32 wrist[3], const f32 tip[3], TacticalInteractionInput *in)
+{
+    const f32 drop = 35.f, ahead = 18.f;
+    const f32 sideSign = ((ctrl == 0) != (VrLeftHandedMode != 0)) ? -1.f : 1.f;
+    f32 palm[3], finger[3], distances[5];
+    const s32 palmTracked = gevrReloadBeltLocal(ctrl, wrist, palm);
+    const s32 fingerTracked = gevrReloadBeltLocal(ctrl, tip, finger);
+
+    in->rig_pickup_bounds_valid = TRUE;
+    in->rig_pickup_radius_cm = GEVR_TACTICAL_RIG_GRAB_RADIUS_CM;
+    for (int k = 0; k < 5; ++k) {
+        const f32 side = s_tacticalRigSide[k];
+        in->rig_distance_cm[k] = palmTracked
+            ? sqrtf(SQ(palm[0] - drop) + SQ(palm[1] * sideSign - side) + SQ(palm[2] - ahead)) : INFINITY;
+        distances[k] = fingerTracked
+            ? sqrtf(SQ(finger[0] - drop) + SQ(finger[1] * sideSign - side) + SQ(finger[2] - ahead)) : INFINITY;
+        in->rig_pickup_distance_cm[k] = INFINITY;
+    }
+    const int slot = gevrTacticalRigNearestSlot(distances, in->rig_pickup_radius_cm);
+    if (slot < 0 || !s_tactical.inv.slots[TACTICAL_RIG_PRIMARY_1 + slot].id) return -1;
+    in->rig_pickup_distance_cm[slot] = distances[slot];
+    return slot;
+}
+
+static int gevrTacticalRigInput(s32 ctrl, const f32 wrist[3], const f32 tip[3], TacticalInteractionInput *in)
+{
+    if (!sysArgCheck("--tactical-physical")) return gevrTacticalLegacyRigInput(ctrl, wrist, tip, in);
+
+    const f32 cm = GEVR_UNITS_PER_METRE * D_800364CC / 100.f;
+    f32 pad[3];
+    for (int i = 0; i < 3; ++i) pad[i] = tip[i] + .3f * (wrist[i] - tip[i]);
+    int best = -1;
+    f32 bestSurface = GEVR_TACTICAL_RIG_SURFACE_CM, bestCentre = INFINITY;
+    in->rig_pickup_bounds_valid = TRUE;
+    in->rig_pickup_radius_cm = GEVR_TACTICAL_RIG_SURFACE_CM;
+    for (int slot = 0; slot < 5; ++slot) {
+        f32 pose[4][3];
+        in->rig_distance_cm[slot] = in->rig_pickup_distance_cm[slot] = INFINITY;
+        if (cm <= 1e-6f || !gevrTacticalRigPose(slot, TRUE, pose)) continue;
+        in->rig_distance_cm[slot] = gevrTacticalRigCentreDistance(wrist, pose[3], cm);
+
+        const TacticalMagazine *mag = &s_tactical.inv.slots[TACTICAL_RIG_PRIMARY_1 + slot];
+        const GevrRigMagazineBounds *bounds = mag->id ? gevrTacticalRigMagazineBounds(slot, mag) : NULL;
+        if (!bounds) continue;
+        const f32 distance = fminf(gevrTacticalFlatRigDistance(tip, pose, cm, bounds->halfCm),
+            gevrTacticalFlatRigDistance(pad, pose, cm, bounds->halfCm));
+        const f32 centre = gevrTacticalRigCentreDistance(tip, pose[3], cm);
+        if (distance < bestSurface || (distance == bestSurface && centre < bestCentre)) {
+            best = slot;
+            bestSurface = distance;
+            bestCentre = centre;
+        }
+    }
+    if (best >= 0) in->rig_pickup_distance_cm[best] = bestSurface;
+    return best;
+}
+
+static s32 gevrTacticalTakeNearbyMagazine(s32 ctrl, const f32 wrist[3], const f32 tip[3], s32 corpsesOnly)
+{
+    extern unsigned int gevrEnemyRigFindReachable(const coord3d *tip, const coord3d *fingerPad,
+        int corpsesOnly, float *distanceSquared);
+    extern int gevrEnemyRigTakeId(unsigned int id, TacticalInventory *inventory, int hand);
+    coord3d world, fingerPad;
+    f32 pad[3], corpseDist;
+    int droppedSlot = -1;
+    f32 floorDist = 400.f;
+    const int handSlot = TACTICAL_LEFT_HAND;
+    if (s_tactical.inv.slots[handSlot].id || !gevrHordeGripWorld(tip, &world)) return FALSE;
+    for (int k = 0; k < 3; ++k) pad[k] = tip[k] + .45f * (wrist[k] - tip[k]);
+    unsigned int rigId = gevrEnemyRigFindReachable(&world,
+        gevrHordeGripWorld(pad, &fingerPad) ? &fingerPad : NULL, corpsesOnly, &corpseDist);
+
+    for (int k = 0; k < 128; ++k) {
+        if (!s_tacticalWorldMags[k].mag.id) continue;
+        const coord3d *at = &s_tacticalWorldMags[k].pos;
+        const f32 dist = SQ(world.x - at->x) + SQ(world.y - at->y) + SQ(world.z - at->z);
+        if (dist < floorDist) {
+            floorDist = dist;
+            droppedSlot = k;
+        }
+    }
+    if (gevrTacticalLootEnabled()) {
+        if (droppedSlot >= 0 && (!rigId || floorDist <= corpseDist) && s_tacticalWorldMags[droppedSlot].netId)
+            return gevrTacticalLootClaim(s_tacticalWorldMags[droppedSlot].netId, ctrl);
+        if (rigId && (droppedSlot < 0 || corpseDist < floorDist))
+            return gevrTacticalLootClaim(rigId, ctrl);
+    }
+    if (droppedSlot >= 0 && (!rigId || floorDist <= corpseDist)
+        && tacticalAddMagazine(&s_tactical.inv, handSlot, s_tacticalWorldMags[droppedSlot].mag) == TACTICAL_OK) {
+        s_tacticalWorldMags[droppedSlot] = (GevrWorldMagazine){0};
+        sysLogPrintf(LOG_NOTE, "tactical: controller %d picked up dropped magazine", ctrl);
+    } else if (rigId && gevrEnemyRigTakeId(rigId, &s_tactical.inv, handSlot)) {
+        sysLogPrintf(LOG_NOTE, "tactical: controller %d took rig magazine %u%s", ctrl, rigId,
+            corpsesOnly ? " with a free hand" : "");
+    } else {
+        return FALSE;
+    }
+    s_tacticalMagCtrl = ctrl;
+    s_tacticalMagNeedsRegrip = FALSE;
+    gevrControllerGripBuzz(ctrl);
+    return TRUE;
+}
+
+static s32 gevrTacticalDropMagazineInWorld(s32 ctrl, const f32 at[3], TacticalMagazine mag)
+{
+    coord3d world;
+    if (!gevrHordeGripWorld(at, &world)) return FALSE;
+    for (int k = 0; k < 128; ++k) {
+        if (s_tacticalWorldMags[k].mag.id) continue;
+        f32 floor;
+        s_tacticalWorldMags[k] = (GevrWorldMagazine){.mag = mag, .pos = world, .flat = TRUE,
+            .clearance = gevrTacticalMagazineClearance(mag, TRUE)};
+        if (sysArgCheck("--tactical-physical")) {
+            extern void gevrPullHandVelocity(s32 ctrl, f32 out[3]);
+            f32 velocity[3];
+            gevrPullHandVelocity(ctrl, velocity);
+            s_tacticalWorldMags[k].vx = velocity[0] / 60.f;
+            s_tacticalWorldMags[k].speed = velocity[1] / 60.f;
+            s_tacticalWorldMags[k].vz = velocity[2] / 60.f;
+        }
+        s_tacticalWorldMags[k].falling = stanFindTileBelowPos(&world, NULL, &floor) != NULL;
+        if (s_tacticalWorldMags[k].falling) s_tacticalWorldMags[k].ground = floor;
+        gevrTacticalPublishWorldMagazine(&s_tacticalWorldMags[k]);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* Run the ordinary rig/storage transition without a weapon as a destination. */
+static void gevrTacticalReleaseLooseMagazine(s32 ctrl, const f32 wrist[3], const f32 tip[3])
+{
+    TacticalInteraction interaction;
+    TacticalInteractionInput in = {0};
+    TacticalMagazine dropped = {0};
+    unsigned int ejected;
+    tacticalInteractionInit(&interaction, TACTICAL_PRIMARY_WELL, TACTICAL_LEFT_HAND);
+    interaction.state = 2;
+    in.tracked = TRUE;
+    in.grab_radius_cm = 20.f;
+    in.magazine_distance_cm = in.action_distance_cm = INFINITY;
+    gevrTacticalRigInput(ctrl, wrist, tip, &in);
+    const int event = tacticalInteractionTick(&interaction, &s_tactical.inv, &in, &dropped, &ejected);
+    if (event == TACTICAL_EVENT_MAG_DROPPED && !gevrTacticalDropMagazineInWorld(ctrl, tip, dropped)) {
+        tacticalAddMagazine(&s_tactical.inv, TACTICAL_LEFT_HAND, dropped);
+        s_tacticalMagNeedsRegrip = TRUE;
+    } else if (event) {
+        s_tacticalMagCtrl = -1;
+        gevrControllerGripBuzz(ctrl);
+        sysLogPrintf(LOG_NOTE, "tactical: controller %d released loose magazine, event %d", ctrl, event);
+    }
+}
+
+static void gevrTacticalSeatNativeMagazine(s32 ctrl, const f32 tip[3], f32 cm)
+{
+    if (!sysArgCheck("--tactical-campaign-gear") || cm <= 1e-6f) return;
+    const s32 hand = gevrReloadSupportGun();
+    if (ctrl == gevrTacticalWeaponController(hand) || !gevrTacticalHandEmpty(ctrl)) return;
+    const s32 item = getCurrentPlayerWeaponId(hand);
+    const int donor = gevrTacticalNativeMagazineGun(item);
+    if (donor < 0 || gevrTacticalItem(item) >= 0) return;
+    const struct hand *heldGun = &g_CurrentPlayer->hands[hand];
+    const WeaponStats *stats = get_ptr_item_statistics((ITEM_IDS)item);
+    const TacticalMagazine *mag = &s_tactical.inv.slots[TACTICAL_LEFT_HAND];
+    if (!mag->id || mag->type != tacticalGunMagazineType(donor, 0)
+        || heldGun->weapon_ammo_in_magazine != 0 || heldGun->weapon_action_state != GUN_ANIM_STATE_IDLE
+        || !stats || stats->MagSize <= 0 || mag->rounds > (unsigned)stats->MagSize) return;
+
+    f32 well[3], centre[3], visibleHeld[3];
+    const s32 gex = gevrGexByHand(hand);
+    if (gex && s_gevrGexMag[hand] != GEVR_GEXMAG_OUT) return;
+    if (!gex || !(gevrGexMagPoints(centre, well, visibleHeld) & 1)) {
+        f32 gun[3], right[3], up[3], back[3];
+        if (!gevrGripAxesRaw(gevrTacticalWeaponController(hand), gun, right, up, back)) return;
+        gevrReloadMagPoint(gun, right, up, back, cm, gex, well);
+    }
+    if (gevrTacticalRigCentreDistance(tip, well, cm) > 11.f) return;
+    TacticalMagazine seated;
+    if (tacticalDropMagazine(&s_tactical.inv, TACTICAL_LEFT_HAND, &seated) != TACTICAL_OK) return;
+    s_tacticalMagCtrl = -1;
+    s_gevrGexGripSpent = TRUE;
+    gevrGexMagIn(hand, "from a looted magazine", (s32)seated.rounds);
+}
+
+static void gevrTacticalLooseMagazineTick(s32 ctrl, s32 trigger)
+{
+    const s32 owner = gevrTacticalHeldMagController();
+    if (owner != ctrl && (owner >= 0 || !s_tacticalTriggerPressed[ctrl] || !gevrTacticalHandEmpty(ctrl)))
+        return;
+
+    f32 wrist[3], tip[3], right[3], up[3], back[3];
+    if (!gevrVrGripTracked(ctrl) || !gevrGripAxesRaw(ctrl, wrist, right, up, back)) {
+        if (owner == ctrl) s_tacticalMagNeedsRegrip = TRUE;
+        return;
+    }
+    const f32 cm = GEVR_UNITS_PER_METRE * D_800364CC / 100.f;
+    gevrTacticalFingertip(wrist, right, up, back, cm, gevrGunSizeFactor(),
+        (VrLeftHandedMode != 0) != (ctrl == 0), tip);
+    if (owner < 0) {
+        TacticalInteractionInput input = {0};
+        const int slot = gevrTacticalRigInput(ctrl, wrist, tip, &input);
+        if (slot >= 0 && tacticalMoveMagazine(&s_tactical.inv, TACTICAL_RIG_PRIMARY_1 + slot, TACTICAL_LEFT_HAND) == TACTICAL_OK) {
+            s_tacticalMagCtrl = ctrl;
+            gevrControllerGripBuzz(ctrl);
+            sysLogPrintf(LOG_NOTE, "tactical: controller %d took chest magazine %u", ctrl,
+                s_tactical.inv.slots[TACTICAL_LEFT_HAND].id);
+        } else gevrTacticalTakeNearbyMagazine(ctrl, wrist, tip, TRUE);
+    } else if (s_tacticalMagNeedsRegrip) {
+        if (trigger) s_tacticalMagNeedsRegrip = FALSE;
+    } else if (!trigger) {
+        gevrTacticalReleaseLooseMagazine(ctrl, wrist, tip);
+    } else {
+        gevrTacticalSeatNativeMagazine(ctrl, tip, cm);
+    }
+}
+
+static void gevrTacticalTick(void)
+{
+    extern _Bool get_button_state(int hand_index, const char *button_name);
+    const s32 hand = gevrReloadSupportGun();
+    const s32 gunctrl = gevrTacticalWeaponController(hand);
+    const s32 ctrl = 1 - gunctrl;
+    const int kind = gevrTacticalItem(getCurrentPlayerWeaponId(hand));
+    const f32 cm = GEVR_UNITS_PER_METRE * D_800364CC / 100.0f;
+    TacticalInteractionInput in = {0};
+    TacticalMagazine dropped;
+    TacticalInteraction *interaction;
+    Mtxf gunPose;
+    f32 off[3], tip[3], r[3], u[3], b[3], mag[3], action[3];
+    f32 d2mag = 0, d2action = 0;
+    unsigned int loaded, ejected = 0;
+    int event;
+    s_tacticalClaim = FALSE;
+    if (!gevrTacticalMode() || kind < 0 || g_CurrentPlayer->bonddead) return;
+    if (s_physicalLeaving[hand]) return;
+    gevrTacticalEnsureStarted();
+    if (!s_tacticalStarted) return;
+    const int well = gevrTacticalHandWell(kind, hand);
+    const s32 physical = sysArgCheck("--tactical-physical");
+    if (well == TACTICAL_LEFT_PRIMARY_WELL && s_leftPrimaryKind != kind) return;
+    if (well != TACTICAL_LEFT_PRIMARY_WELL && !s_tactical.initialized[kind]) {
+        WeaponStats *st;
+        unsigned int reserve;
+        int count = g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine;
+        if (g_CurrentPlayer->hands[hand].weapon_action_state != GUN_ANIM_STATE_IDLE) return;
+        st = get_ptr_item_statistics(getCurrentPlayerWeaponId(hand));
+        if (!st || st->AmmoType <= 0 || count < 0) return;
+        if (sysArgCheck("--tactical-physical") && gevrTacticalIsLongGun(kind) && s_physicalFreshPrimary) {
+            count = gevrTacticalCapacity(kind);
+            s_physicalFreshPrimary = FALSE;
+        }
+        if (sysArgCheck("--tactical-physical") && gevrTacticalIsPistol(kind) && s_physicalFreshPistol) {
+            count = gevrTacticalCapacity(kind);
+            s_physicalFreshPistol = FALSE;
+        }
+        reserve = g_CurrentPlayer->ammoheldarr[st->AmmoType] > 0 ? g_CurrentPlayer->ammoheldarr[st->AmmoType] : 0;
+        if (tacticalSessionEquip(&s_tactical, kind, (unsigned int)count, gevrTacticalCapacity(kind), &reserve, &loaded) != TACTICAL_OK) return;
+        if (sysArgCheck("--tactical-physical")) {
+            /* Firearms and mission equipment share this array. */
+            g_CurrentPlayer->ammoheldarr[st->AmmoType] = 0;
+            reserve = 0;
+        } else g_CurrentPlayer->ammoheldarr[st->AmmoType] = (s32)reserve;
+        g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = (s32)loaded;
+        if (kind == TACTICAL_GUN_RPG && loaded) currentPlayerCreateRocket(hand);
+        sysLogPrintf(LOG_NOTE, "tactical: initialised %s with %u loaded, %u loose", gevrTacticalGunName(kind), loaded, reserve);
+    }
+    /* Native weapon transitions can finish without the earlier draw callback
+     * restoring this session. Reconcile before processing a trigger, or an
+     * initialized but inactive gun silently rejects every interaction. */
+    if (well != TACTICAL_LEFT_PRIMARY_WELL && gevrTacticalHandLoadedKind(kind, hand) != kind) {
+        unsigned int noReserve = 0;
+        if (g_CurrentPlayer->hands[hand].weapon_action_state != GUN_ANIM_STATE_IDLE) return;
+        if (tacticalSessionEquip(&s_tactical, kind, 0, gevrTacticalCapacity(kind), &noReserve, &loaded) != TACTICAL_OK) return;
+        g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = (s32)loaded;
+        if (kind == TACTICAL_GUN_RPG && loaded) currentPlayerCreateRocket(hand);
+        sysLogPrintf(LOG_NOTE, "tactical: restored %s session with %u loaded", gevrTacticalGunName(kind), loaded);
+    }
+    if (sysArgCheck("--tactical-sim") && sysArgCheck("--input-script")) return;
+    interaction = gevrTacticalHandInteraction(kind, hand);
+    const s32 owner = gevrTacticalHeldMagController();
+    if (interaction->state == 3 && s_tacticalActionCtrl >= 0 && s_tacticalActionCtrl != ctrl) {
+        interaction->state = 0;
+        s_tacticalActionCtrl = -1;
+    }
+    if (physical && owner == ctrl && interaction->state != 2) {
+        interaction->state = 2;
+        interaction->require_regrip = s_tacticalMagNeedsRegrip;
+    } else if (physical && owner != ctrl && interaction->state == 2) {
+        interaction->state = 0;
+        interaction->require_regrip = FALSE;
+    }
+    {
+        int releaseCtrl = gevrTacticalMagReleaseController();
+        int releaseButtonCtrl = 1 - hand;
+        int rawRelease = get_button_state(releaseButtonCtrl, releaseButtonCtrl ? "b" : "y");
+        int release = releaseCtrl >= 0 && rawRelease;
+        if (release && !s_tacticalReleaseWas) {
+            int slot = -1;
+            f32 releaseMag[3], releaseAction[3];
+            coord3d releaseWorld;
+            for (int k = 0; k < 128; k++) if (!s_tacticalWorldMags[k].mag.id) { slot = k; break; }
+            if (slot >= 0 && gevrTacticalInteractionPoints(hand, kind, &gunPose, releaseMag, releaseAction)
+                && gevrHordeGripWorld(releaseMag, &releaseWorld)
+                && tacticalSessionEjectMagazine(&s_tactical, kind, interaction->well, &dropped) == TACTICAL_OK) {
+                f32 floor;
+                s_tacticalWorldMags[slot] = (GevrWorldMagazine){.mag = dropped, .pos = releaseWorld, .flat = TRUE,
+                    .clearance = gevrTacticalMagazineClearance(dropped, TRUE)};
+                s_tacticalWorldMags[slot].falling = stanFindTileBelowPos(&releaseWorld, NULL, &floor) != NULL;
+                if (s_tacticalWorldMags[slot].falling) s_tacticalWorldMags[slot].ground = floor;
+                gevrTacticalPublishWorldMagazine(&s_tacticalWorldMags[slot]);
+                if (interaction->state == 1) interaction->state = 0;
+                int base = gevrTacticalSoundBase(kind);
+                if (base >= 0) {
+                    audioTacticalPlay(base + 3);
+                    audioTacticalPlay(base);
+                }
+                g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = gevrTacticalHandRounds(well);
+                sysLogPrintf(LOG_NOTE, "tactical: button ejected magazine id %u, rounds %u, chamber %u", dropped.id, dropped.rounds,
+                             s_tactical.inv.chambered[interaction->well]);
+            } else sysLogPrintf(LOG_NOTE, "tactical: magazine release ignored (empty, tracking unavailable or no drop slot)");
+        }
+        s_tacticalReleaseWas = rawRelease;
+    }
+    /* Trigger is the off-hand grab; grip remains available for two-hand aim. */
+    in.grip = get_button_state(ctrl, "trigger");
+    if (physical && owner != ctrl && !s_tacticalSupport.active && !gevrTacticalHandEmpty(ctrl))
+        in.grip = FALSE;
+    if (physical && interaction->state == 0)
+        interaction->was_gripped = in.grip && !s_tacticalTriggerPressed[ctrl];
+    in.snap_inserted_magazine = TRUE;
+    /* Grip-space origin sits behind the visible G2 hand; 10 cm missed the
+     * user's observed 13-19 cm attempts. Prefer the nearest target. */
+    in.grab_radius_cm = 20.0f; in.seat_radius_cm = 15.0f;
+    if (gevrTacticalIsAk(kind) && sysArgCheck("--tactical-physical")) in.magazine_grab_radius_cm = 13.0f;
+    if (physical) in.action_grab_radius_cm = gevrTacticalIsPistol(kind) ? 14.f : 16.f;
+    if (physical && kind == TACTICAL_GUN_SKORPION) {
+        in.magazine_grab_radius_cm = 11.f;
+        in.action_grab_radius_cm = 10.f;
+        in.seat_radius_cm = 10.f;
+    }
+    in.tracked = cm > 1e-6f && gevrVrGripTracked(ctrl) && gevrVrGripTracked(gunctrl)
+        && gevrGripAxesRaw(ctrl, off, r, u, b)
+        && gevrTacticalInteractionPoints(hand, kind, &gunPose, mag, action);
+    if (!in.tracked) {
+        if (in.grip && !interaction->was_gripped)
+            sysLogPrintf(LOG_NOTE, "tactical: grab unavailable, tracking or weapon pose invalid");
+        if (owner == ctrl) s_tacticalMagNeedsRegrip = TRUE;
+        s_tacticalActionCm = 0; s_tacticalActionAsset = -1;
+        s_tacticalActionCtrl = -1;
+        gevrTacticalOpticFlickReset();
+        gevrTacticalHandInteract(kind, hand, &in, &dropped, &ejected, &loaded);
+        return;
+    }
+    gevrTacticalFingertip(off, r, u, b, cm, gevrGunSizeFactor(),
+        (VrLeftHandedMode != 0) != (ctrl == 0), tip);
+    const int build = s_carriedPrimaryBuild[hand];
+    if (build >= 0 && gevrTacticalGearBaseBuild(build) == gevrTacticalGearKey(kind)
+        && interaction->state == 0
+        && owner != ctrl && !get_button_state(ctrl, "trigger") && !get_button_state(ctrl, "grip")
+        && (gevrTacticalHandEmpty(ctrl) || s_tacticalSupport.active) && gevrPullInPlay()) {
+        extern s32 trigger_haptic_vibration_c(int hand_index, float amplitude, float duration);
+        extern int vr_haptics_ready(void);
+        if (gevrTacticalMagnifierFlick(build, gunPose.m, tip, cm, g_GlobalTimer) && vr_haptics_ready())
+            trigger_haptic_vibration_c(ctrl, .24f, .045f);
+    } else gevrTacticalOpticFlickReset();
+    const f32 *up = gunPose.m[1], *forward = gunPose.m[2];
+    const f32 upNorm = sqrtf(SQ(up[0]) + SQ(up[1]) + SQ(up[2]));
+    const f32 forwardNorm = sqrtf(SQ(forward[0]) + SQ(forward[1]) + SQ(forward[2]));
+    if (upNorm <= 1e-6f || forwardNorm <= 1e-6f) return;
+    for (int k = 0; k < 3; k++) {
+        d2mag += (tip[k] - mag[k]) * (tip[k] - mag[k]);
+        d2action += (tip[k] - action[k]) * (tip[k] - action[k]);
+        in.magazine_pull_cm -= (off[k] - mag[k]) * up[k] / (upNorm * cm);
+        in.action_pull_cm -= (tip[k] - action[k]) * forward[k] / (forwardNorm * cm);
+    }
+    in.magazine_distance_cm = sqrtf(d2mag) / cm;
+    in.action_distance_cm = sqrtf(d2action) / cm;
+    if (kind == TACTICAL_GUN_RPG) {
+        in.action_distance_cm = INFINITY;
+        in.magazine_grab_radius_cm = 0.01f;
+        in.seat_radius_cm = 5.f;
+        Mtxf glove, rocket;
+        if (owner == ctrl && s_tactical.inv.slots[TACTICAL_LEFT_HAND].type
+            == tacticalGunMagazineType(kind, s_tactical.pistol_mag_type)
+            && gevrStereoTacticalHandMatrix(ctrl, &glove)) {
+            gevrTacticalRocketGrip(glove.m, rocket.m);
+            in.magazine_distance_cm = gevrTacticalRocketSeat(rocket.m, mag, forward, forwardNorm, cm);
+        } else in.magazine_distance_cm = INFINITY;
+    } else if (kind == TACTICAL_GUN_M32A1) {
+        in.action_distance_cm = INFINITY;
+    }
+    const s32 rigPickupCandidate = gevrTacticalRigInput(ctrl, off, tip, &in) >= 0;
+    if (physical && interaction->state == 0 && owner != ctrl && s_tacticalTriggerPressed[ctrl]
+        && in.grip && !rigPickupCandidate
+        && gevrTacticalAccessoryTap(gevrTacticalCarriedAssembly(kind, hand), hand, kind,
+            gunPose.m, tip, fminf(SQ(6.5f * cm), fminf(d2mag, d2action)))) {
+        gevrControllerGripBuzz(ctrl);
+        s_tacticalClaim = TRUE;
+        return;
+    }
+    if (physical && interaction->state == 0 && owner != ctrl && s_tacticalTriggerPressed[ctrl]
+        && !get_button_state(gunctrl, "trigger") && gevrTacticalHandEmpty(ctrl)
+        && !s_tacticalSupport.active && !rigPickupCandidate) {
+        f32 nearest = SQ(6.f * cm);
+        for (int side = -1; side <= 1; side += 2) {
+            const f32 socket[3] = {side * 49.f, -24.f, 50.f};
+            f32 at[3];
+            gevrTacticalModelPoint(hand, &gunPose, socket, at);
+            const f32 dist = SQ(tip[0] - at[0]) + SQ(tip[1] - at[1]) + SQ(tip[2] - at[2]);
+            if (dist < nearest && dist < d2mag && dist < d2action && gevrTacticalChangeFireMode(hand)) {
+                gevrControllerGripBuzz(ctrl);
+                s_tacticalClaim = TRUE;
+                return;
+            }
+        }
+    }
+    s_tacticalClaim = interaction->state != 0 || (in.grip && (in.magazine_distance_cm < (in.magazine_grab_radius_cm > 0 ? in.magazine_grab_radius_cm : 20)
+        || in.action_distance_cm < (in.action_grab_radius_cm > 0 ? in.action_grab_radius_cm : 20)));
+    if (in.grip && rigPickupCandidate) s_tacticalClaim = TRUE;
+    if (in.grip && !interaction->was_gripped)
+        sysLogPrintf(LOG_NOTE, "tactical: off-hand trigger distances gun-mag %.1f action %.1f rig %.1f %.1f %.1f %.1f %.1f cm",
+                     (double)in.magazine_distance_cm, (double)in.action_distance_cm,
+                     (double)in.rig_distance_cm[0], (double)in.rig_distance_cm[1], (double)in.rig_distance_cm[2],
+                     (double)in.rig_distance_cm[3], (double)in.rig_distance_cm[4]);
+    if (in.grip && !interaction->was_gripped && interaction->state == 0
+        && !rigPickupCandidate && (gevrTacticalHandEmpty(ctrl) || s_tacticalSupport.active)
+        && gevrTacticalTakeNearbyMagazine(ctrl, off, tip, FALSE)) {
+        interaction->state = 2;
+        s_tacticalClaim = TRUE;
+    }
+    if (physical && owner == ctrl && s_tacticalMagNeedsRegrip) {
+        if (!in.grip) return;
+        s_tacticalMagNeedsRegrip = FALSE;
+        interaction->require_regrip = FALSE;
+    }
+    unsigned int beforeWell = s_tactical.inv.slots[interaction->well].id;
+    event = gevrTacticalHandInteract(kind, hand, &in, &dropped, &ejected, &loaded);
+    gevrTacticalSoundEvent(kind, hand, event, beforeWell);
+    if (interaction->state == 3 && in.grip) {
+        if (s_tacticalActionCtrl < 0 || s_tacticalActionAsset != kind)
+            gevrTacticalCaptureActionHand(ctrl, &gunPose);
+        s_tacticalActionAsset = kind;
+        s_tacticalActionCm = in.action_pull_cm - interaction->rack.start_cm;
+    } else {
+        s_tacticalActionCtrl = -1;
+        s_tacticalActionAsset = -1;
+        s_tacticalActionCm = 0;
+    }
+    if (s_tacticalActionCm < 0 || !isfinite(s_tacticalActionCm)) s_tacticalActionCm = 0;
+    if (s_tacticalActionCm > 5) s_tacticalActionCm = 5;
+    if (event == TACTICAL_EVENT_MAG_TAKEN) s_tacticalMagCtrl = ctrl;
+    if (event == TACTICAL_EVENT_MAG_DROPPED && !gevrTacticalDropMagazineInWorld(ctrl, tip, dropped)
+        && tacticalAddMagazine(&s_tactical.inv, interaction->hand, dropped) == TACTICAL_OK) {
+        interaction->state = 2;
+        interaction->require_regrip = 1;
+        if (physical) s_tacticalMagNeedsRegrip = TRUE;
+    }
+    if (!s_tactical.inv.slots[interaction->hand].id) s_tacticalMagCtrl = -1;
+    g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = (s32)loaded;
+    if (kind == TACTICAL_GUN_RPG && event == TACTICAL_EVENT_MAG_SEATED) currentPlayerCreateRocket(hand);
+    if (event) {
+        gevrControllerGripBuzz(ctrl);
+        sysLogPrintf(LOG_NOTE, "tactical: interaction %d, loaded %u, ejected %u", event, loaded, ejected);
+    }
+}
+
+#include "gevr_tactical_campaign_probe.inc.h"
+
+/* Exercise the same magazine and rack state transitions without an XR runtime.
+ * It is available only to an explicitly scripted, isolated PC test. */
+static s32 gevrTacticalTestHook(const char *word)
+{
+    TacticalInteractionInput in = {0};
+    TacticalMagazine dropped = {0};
+    unsigned int loaded = 0, ejected = 0;
+    const int hand = gevrReloadSupportGun();
+    const int kind = gevrTacticalItem(getCurrentPlayerWeaponId(hand));
+    int event = 0;
+    if (!sysArgCheck("--tactical-sim") || !sysArgCheck("--input-script") || !gevrTacticalMode()) return FALSE;
+    if (!strcasecmp(word, "tacmissionaudit")) {
+        if (s_tacticalStarted) gevrTacticalCampaignProbe();
+        return TRUE;
+    }
+    int targetId, hitRegion;
+    if (sscanf(word, "tacguardhit%d_%d", &targetId, &hitRegion) == 2
+        && (hitRegion == HIT_HEAD || hitRegion == HIT_CHEST)) {
+        ChrRecord *closest = NULL;
+        float best = INFINITY;
+        for (int i = 0; i < g_NumChrSlots; ++i) {
+            ChrRecord *chr = &g_ChrSlots[i];
+            if ((targetId >= 0 && chr->chrnum != targetId) || !chr->prop || !chr->model || chr->prop->type != PROP_TYPE_CHR
+                || chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD) continue;
+            if (targetId >= 0) { closest = chr; break; }
+            if (!chr->weapons_held[GUNRIGHT] || (chr->chrflags & (CHRFLAG_INVINCIBLE | CHRFLAG_HIDDEN))) continue;
+            const coord3d *here = &g_CurrentPlayer->prop->pos;
+            const coord3d *at = &chr->prop->pos;
+            const float d2 = SQ(here->x - at->x) + SQ(here->y - at->y) + SQ(here->z - at->z);
+            if (d2 < best) { closest = chr; best = d2; }
+        }
+        if (closest) {
+            ChrRecord *chr = closest;
+            coord3d shot = {.f = {0, 0, 1}};
+            coord3d at = chr->prop->pos;
+            at.y += hitRegion == HIT_HEAD ? 110.f : 75.f;
+            const int shared = gevrCoopGuardGore(chr) && sysArgCheck("--tactical-coop-test");
+            const float before = chr->damage;
+            if (shared) gevrCoopGuardImpactPoint(chr, &at, -1, FALSE);
+            const int hit = handles_shot_actors(chr, hitRegion, &shot, ITEM_TACTICAL_AK74N, TRUE);
+            if (shared) {
+                gevrCoopGuardImpactPoint(NULL, NULL, -1, FALSE);
+                if (hit && chr->damage > before)
+                    gevrCoopGuardBlood(chr, ITEM_TACTICAL_AK74N, -1, chr->actiontype == ACT_DIE, &at, &shot);
+            }
+            sysLogPrintf(LOG_NOTE, "tactical sim: guard %d region %d hit %d dying %d",
+                chr->chrnum, hitRegion, hit, chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD);
+        }
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tactankstate") || !strcasecmp(word, "tactankseat")) {
+        const bool seat = !strcasecmp(word, "tactankseat");
+        for (PropDefHeaderRecord *def = g_CurrentSetup.propDefs; def && def->type != PROPDEF_END;
+             def += sizepropdef(def)) {
+            if (def->type != PROPDEF_TANK) continue;
+            const TankRecord *tank = (const TankRecord *)def;
+            if (!tank->prop || tank->obj != PROP_TANK) continue;
+            coord2d roof = {.x = 0, .y = 0};
+            for (int k = 0; k < 4; ++k) {
+                roof.x += tank->rect.points[k].x * .25f;
+                roof.y += tank->rect.points[k].y * .25f;
+            }
+            if (seat && tank->prop->stan && (roof.x != 0.f || roof.y != 0.f)) {
+                /* Give the desktop test the same standing position a player
+                 * reaches on foot. Collision and B still decide boarding. */
+                coord3d standing = {.x = roof.x, .y = tank->prop->pos.y, .z = roof.y};
+                gevrPlaceCurrentPlayer(&standing, tank->prop->stan);
+                g_WorldTankProp = tank->prop;
+            }
+            sysLogPrintf(LOG_NOTE, "tactical sim: tank seat %.2f %.2f %.2f enter %d tracked %d mounted %d item %d",
+                roof.x, tank->prop->pos.y, roof.y, g_BondCanEnterTank,
+                g_PlayerTankProp == tank->prop, g_PlayerIsInTank, getCurrentPlayerWeaponId(GUNRIGHT));
+            break;
+        }
+        return TRUE;
+    }
+    int takeTag;
+    if (sscanf(word, "tactaketag%d", &takeTag) == 1 && takeTag >= 0 && takeTag < 256) {
+        ObjectRecord *obj = objFindByTagId(takeTag);
+        PropRecord *prop = obj ? obj->prop : NULL;
+        const int item = prop && prop->type == PROP_TYPE_WEAPON && prop->weapon ? prop->weapon->weaponnum : -1;
+        const int allowed = prop && gevrPhysicalPickupAllowed(0, item);
+        const int took = allowed && gevrHandPickup(prop, FALSE);
+        sysLogPrintf(LOG_NOTE, "tactical sim: objective tag %d item %d allowed %d picked %d copied %d",
+            takeTag, item, allowed, took, g_CurrentPlayer->copiedgoldeneye);
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacmissionstate")) {
+        sysLogPrintf(LOG_NOTE, "tactical sim: key copied %d held %d magnet %d",
+            g_CurrentPlayer->copiedgoldeneye, bondinvHasGEKey(), g_CurrentPlayer->magnetattracttime);
+        const int item = getCurrentPlayerWeaponId(GUNRIGHT);
+        sysLogPrintf(LOG_NOTE, "tactical sim: mission hand item %d loaded %d reserve %d",
+            item, get_ammo_in_hands_magazine(GUNRIGHT), get_ammo_count_for_weapon(item));
+        int firearms = 0;
+        for (int weapon = ITEM_WPPK; weapon < ITEM_IDS_MAX; ++weapon)
+            firearms += gevrCampaignGunIsFirearm(weapon) && bondinvHasInvItem(weapon);
+        sysLogPrintf(LOG_NOTE, "tactical sim: mission kit firearms %d knife %d magnet %d charges %d",
+            firearms, bondinvHasInvItem(ITEM_KNIFE) || bondinvHasInvItem(ITEM_THROWKNIFE),
+            bondinvHasInvItem(ITEM_WATCHMAGNETATTRACT), get_ammo_count_for_weapon(ITEM_WATCHMAGNETATTRACT));
+        for (int k = 0; k < objectiveGetCount() && k < OBJECTIVES_MAX; ++k)
+            if (objective_ptrs[k])
+                sysLogPrintf(LOG_NOTE, "tactical sim: objective %d status %d", k, get_status_of_objective(k));
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tackatanadraw") || !strcasecmp(word, "tackatanastow")
+        || !strcasecmp(word, "tacbladerelease")) {
+        if (!s_tacticalStarted) return TRUE;
+        const bool draw = !strcasecmp(word, "tackatanadraw");
+        const int test = !strcasecmp(word, "tacbladerelease") ? 7 : 6;
+        s_physicalSimGrip = test;
+        const int result = gevrPhysicalGripInput(1, draw, draw);
+        s_physicalSimGrip = 0;
+        sysLogPrintf(LOG_NOTE, "tactical sim: blade action %s accepted %d, katana hand %d, knife hand %d",
+            word, result, s_tacticalKatanaHand, s_tacticalKnifeHand);
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacknifedraw") || !strcasecmp(word, "tacknifesheathe")) {
+        if (!gevrTacticalKnifeEnabled() || !s_tacticalStarted) return TRUE;
+        const s32 draw = !strcasecmp(word, "tacknifedraw");
+        if (draw && gevrTacticalPrepareWatchItem(ITEM_FIST))
+            gevrTacticalReleaseGadget(GUNRIGHT);
+        s_physicalSimGrip = 5;
+        const s32 changed = gevrPhysicalGripInput(1, draw, draw);
+        s_physicalSimGrip = 0;
+        sysLogPrintf(LOG_NOTE, "tactical sim: Huntsman draw %d grip %d hand %d held item %d",
+            draw, changed, s_tacticalKnifeHand, getCurrentPlayerWeaponId(GUNRIGHT));
+        return TRUE;
+    }
+    int bladePart;
+    if (sscanf(word, "tackatanahit%d", &bladePart) == 1 && bladePart > HIT_NULL_PART && bladePart <= HIT_CHEST
+        && getCurrentPlayerWeaponId(GUNRIGHT) == ITEM_TACTICAL_KATANA) {
+        for (int j = 0; j < g_NumChrSlots; ++j) {
+            ChrRecord *chr = &g_ChrSlots[j];
+            if (!chr->prop || !chr->model || chr->prop->type != PROP_TYPE_CHR
+                || chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD
+                || (chr->chrflags & (CHRFLAG_INVINCIBLE | CHRFLAG_HIDDEN))) continue;
+            coord3d direction = {.f = {1, 0, 0}};
+            const int hit = handles_shot_actors(chr, bladePart, &direction, ITEM_TACTICAL_KATANA, TRUE);
+            if (hit) gevrRagdollNoteKatanaDeath(chr, bladePart, direction.f);
+            sysLogPrintf(LOG_NOTE, "tactical sim: katana region %d hit %d damage %.2f required %.2f dying %d",
+                bladePart, hit, chr->damage, chr->maxdamage, chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD);
+            break;
+        }
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacknifehit") && getCurrentPlayerWeaponId(GUNRIGHT) == ITEM_KNIFE
+        && gevrTacticalKnifeEnabled()) {
+        for (int j = 0; j < g_NumChrSlots; ++j) {
+            ChrRecord *chr = &g_ChrSlots[j];
+            if (!chr->prop || !chr->model || chr->prop->type != PROP_TYPE_CHR
+                || chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD || (chr->chrflags & CHRFLAG_INVINCIBLE))
+                continue;
+            coord3d direction = {.f = {0, 0, 1}};
+            const int hit = handles_shot_actors(chr, HIT_CHEST, &direction, ITEM_KNIFE, TRUE);
+            sysLogPrintf(LOG_NOTE, "tactical sim: Huntsman hit %d damage %.2f required %.2f dying %d",
+                hit, chr->damage, chr->maxdamage, chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD);
+            break;
+        }
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacvestcheck") && sysArgCheck("--tactical-klmk-vest")) {
+        extern void gevrTacticalKlmkShotCheck(void);
+        gevrTacticalKlmkShotCheck();
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacvestlocate") && sysArgCheck("--tactical-klmk-vest")) {
+        for (int i = 0; i < g_NumChrSlots; ++i) {
+            const ChrRecord *chr = &g_ChrSlots[i];
+            if (chr->bodynum != BODY_Russian_Soldier || !chr->model || !chr->prop || chr->chrnum < 0) continue;
+            const coord3d *pos = &chr->prop->pos;
+            sysLogPrintf(LOG_NOTE, "tactical vest: guard %d at %.1f %.1f %.1f facing %.1f",
+                chr->chrnum, (double)pos->x, (double)pos->y, (double)pos->z,
+                (double)(getsubroty(chr->model) * 180.0f / M_PI_F));
+        }
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacgearaudit") && sysArgCheck("--tactical-campaign-gear")) {
+        extern void gevrEnemyRigAuditStage(void);
+        gevrEnemyRigAuditStage();
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacopticnext") && sysArgCheck("--tactical-optic-preview")) {
+        const int changed = gevrTacticalOpticCycle(s_focusedOptic);
+        sysLogPrintf(LOG_NOTE, "tactical optics: scripted mode change %d", changed);
+        return TRUE;
+    }
+    int healthPercent, armorPercent;
+    if (sysArgCheck("--tactical-watch") && sscanf(word, "tacwatchgauges%d_%d", &healthPercent, &armorPercent) == 2
+        && healthPercent > 0 && healthPercent <= 100 && armorPercent >= 0 && armorPercent <= 100) {
+        g_CurrentPlayer->bondhealth = healthPercent / 100.f;
+        g_CurrentPlayer->bondarmour = armorPercent / 100.f;
+        sysLogPrintf(LOG_NOTE, "tactical sim: watch gauges health %d armor %d", healthPercent, armorPercent);
+        return TRUE;
+    }
+    if (!strncmp(word, "tacexpand", 9) && gevrTacticalExpandedEnabled()) {
+        const int index = atoi(word + 9);
+        if (index < 1 || index > ITEM_IDS_MAX - ITEM_TACTICAL_UZI) return FALSE;
+        const int item = ITEM_TACTICAL_UZI + index - 1;
+        const int gun = gevrTacticalItem(item);
+        if (gun < 0) return FALSE;
+        const int pistol = tacticalGunIsPistol(gun);
+        gevrTacticalGearCommit(bossGetStageNum(), pistol ? ITEM_AK47 : item,
+            pistol ? item : ITEM_WPPKSIL, pistol ? TACTICAL_GUN_AK : gevrTacticalGearKey(gun),
+            pistol ? gevrTacticalGearKey(gun) : GEVR_GEAR_PPK_SUPPRESSED);
+        tacticalSessionInit(&s_tactical);
+        s_tactical.physical_rig = sysArgCheck("--tactical-physical") != 0;
+        tacticalSessionSetPistolMagazineType(&s_tactical, 4u);
+        memset(s_physicalPistols, 0, sizeof(s_physicalPistols));
+        s_physicalShoulder = (GevrPhysicalRifle){0};
+        tacticalInteractionInit(&s_leftPrimaryInteraction, TACTICAL_LEFT_PRIMARY_WELL, TACTICAL_LEFT_HAND);
+        s_leftPrimaryKind = -1;
+        s_physicalPrimary[GUNLEFT] = ITEM_UNARMED;
+        s_carriedPrimaryBuild[GUNLEFT] = -1;
+        if (!gevrTacticalEquipSelectedGear()) return FALSE;
+        if (pistol) {
+            /* Leave the sidearm in its real deployment holster for the draw probe. */
+            tacticalSessionStow(&s_tactical, TACTICAL_GUN_AK);
+            s_physicalPrimary[GUNRIGHT] = ITEM_UNARMED;
+            gunRequestHandWeaponChange(GUNRIGHT, ITEM_FIST, TRUE);
+        }
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacvisualak") || !strcasecmp(word, "tacvisualskorpion") || !strcasecmp(word, "tacvisualsvd")) {
+        extern ObjectRecord *create_new_item_instance_of_model(PROP modelnum, s32 weaponid);
+        extern void setupUpdateObjectRoomPosition(ObjectRecord *obj);
+        extern void chrpropActivate(PropRecord *prop);
+        extern void chrpropEnable(PropRecord *prop);
+        int item = !strcasecmp(word, "tacvisualskorpion") ? ITEM_SKORPION
+            : !strcasecmp(word, "tacvisualsvd") ? ITEM_SNIPERRIFLE : ITEM_TACTICAL_AK74N;
+        const char *label = gevrTacticalGunName(gevrTacticalItem(item));
+        ObjectRecord *obj = create_new_item_instance_of_model(gevrTacticalDroppedProp(item), item);
+        if (obj && obj->prop && obj->model && g_CurrentPlayer->prop) {
+            f32 facing = g_CurrentPlayer->vv_theta * (M_PI_F / 180.0f), floor;
+            coord3d pos = g_CurrentPlayer->prop->pos;
+            pos.x += sinf(facing) * 130; pos.z += cosf(facing) * 130; pos.y += 25;
+            obj->prop->pos = obj->runtime_pos = pos;
+            obj->prop->stan = stanFindTileBelowPos(&pos, NULL, &floor);
+            if (!obj->prop->stan) obj->prop->stan = g_CurrentPlayer->prop->stan;
+            matrix_4x4_set_position_and_rotation_around_y(pos.f, facing, &obj->mtx);
+            matrix_scalar_multiply(obj->model->scale, obj->mtx.m[0]);
+            setupUpdateObjectRoomPosition(obj); chrpropActivate(obj->prop); chrpropEnable(obj->prop);
+            sysLogPrintf(LOG_NOTE, "tactical sim: placed dropped %s visual probe", label);
+            if (s_gearMissionActive && gevrTacticalItem(item) == s_carriedPrimaryBuild[GUNRIGHT]) {
+                int build = -1;
+                const TacticalMagazine *linked = gevrTacticalGearModelMagazine(obj->model, s_carriedPrimaryBuild[GUNRIGHT], &build);
+                sysLogPrintf(LOG_NOTE, "tactical sim: same-type world rifle link %d, custom %d", linked != NULL, build >= 0);
+            }
+        } else sysLogPrintf(LOG_WARNING, "tactical sim: failed to place dropped %s visual probe", label);
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacphysnewpistol")) {
+        if (getCurrentPlayerWeaponId(GUNRIGHT) == ITEM_FIST) {
+            s_tactical.initialized[TACTICAL_GUN_USP] = FALSE;
+            s_physicalFreshPistol = TRUE;
+            bondinvAddInvItem(ITEM_WPPKSIL);
+            gunRequestHandWeaponChange(GUNRIGHT, ITEM_WPPKSIL, 1);
+            sysLogPrintf(LOG_NOTE, "tactical sim: requested test pistol");
+        }
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacleftdraw") || !strcasecmp(word, "tacleftstow")) {
+        s_physicalSimGrip = 3; /* left hand, left hip */
+        gevrPhysicalGripInput(0, TRUE, TRUE);
+        if (!strcasecmp(word, "tacleftstow")) gevrPhysicalGripInput(0, FALSE, FALSE);
+        s_physicalSimGrip = 0;
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacinspectak74n") || !strcasecmp(word, "tacinspectm16") || !strcasecmp(word, "tacinspecttt33")
+        || !strcasecmp(word, "tacinspectak") || !strcasecmp(word, "tacinspectmp5") || !strcasecmp(word, "tacinspectmp5k")
+        || !strcasecmp(word, "tacinspectskorpion") || !strcasecmp(word, "tacinspectsvd")) {
+        int item = !strcasecmp(word,"tacinspectak74n") ? ITEM_TACTICAL_AK74N
+            : !strcasecmp(word,"tacinspectm16") ? ITEM_M16 : !strcasecmp(word,"tacinspectak") ? ITEM_AK47
+            : !strcasecmp(word,"tacinspectmp5") ? ITEM_SPECTRE : !strcasecmp(word,"tacinspectmp5k") ? ITEM_MP5K
+            : !strcasecmp(word,"tacinspectskorpion") ? ITEM_SKORPION
+            : !strcasecmp(word,"tacinspectsvd") ? ITEM_SNIPERRIFLE : ITEM_TT33;
+        int inspectKind=gevrTacticalItem(item);
+        if (sysArgCheck("--tactical-variety") && inspectKind>=0) {
+            s_tactical.initialized[inspectKind]=FALSE;
+            if (gevrTacticalIsLongGun(inspectKind)) s_physicalFreshPrimary=TRUE; else s_physicalFreshPistol=TRUE;
+        }
+        bondinvAddInvItem(item); gunRequestHandWeaponChange(GUNRIGHT,item,1);
+        sysLogPrintf(LOG_NOTE,"tactical sim: requested inspection item %d",item); return TRUE;
+    }
+    if (!strcasecmp(word, "tacroundtest")) {
+        Gfx sample[256], *empty, *ppk, *ak;
+        empty=gevrTacticalDrawMagazineRounds(sample,1,0,0,0,0);
+        ppk=gevrTacticalDrawMagazineRounds(sample,1,1,7,1,0);
+        ak=gevrTacticalDrawMagazineRounds(sample,0,2,30,0,0);
+        sysLogPrintf(LOG_NOTE,"tactical sim: visible rounds empty commands %d PPK one commands %d AK two commands %d",
+            (int)(empty-sample),(int)(ppk-sample),(int)(ak-sample));
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacrigbounds")) {
+        const int assets[] = {0, 1, 2, 3, 5};
+        for (int k = 0; k < 5; k++) {
+            float low[3], high[3];
+            if (gevrTacticalHeldMagBounds(assets[k], low, high))
+                sysLogPrintf(LOG_NOTE, "tactical sim: rig bounds asset %d low %.1f %.1f %.1f high %.1f %.1f %.1f cm",
+                    assets[k], (double)(low[0]*GEVR_VIEWMODEL_CM*.1f), (double)(low[1]*GEVR_VIEWMODEL_CM*.1f), (double)(low[2]*GEVR_VIEWMODEL_CM*.1f),
+                    (double)(high[0]*GEVR_VIEWMODEL_CM*.1f), (double)(high[1]*GEVR_VIEWMODEL_CM*.1f), (double)(high[2]*GEVR_VIEWMODEL_CM*.1f));
+            else sysLogPrintf(LOG_WARNING, "tactical sim: rig bounds asset %d unavailable", assets[k]);
+        }
+        return TRUE;
+    }
+    if (!strcasecmp(word, "taccompareweapons")) {
+        WeaponStats *ak=get_ptr_item_statistics(ITEM_AK47), *full=get_ptr_item_statistics(ITEM_TACTICAL_AK74N), *ar=get_ptr_item_statistics(ITEM_M16);
+        sysLogPrintf(LOG_NOTE,"tactical sim: identities AK %d full %d AR33 %d; sound %u/%u/%u rate %u/%u/%u damage %.2f/%.2f/%.2f inaccuracy %.2f/%.2f/%.2f",
+            ITEM_AK47,ITEM_TACTICAL_AK74N,ITEM_M16,ak->Sound,full->Sound,ar->Sound,ak->AutomaticFiringRate,full->AutomaticFiringRate,ar->AutomaticFiringRate,
+            (double)ak->DestructionAmount,(double)full->DestructionAmount,(double)ar->DestructionAmount,(double)ak->Inaccuracy,(double)full->Inaccuracy,(double)ar->Inaccuracy);
+        return TRUE;
+    }
+    s32 gadget = -1;
+    if (!strcasecmp(word, "tacwatchmodem") || !strcasecmp(word, "tacwatchpaused")) gadget = ITEM_BUG;
+    if (!strcasecmp(word, "tacwatchremote")) gadget = ITEM_REMOTEMINE;
+    if (!strcasecmp(word, "tacwatchdetonator")) gadget = ITEM_TRIGGER;
+    if (!strcasecmp(word, "tacwatchtimed")) gadget = ITEM_TIMEDMINE;
+    if (!strcasecmp(word, "tacwatchdecoder")) gadget = ITEM_DOORDECODER;
+    if (!strcasecmp(word, "tacwatchkeycard")) gadget = ITEM_KEYCARD;
+    int requested;
+    if (sscanf(word, "tacwatchitem%d", &requested) == 1 && requested >= ITEM_KNIFE && requested < ITEM_IDS_MAX)
+        gadget = requested;
+    int keyOwner;
+    if (sscanf(word, "tacfacilitykey%d", &keyOwner) == 1 && bossGetStageNum() == LEVELID_FACILITY) {
+        for (PropDefHeaderRecord *def = g_CurrentSetup.propDefs; def && def->type != PROPDEF_END;
+                def += sizepropdef(def)) {
+            if (def->type != PROPDEF_KEY) continue;
+            KeyRecord *key = (KeyRecord *)def;
+            if (key->pad != keyOwner || !key->prop) continue;
+            if (key->prop->parent) {
+                propobjSetDropped(key->prop, DROPTYPE_DEFAULT);
+                objDrop(key->prop);
+            }
+            sysLogPrintf(LOG_NOTE, "Facility key check: picked card %d flags %x: %d",
+                keyOwner, key->keyflags, gevrHandPickup(key->prop, FALSE));
+            break;
+        }
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacfacilitylocks") && bossGetStageNum() == LEVELID_FACILITY) {
+        for (PropDefHeaderRecord *def = g_CurrentSetup.propDefs; def && def->type != PROPDEF_END;
+                def += sizepropdef(def)) {
+            if (def->type != PROPDEF_DOOR) continue;
+            DoorRecord *door = (DoorRecord *)def;
+            if (!door->prop || (!door->keyflags && door != gevrTacticalFacilityDecoderDoor())) continue;
+            const PadRecord *pad = gevrWarpPad(door->pad);
+            sysLogPrintf(LOG_NOTE, "Facility key check: pad %d flags %x state %d at %.0f %.0f %.0f facing %.0f",
+                door->pad, door->keyflags, door->openstate, (double)door->runtime_pos.x,
+                (double)door->runtime_pos.y, (double)door->runtime_pos.z,
+                (double)(atan2f(pad->look.x, pad->look.z) * 180.f / M_PI_F));
+        }
+        return TRUE;
+    }
+    int mineVariant;
+    if (sysArgCheck("--tactical-source-mines") && sscanf(word, "tacsourcemine%d", &mineVariant) == 1
+        && mineVariant >= 0 && mineVariant < 3) {
+        static const s32 mines[] = {ITEM_PROXIMITYMINE, ITEM_REMOTEMINE, ITEM_TIMEDMINE};
+        gadget = mines[mineVariant];
+        bondinvAddInvItem(gadget);
+        g_CurrentPlayer->ammoheldarr[get_ptr_item_statistics(gadget)->AmmoType] = 1;
+    }
+    if (gadget >= 0) {
+        extern void gevrWatchEquipSelection(s32 index);
+        const s32 count = bondinvCountTotalItemsInInv();
+        for (s32 i = 0; i < count; ++i) {
+            if (bondinvGetTextbyInvIndex(i) != gadget) continue;
+            s_tacticalTestStereoOff = strcasecmp(word, "tacwatchmodem") != 0;
+            gevrWatchEquipSelection(i);
+            s_tacticalTestStereoOff = FALSE;
+            break;
+        }
+        sysLogPrintf(LOG_NOTE, "tactical sim: watch gadget %d, now holding %d", gadget, getCurrentPlayerWeaponId(GUNRIGHT));
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacdecoderstate")) {
+        const ChrRecord *doak = chrFindByLiteralId(79);
+        if (doak && doak->prop) {
+            const coord3d *pos = &doak->prop->pos;
+            sysLogPrintf(LOG_NOTE, "tactical sim: Doak at %.0f %.0f %.0f, AI offset %u",
+                (double)pos->x, (double)pos->y, (double)pos->z, doak->aioffset);
+        }
+        const DoorRecord *door = gevrTacticalFacilityDecoderDoor();
+        if (door) {
+            const coord3d *pos = &door->runtime_pos;
+            const PadRecord *pad = gevrWarpPad(door->pad);
+            sysLogPrintf(LOG_NOTE, "tactical sim: Facility lock at %.0f %.0f %.0f, pad %d look %.2f %.2f",
+                (double)pos->x, (double)pos->y, (double)pos->z, door->pad,
+                (double)pad->look.x, (double)pad->look.z);
+        }
+        const ObjectRecord *decoder = objFindByTagId(0);
+        if (decoder && decoder->prop)
+            sysLogPrintf(LOG_NOTE, "tactical sim: decoder prop type %d object type %d item %d flags %x",
+                decoder->prop->type, decoder->type, ((const WeaponObjRecord *)decoder)->weaponnum, decoder->runtime_bitflags);
+        sysLogPrintf(LOG_NOTE, "tactical sim: decoder owned %d held %d door state %d position %.3f",
+            bondinvHasInvItem(ITEM_DOORDECODER), getCurrentPlayerWeaponId(GUNRIGHT),
+            door ? door->openstate : -1, door ? (double)door->openPosition : -1.0);
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tactimedcrate")) {
+        /* The flat input script has no tracked grip. Target the real Runway
+         * mine crate, then run the same pickup routine as a grip press. */
+        if (bossGetStageNum() != LEVELID_RUNWAY) return TRUE;
+        for (PropDefHeaderRecord *def = g_CurrentSetup.propDefs; def && def->type != PROPDEF_END;
+                def += sizepropdef(def)) {
+            if (def->type != PROPDEF_AMMO) continue;
+            const MultiAmmoCrateRecord *crate = (const MultiAmmoCrateRecord *)def;
+            if (!crate->slots[AMMO_TIMEDMINE - 1].quantity || !crate->prop) continue;
+            PropRecord *prop = crate->prop;
+            const coord3d *pos = &prop->pos;
+            sysLogPrintf(LOG_NOTE, "tactical sim: Runway mine crate at %.0f %.0f %.0f",
+                (double)pos->x, (double)pos->y, (double)pos->z);
+            const s32 picked = gevrHandPickup(prop, FALSE);
+            sysLogPrintf(LOG_NOTE, "tactical sim: Runway mine crate grip pickup %d", picked);
+            return TRUE;
+        }
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacgadgetpress") || !strcasecmp(word, "tacgadgetrelease")) {
+        /* Desktop regression: a raw controller press with the legacy pad's Z up. */
+        s_tacticalTestGadgetTrigger = !strcasecmp(word, "tacgadgetpress");
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacgadgetstate")) {
+        s32 remote = 0, timed = 0;
+        for (PropRecord *prop = chrpropGetActiveTail(); prop; prop = prop->prev) {
+            if (prop->type != PROP_TYPE_WEAPON || !prop->weapon || prop->weapon->timer <= 0
+                || RUNTIME_OWNER(prop->weapon->runtime_bitflags) != get_cur_playernum()) continue;
+            if (prop->weapon->weaponnum == ITEM_REMOTEMINE) ++remote;
+            if (prop->weapon->weaponnum == ITEM_TIMEDMINE) ++timed;
+        }
+        sysLogPrintf(LOG_NOTE, "tactical gadget state: right %d loaded %d remote reserve %d live %d timed reserve %d live %d",
+            getCurrentPlayerWeaponId(GUNRIGHT), g_CurrentPlayer->hands[GUNRIGHT].weapon_ammo_in_magazine,
+            g_CurrentPlayer->ammoheldarr[AMMO_REMOTEMINE], remote,
+            g_CurrentPlayer->ammoheldarr[AMMO_TIMEDMINE], timed);
+        return TRUE;
+    }
+    if (!strcasecmp(word, "taccoopwatchstate")) {
+        extern int gevrPanelIsOpen(void);
+        sysLogPrintf(LOG_NOTE, "tactical co-op: watch state slot %d watch %d pause %d panel %d controller %d tick %d mission %d item %d",
+            get_cur_playernum(), g_CurrentPlayer->watch_animation_state, g_CurrentPlayer->pause_state,
+            g_CurrentPlayer->mpmenuon || gevrPanelIsOpen(), gevrWatchController(), g_GlobalTimer, getMissiontimer(),
+            getCurrentPlayerWeaponId(GUNRIGHT));
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacwatchstate")) {
+        sysLogPrintf(LOG_NOTE,"tactical sim: watch state right %d left %d hip %d/%d rifle %d pistol stored-mag %u/%u modem in inventory %d",
+            getCurrentPlayerWeaponId(GUNRIGHT),getCurrentPlayerWeaponId(GUNLEFT),s_physicalPistols[0].item,s_physicalPistols[1].item,s_physicalShoulder.item,
+            s_physicalPistols[1].gun.magazine.id,s_physicalPistols[1].gun.magazine.rounds,bondinvHasInvItem(ITEM_BUG));
+        sysLogPrintf(LOG_NOTE,"tactical sim: modem reserve %d hand rounds %d action %d selected %d",
+            g_CurrentPlayer->ammoheldarr[AMMO_BUG],g_CurrentPlayer->hands[GUNRIGHT].weapon_ammo_in_magazine,
+            g_CurrentPlayer->hands[GUNRIGHT].weapon_action_state,bondinvHasInvItem(ITEM_WPPKSIL));
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacppkposes")) {
+        void *open = gevrTacticalPistolOpenHandList();
+        void *magHand = gevrTacticalPistolMagazineHandList();
+        void *support = gevrTacticalPistolSupportList();
+        void *rigMag = gevrTacticalHeldMagList(1);
+        void *handMag = gevrTacticalHandMagList(1);
+        sysLogPrintf(LOG_NOTE, "tactical sim: PPK poses open %d magazine %d support %d rig-mag %d hand-mag %d separate %d",
+            open != NULL, magHand != NULL, support != NULL, rigMag != NULL, handMag != NULL, rigMag && handMag && rigMag != handMag);
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacppkstate")) {
+        TacticalMagazine *well = &s_tactical.inv.slots[TACTICAL_RIGHT_PISTOL_WELL];
+        TacticalMagazine *a = &s_tactical.inv.slots[TACTICAL_RIG_PISTOL_1];
+        TacticalMagazine *b = &s_tactical.inv.slots[TACTICAL_RIG_PISTOL_2];
+        sysLogPrintf(LOG_NOTE, "tactical sim: PPK hand %d right %d left %d well %u/%u chamber %u spares %u/%u %u/%u primaries %u %u %u", hand,
+            getCurrentPlayerWeaponId(GUNRIGHT), getCurrentPlayerWeaponId(GUNLEFT), well->id, well->rounds,
+            s_tactical.inv.chambered[TACTICAL_RIGHT_PISTOL_WELL], a->id, a->rounds, b->id, b->rounds,
+            s_tactical.inv.slots[TACTICAL_RIG_PRIMARY_1].id, s_tactical.inv.slots[TACTICAL_RIG_PRIMARY_2].id, s_tactical.inv.slots[TACTICAL_RIG_PRIMARY_3].id);
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacphyshipr") || !strcasecmp(word, "tacphyshipl")) {
+        s_physicalSimGrip = !strcasecmp(word, "tacphyshipr") ? 3 : 4;
+        gevrPhysicalGripInput(1, TRUE, TRUE);
+        gevrPhysicalGripInput(1, FALSE, FALSE);
+        s_physicalSimGrip = 0;
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacphysdrawr") || !strcasecmp(word, "tacphysdrawl")) {
+        s_physicalSimGrip = !strcasecmp(word, "tacphysdrawr") ? 3 : 4;
+        gevrPhysicalGripInput(1, TRUE, TRUE);
+        s_physicalSimGrip = 0;
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacphysdrop") || !strcasecmp(word, "tacphysdropl") || !strcasecmp(word, "tacphysstow")) {
+        const int ctrl = strcasecmp(word, "tacphysdropl") != 0;
+        s_physicalSimGrip = !strcasecmp(word, "tacphysstow") ? 2 : 1;
+        gevrPhysicalGripInput(ctrl, TRUE, TRUE);
+        gevrPhysicalGripInput(ctrl, FALSE, FALSE);
+        s_physicalSimGrip = 0;
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacphysdraw")) {
+        s_physicalSimGrip = 2;
+        gevrPhysicalGripInput(1, TRUE, TRUE);
+        s_physicalSimGrip = 0;
+        return TRUE;
+    }
+    int supplyItem;
+    if (sscanf(word, "tacspare%d", &supplyItem) == 1) {
+        const unsigned int type = tacticalGunMagazineType(gevrTacticalItem(supplyItem), s_tactical.pistol_mag_type);
+        if (!type || kind < 0 || gevrTacticalHandLoadedKind(kind, hand) != kind) return TRUE;
+        for (int k = 0; k < (int)ARRAYCOUNT(s_tacticalWorldMags); ++k) {
+            const GevrWorldMagazine *supply = &s_tacticalWorldMags[k];
+            if (!supply->mag.id || supply->mag.type != type) continue;
+            coord3d point = supply->pos;
+            mtx4TransformVecInPlace(camGetWorldToScreenMtxf(), &point);
+            for (int axis = 0; axis < 3; ++axis) point.f[axis] *= D_800364CC;
+            const int took = gevrTacticalTakeNearbyMagazine(1 - gevrTacticalWeaponController(hand),
+                point.f, point.f, TRUE);
+            const TacticalMagazine *mag = &s_tactical.inv.slots[TACTICAL_LEFT_HAND];
+            if (took) gevrTacticalHandInteraction(kind, hand)->state = 2;
+            sysLogPrintf(LOG_NOTE, "tactical sim: table spare item %d picked %d id %u rounds %u",
+                supplyItem, took, mag->id, mag->rounds);
+            return TRUE;
+        }
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacfreegrabright") || !strcasecmp(word, "tacfreegrableft")) {
+        extern unsigned int gevrEnemyRigTestBackProbe(coord3d *out, float *distance);
+        coord3d point;
+        float distance = 0.f;
+        const s32 ctrl = !strcasecmp(word, "tacfreegrabright");
+        const unsigned int expected = gevrEnemyRigTestBackProbe(&point, &distance);
+        int ok = FALSE;
+        if (kind < 0 && expected && gevrTacticalHandEmpty(ctrl)) {
+            mtx4TransformVecInPlace(camGetWorldToScreenMtxf(), &point);
+            for (int i = 0; i < 3; ++i) point.f[i] *= D_800364CC;
+            ok = gevrTacticalTakeNearbyMagazine(ctrl, point.f, point.f, TRUE);
+        }
+        const TacticalMagazine *mag = &s_tactical.inv.slots[TACTICAL_LEFT_HAND];
+        sysLogPrintf(LOG_NOTE, "tactical sim: unarmed corpse pickup success %d owner %d same id %d rounds %u distance %.1f",
+            ok, gevrTacticalHeldMagController(), ok && expected == mag->id, mag->rounds, (double)distance);
+        if (ok) gevrTacticalReleaseLooseMagazine(ctrl, point.f, point.f);
+        return TRUE;
+    }
+    if (gevrTacticalLootEnabled() && sysArgCheck("--tactical-coop-test")) {
+        if (!strcasecmp(word, "taccoopdown")) {
+            gevrCoopGoDown();
+            return TRUE;
+        }
+        if (!strncmp(word, "taccoopstage", 12)) {
+            netCoopHostStartMission(atoi(word + 12), 0);
+            return TRUE;
+        }
+        if (!strcasecmp(word, "taccoopkit")) {
+            GevrTacticalVisual visual = {0};
+            gevrTacticalCollectVisual(&visual);
+            const GevrVisualWeapon *held = &visual.weapons[GEVR_VIS_RIGHT];
+            const GevrVisualWeapon *stowed = &visual.weapons[GEVR_VIS_SHOULDER];
+            sysLogPrintf(LOG_NOTE, "tactical sim: co-op kit right %d shoulder %d build %d rounds %u chamber %d",
+                held->item, stowed->item, stowed->build, stowed->magazine.rounds, (stowed->flags & GEVR_VIS_CHAMBER) != 0);
+            return TRUE;
+        }
+    }
+    if (gevrTacticalLootEnabled() && !strncmp(word, "tacsharedclaim", 14)) {
+        const int ctrl = word[14] != 'l';
+        const uint32_t id = strtoul(word + 15, NULL, 10);
+        GevrSharedLoot target = {.id = id};
+        int moving;
+        const int inScene = (id & GEVR_RIG_LOOT_ID) ? gevrTacticalLootReadRig(id, &target)
+            : gevrTacticalLootSample(&target, &moving);
+        const int result = gevrTacticalLootClaim(id, ctrl);
+        sysLogPrintf(LOG_NOTE, "tactical sim: shared claim %u hand %d result %d scene %d", id, ctrl, result, inScene);
+        return TRUE;
+    }
+    if (gevrTacticalLootEnabled() && !strcasecmp(word, "tacsharedmagdrop")) {
+        TacticalMagazine mag;
+        const float at[3] = {0, 0, -10 * D_800364CC};
+        if (tacticalDropMagazine(&s_tactical.inv, TACTICAL_LEFT_HAND, &mag) != TACTICAL_OK) return TRUE;
+        if (!gevrTacticalDropMagazineInWorld(s_tacticalMagCtrl, at, mag)) {
+            tacticalAddMagazine(&s_tactical.inv, TACTICAL_LEFT_HAND, mag);
+        } else {
+            s_tacticalMagCtrl = -1;
+        }
+        return TRUE;
+    }
+    unsigned probeRig = 0;
+    if (gevrTacticalLootEnabled() && (!strcasecmp(word, "tacsharedrig")
+        || sscanf(word, "tacsharedrig%u", &probeRig) == 1)) {
+        GevrSharedLoot loot;
+        const uint32_t first = probeRig >= GEVR_RIG_LOOT_ID ? probeRig : GEVR_RIG_LOOT_ID;
+        const uint32_t count = probeRig >= GEVR_RIG_LOOT_ID ? 1 : 2048;
+        for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t id = first + i;
+            if (!gevrTacticalLootReadRig(id, &loot)) continue;
+            sysLogPrintf(LOG_NOTE, "tactical sim: shared rig %u rounds %u at %.2f %.2f %.2f",
+                id, loot.magazine.rounds, (double)loot.position[0], (double)loot.position[1], (double)loot.position[2]);
+            return TRUE;
+        }
+        return TRUE;
+    }
+    if (!strncmp(word, "tacphyspick", 11)) {
+        const int itemFilter = atoi(word + 11);
+        for (int k = 0; k < (int)ARRAYCOUNT(s_physicalRifles); ++k) {
+            if (!s_physicalRifles[k].prop || (itemFilter && s_physicalRifles[k].item != itemFilter)) continue;
+            PropRecord *prop = s_physicalRifles[k].prop;
+            unsigned id = s_physicalRifles[k].gun.magazine.id;
+            int item = s_physicalRifles[k].item;
+            int allowed = gevrPhysicalPickupAllowed(1, item);
+            int shared = allowed && gevrTacticalLootClaimProp(prop, 1);
+            int ok = allowed && !shared && gevrHandPickupIntoHand(prop, 1);
+            if (ok) gevrGripEquip(GUNRIGHT, item);
+            sysLogPrintf(LOG_NOTE, "tactical sim: rifle pickup allowed %d success %d magazine %u", allowed, ok, id);
+            if (itemFilter) sysLogPrintf(LOG_NOTE, "tactical sim: picked up item %d success %d magazine %u", item, ok, id);
+            return TRUE;
+        }
+        sysLogPrintf(LOG_NOTE, "tactical sim: rifle pickup no dropped prop");
+        return TRUE;
+    }
+    if (!s_tacticalStarted || kind < 0 || gevrTacticalHandLoadedKind(kind, hand) != kind) {
+        sysLogPrintf(LOG_WARNING, "tactical sim: not ready for %s", word); return TRUE;
+    }
+    TacticalInteraction *interaction = gevrTacticalHandInteraction(kind, hand);
+    const int well = interaction->well;
+    unsigned int beforeWell = s_tactical.inv.slots[well].id;
+    in.tracked = 1; in.magazine_distance_cm = in.action_distance_cm = 100;
+    for (int k = 0; k < 5; k++) in.rig_distance_cm[k] = 100;
+    if (!strcasecmp(word, "tacpeek") || !strcasecmp(word, "tacpeekrelease") || !strcasecmp(word, "tacempty")) {
+        loaded = gevrTacticalHandRounds(well);
+        if (!strcasecmp(word, "tacpeek")) {
+            in.grip = 1;
+            in.action_distance_cm = 0.f;
+            gevrTacticalHandInteract(kind, hand, &in, &dropped, &ejected, &loaded);
+            in.action_pull_cm = 2.5f;
+            event = gevrTacticalHandInteract(kind, hand, &in, &dropped, &ejected, &loaded);
+            if (interaction->state == 3) {
+                s_tacticalActionAsset = kind;
+                s_tacticalActionCm = in.action_pull_cm - interaction->rack.start_cm;
+            }
+        } else if (!strcasecmp(word, "tacpeekrelease")) {
+            event = gevrTacticalHandInteract(kind, hand, &in, &dropped, &ejected, &loaded);
+            s_tacticalActionAsset = -1;
+            s_tacticalActionCm = 0.f;
+        } else {
+            while (tacticalFire(&s_tactical.inv, well) == TACTICAL_OK) {}
+            loaded = gevrTacticalHandRounds(well);
+        }
+        g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = (s32)loaded;
+        sysLogPrintf(LOG_NOTE, "tactical sim: %s item %d chamber %d pull %.1f loaded %u event %d",
+            word, kind, gevrTacticalChamberState(kind, hand), (double)gevrTacticalManualMotion(kind, hand), loaded, event);
+        return TRUE;
+    }
+    if (!strcasecmp(word, "tacfire")) {
+        int result = tacticalFire(&s_tactical.inv, well);
+        loaded = gevrTacticalHandRounds(well);
+        g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = (s32)loaded;
+        sysLogPrintf(LOG_NOTE, "tactical sim: fire result %d loaded %u", result, loaded);
+        return TRUE;
+    } else if (!strcasecmp(word, "tacout")) {
+        in.grip = 1; in.magazine_distance_cm = 0;
+        gevrTacticalHandInteract(kind, hand, &in, &dropped, &ejected, &loaded);
+        in.magazine_pull_cm = 6;
+        event = gevrTacticalHandInteract(kind, hand, &in, &dropped, &ejected, &loaded);
+    } else if (!strcasecmp(word, "tacdrop")) {
+        event = gevrTacticalHandInteract(kind, hand, &in, &dropped, &ejected, &loaded);
+        if (event == TACTICAL_EVENT_MAG_DROPPED) s_tacticalWorldMags[0].mag = dropped;
+    } else if (!strcasecmp(word, "tacgrab")) {
+        in.grip = 1; in.rig_distance_cm[gevrTacticalIsPistol(kind) ? 3 : 0] = 0;
+        event = gevrTacticalHandInteract(kind, hand, &in, &dropped, &ejected, &loaded);
+    } else if (!strcasecmp(word, "tacseat")) {
+        in.magazine_distance_cm = 0;
+        event = gevrTacticalHandInteract(kind, hand, &in, &dropped, &ejected, &loaded);
+    } else if (!strcasecmp(word, "tacstore")) {
+        TacticalMagazine before=s_tactical.inv.slots[interaction->hand];
+        int first=before.mag_class==TACTICAL_MAG_PISTOL ? 3 : 0;
+        int end=before.mag_class==TACTICAL_MAG_PISTOL ? 5 : 3;
+        int k;
+        for(k=first;k<end;k++) if(!s_tactical.inv.slots[TACTICAL_RIG_PRIMARY_1+k].id) break;
+        if(k<end) in.rig_distance_cm[k]=0;
+        event=gevrTacticalHandInteract(kind,hand,&in,&dropped,&ejected,&loaded);
+        if(k<end) {
+            TacticalMagazine *after=&s_tactical.inv.slots[TACTICAL_RIG_PRIMARY_1+k];
+            sysLogPrintf(LOG_NOTE,"tactical sim: enemy mag rig store event %d same-id %d rounds %u",event,
+                before.id && before.id==after->id,after->rounds);
+        }
+    } else if (!strcasecmp(word, "tacrack")) {
+        in.grip = 1; in.action_distance_cm = 0;
+        gevrTacticalHandInteract(kind, hand, &in, &dropped, &ejected, &loaded);
+        in.action_pull_cm = 5;
+        gevrTacticalHandInteract(kind, hand, &in, &dropped, &ejected, &loaded);
+        in.grip = 0;
+        event = gevrTacticalHandInteract(kind, hand, &in, &dropped, &ejected, &loaded);
+    } else if (!strcasecmp(word, "tacstate")) {
+        loaded = gevrTacticalHandRounds(well);
+    } else if (!strcasecmp(word, "tacloot") || !strcasecmp(word,"tacloot20") || !strcasecmp(word,"tacloot30") || !strcasecmp(word,"taclootpm")
+               || !strcasecmp(word,"taclootskorpion")
+               || !strcasecmp(word,"taclootdead") || !strcasecmp(word,"taclootback")) {
+        extern int gevrEnemyRigTestTakeType(TacticalInventory *inventory, int hand, unsigned int type, unsigned int capacity);
+        extern int gevrEnemyRigTestTakeRetired(TacticalInventory *inventory, int hand);
+        extern int gevrEnemyRigTestTakeFromBack(TacticalInventory *inventory, int hand);
+        unsigned capacity=!strcasecmp(word,"tacloot20") ? 20u : !strcasecmp(word,"tacloot30") ? 30u : 0u;
+        unsigned type = !strcasecmp(word,"taclootskorpion") ? TACTICAL_SKORPION_MAG_TYPE : !strcasecmp(word,"taclootpm") ? 5u : capacity ? 3u : 0u;
+        int taken = !strcasecmp(word,"taclootback") ? gevrEnemyRigTestTakeFromBack(&s_tactical.inv, interaction->hand)
+            : !strcasecmp(word,"taclootdead") ? gevrEnemyRigTestTakeRetired(&s_tactical.inv, interaction->hand)
+            : gevrEnemyRigTestTakeType(&s_tactical.inv, interaction->hand, type, capacity);
+        TacticalMagazine *mag = &s_tactical.inv.slots[interaction->hand];
+        if (taken) { interaction->state = 2; interaction->was_gripped = 1; }
+        sysLogPrintf(LOG_NOTE, "tactical sim: enemy loot %d id %u type %u rounds %u", taken, mag->id, mag->type, mag->rounds);
+        return TRUE;
+    } else if (!strcasecmp(word, "tacnames")) {
+        sysLogPrintf(LOG_NOTE, "tactical sim: names %s / %s; owned %d / %d",
+                     (const char *)get_ptr_short_watch_text_for_item(ITEM_SPECTRE),
+                     (const char *)get_ptr_short_watch_text_for_item(ITEM_MP5K),
+                     bondinvHasInvItem(ITEM_SPECTRE), bondinvHasInvItem(ITEM_MP5K));
+        return TRUE;
+    } else return FALSE;
+    gevrTacticalSoundEvent(kind, hand, event, beforeWell);
+    g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine = (s32)loaded;
+    if (kind == TACTICAL_GUN_RPG && event == TACTICAL_EVENT_MAG_SEATED) currentPlayerCreateRocket(hand);
+    sysLogPrintf(LOG_NOTE, "tactical sim: %s event %d loaded %u ejected %u carried %u dropped %u", word,
+                 event, loaded, ejected, tacticalCountRounds(&s_tactical.inv), s_tacticalWorldMags[0].mag.rounds);
+    return TRUE;
+}
+
+/* Draw the same body-relative magazine pose used for pickups. */
+static Gfx *gevrTacticalRigDraw(Gfx *gdl)
+{
+    extern Mtx *dynAllocateMatrix(void);
+    ModelRenderData rd = {0};
+    const s32 physical = sysArgCheck("--tactical-physical");
+    if (!gevrTacticalMode() || !s_tacticalStarted || g_CurrentPlayer->bonddead
+        || g_CurrentPlayer->watch_animation_state || g_CurrentPlayer->mpmenuon) return gdl;
+    rd.flags = 3; rd.zbufferenabled = TRUE; rd.PropType = 4;
+    rd.envcolour.word = g_CurrentPlayer->tileColor.a | ((u32)g_CurrentPlayer->tileColor.r << 24)
+        | ((u32)g_CurrentPlayer->tileColor.g << 16) | ((u32)g_CurrentPlayer->tileColor.b << 8);
+    /* Follow the body on interpolated XR frames. Using the world transform
+     * here lets artificial locomotion move the rig away from the hands. */
+    if (g_gevrStereo) gDPNoOpTag(gdl++, 0x565F0003);
+    for (int sword = 0; g_gevrStereo && physical && sword < 2; ++sword) {
+        if ((sword ? s_tacticalKatanaHand : s_tacticalKnifeHand) >= 0
+            || !bondinvHasInvItem(sword ? ITEM_TACTICAL_KATANA : ITEM_KNIFE)) continue;
+        Gfx *sheath = sword ? gevrTacticalKatanaScabbard() : gevrTacticalKnifeSheathList();
+        f32 pose[4][3];
+        const int side = (sword ? 0 : 1) ^ (VrLeftHandedMode != 0);
+        const f32 *fit = sword ? gevrTacticalKatanaMount : s_tacticalKnifeFit;
+        if (sheath && gevrBodyReloadPose(side, fit, pose)) {
+            Mtxf m;
+            matrix_4x4_set_identity(&m);
+            const f32 scale = GEVR_VIEWMODEL_CM * .1f * D_800364CC * (sword ? 1.f : 1.24f);
+            for (int col = 0; col < 3; ++col) {
+                m.m[0][col] = pose[0][col] * scale;
+                m.m[1][col] = (sword ? .96f*pose[1][col] - .28f*pose[0][col] : pose[1][col]) * scale;
+                m.m[2][col] = pose[2][col] * scale;
+                if (sword) m.m[0][col] = (.96f*pose[0][col] + .28f*pose[1][col]) * scale;
+                m.m[3][col] = pose[3][col];
+            }
+            gevrTacticalUnmirrorBasis(m.m);
+            Mtx *mtx = dynAllocateMatrix();
+            guMtxF2L(m.m, mtx);
+            rd.gdl = gdl; modelApplyRenderModeType3(&rd, TRUE); gdl = rd.gdl;
+            gSPMatrix(gdl++, osVirtualToPhysical(mtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+            gSPDisplayList(gdl++, sheath);
+        }
+    }
+    if (g_gevrStereo && physical && s_physicalShoulder.item) {
+        /* Visual behind the torso; the generous shoulder grab point is unchanged. */
+        f32 fit[3] = {22, 8 * (VrLeftHandedMode ? -1 : 1), -28}, pose[4][3];
+        const int mountedKind = gevrTacticalItem(s_physicalShoulder.item);
+        const int native = gevrTacticalNativeRifle(s_physicalShoulder.item);
+        const TacticalMagazine round = {.id = s_physicalShoulder.gun.chambered};
+        Gfx *list = mountedKind >= 0 ? gevrTacticalMountedGearList(mountedKind, s_physicalShoulder.build, FALSE,
+            mountedKind == TACTICAL_GUN_RPG ? &round : &s_physicalShoulder.gun.magazine) : NULL;
+        Mtxf m; Mtx *mtx;
+        if ((list || native) && gevrBodyReloadPose(1, fit, pose)) {
+            matrix_4x4_set_identity(&m);
+            for (int col = 0; col < 3; col++) {
+                f32 scale = GEVR_VIEWMODEL_CM * .1f * D_800364CC;
+                m.m[0][col] = (native ? -1.f : 1.f) * pose[0][col] * scale;
+                m.m[1][col] = -pose[2][col] * scale;
+                m.m[2][col] = (native ? -1.f : 1.f) * pose[1][col] * scale;
+                m.m[3][col] = pose[3][col];
+            }
+            gevrTacticalUnmirrorBasis(m.m);
+            if (native) {
+                extern Gfx *gevrHeldGunDrawPosed(s32 inst, s32 item, Mtxf *root, ModelRenderData *templ, Gfx *gdl);
+                matrix_4x4_7F058C64();
+                gdl = gevrHeldGunDrawPosed(0, s_physicalShoulder.item, &m, &rd, gdl);
+                matrix_4x4_7F058C88();
+            } else {
+                mtx = dynAllocateMatrix(); guMtxF2L(m.m, mtx);
+                rd.gdl = gdl; modelApplyRenderModeType3(&rd, TRUE); gdl = rd.gdl;
+                gSPMatrix(gdl++, osVirtualToPhysical(mtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+                gSPDisplayList(gdl++, list);
+            }
+        }
+    }
+    if (g_gevrStereo && physical) for (int hip = 0; hip < 2; hip++) {
+        f32 fit[3] = {GEVR_TACTICAL_HIP_DROP_CM,
+            GEVR_TACTICAL_HIP_SIDE_CM * ((hip != 0) != (VrLeftHandedMode != 0) ? 1 : -1), 0}, pose[4][3];
+        Gfx *list;
+        Mtxf m; Mtx *mtx;
+        if (!s_physicalPistols[hip].item) continue;
+        list = gevrTacticalMountedGearList(gevrTacticalItem(s_physicalPistols[hip].item), s_physicalPistols[hip].build,
+            s_physicalPistols[hip].item == ITEM_WPPKSIL, &s_physicalPistols[hip].gun.magazine);
+        if (!list || !gevrBodyReloadPose(1, fit, pose)) continue;
+        matrix_4x4_set_identity(&m);
+        for (int col = 0; col < 3; col++) {
+            f32 scale = GEVR_VIEWMODEL_CM * .1f * D_800364CC;
+            m.m[0][col] = pose[0][col] * scale;
+            m.m[1][col] = -pose[2][col] * scale;
+            m.m[2][col] = pose[1][col] * scale;
+            m.m[3][col] = pose[3][col];
+        }
+        gevrTacticalUnmirrorBasis(m.m);
+        mtx = dynAllocateMatrix(); guMtxF2L(m.m, mtx);
+        rd.gdl = gdl; modelApplyRenderModeType3(&rd, TRUE); gdl = rd.gdl;
+        gSPMatrix(gdl++, osVirtualToPhysical(mtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+        gSPDisplayList(gdl++, list);
+    }
+    if (g_gevrStereo) for (int k = 0; k < 5; k++) {
+        TacticalMagazine *mag = &s_tactical.inv.slots[TACTICAL_RIG_PRIMARY_1 + k];
+        int asset = tacticalMagazineGun(mag);
+        Gfx *list = gevrTacticalGearLooseMagList(mag->gear_part, asset);
+        if (!list && asset >= 0) list = gevrTacticalHeldMagList(asset);
+        f32 pose[4][3];
+        Mtxf m; Mtx *mtx;
+        if (!list || !gevrTacticalRigPose(k, physical, pose)) continue;
+        matrix_4x4_set_identity(&m);
+        for (int row = 0; row < 3; row++) for (int col = 0; col < 3; col++)
+            m.m[row][col] = pose[row][col] * GEVR_VIEWMODEL_CM * .1f * D_800364CC;
+        for (int col = 0; col < 3; col++) m.m[3][col] = pose[3][col];
+        gevrTacticalUnmirrorBasis(m.m);
+        const GevrRigMagazineBounds *bounds = physical ? gevrTacticalRigMagazineBounds(k, mag) : NULL;
+        if (bounds) {
+            for (int col = 0; col < 3; ++col)
+                for (int axis = 0; axis < 3; ++axis)
+                    m.m[3][col] -= bounds->centre[axis] * m.m[axis][col];
+        }
+        mtx = dynAllocateMatrix(); guMtxF2L(m.m, mtx);
+        rd.gdl = gdl; modelApplyRenderModeType3(&rd, TRUE); gdl = rd.gdl;
+        gSPMatrix(gdl++, osVirtualToPhysical(mtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+        gSPDisplayList(gdl++, list);
+        gdl = gevrTacticalDrawMagazineRounds(gdl, asset, mag->rounds, 0, 0, mag->gear_part);
+    }
+    if (g_gevrStereo) gDPNoOpTag(gdl++, 0x565F0000);
+    if (currentPlayerGetViewToWorldMtxf()) {
+        Mtxf worldToView;
+        matrix_4x4_invert_affine(currentPlayerGetViewToWorldMtxf(), &worldToView);
+        for (int k = 0; k < 128; k++) if (s_tacticalWorldMags[k].mag.id) {
+            TacticalMagazine *mag = &s_tacticalWorldMags[k].mag;
+            int asset = tacticalMagazineGun(mag);
+            Gfx *list = gevrTacticalGearLooseMagList(mag->gear_part, asset);
+            if (!list && asset >= 0) list = gevrTacticalHeldMagList(asset);
+            coord3d p = s_tacticalWorldMags[k].pos;
+            Mtxf m; Mtx *mtx;
+            if (!list) continue;
+            mtx4TransformVecInPlace(&worldToView, &p);
+            matrix_4x4_set_identity(&m);
+            for (int col = 0; col < 3; col++) {
+                const f32 scale = .1f * D_800364CC;
+                const int flat = s_tacticalWorldMags[k].flat;
+                m.m[0][col] = worldToView.m[0][col] * scale;
+                m.m[1][col] = worldToView.m[flat ? 2 : 1][col] * scale;
+                m.m[2][col] = worldToView.m[flat ? 1 : 2][col] * (flat ? -scale : scale);
+                m.m[3][col] = p.f[col] * D_800364CC;
+            }
+            gevrTacticalUnmirrorBasis(m.m);
+            mtx = dynAllocateMatrix(); guMtxF2L(m.m, mtx);
+            rd.gdl = gdl; modelApplyRenderModeType3(&rd, TRUE); gdl = rd.gdl;
+            gSPMatrix(gdl++, osVirtualToPhysical(mtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+            gSPDisplayList(gdl++, list);
+            gdl = gevrTacticalDrawMagazineRounds(gdl, asset, mag->rounds, 0, 0, mag->gear_part);
+        }
+    }
+    return gdl;
+}
+
 /* PP7 interaction points come from its rest mesh and the RAW gun controller.
  * Neither the rendered/supported hand nor last frame's falling magazine can
  * move a grab zone. Fit offsets are independent of KF7 calibration. */
@@ -19882,6 +24374,7 @@ s32 gevrGexClaimsOffHand(void)
     const s32 gunHand = gevrReloadSupportGun();
     f32 off[3], r[3], u[3], b[3];
 
+    if (gevrTacticalManualOn(gunHand)) return s_tacticalClaim;
     if (!g_gevrStereo || g_CurrentPlayer == NULL || !gevrGexByHand(gunHand) || gevrReloadGun(getCurrentPlayerWeaponId((1-gunHand))))
     {
         return FALSE;
@@ -20292,6 +24785,67 @@ void gevrHandReloadTick(void)
     f32 gun[3], gr[3], gu[3], gb[3], off[3], orr[3], ou[3], ob[3];
     s32 right, left, grip, ctrl, i;
 
+    if (netIsActive() && get_cur_playernum() != netGetLocalSlot()) return;
+    gevrTacticalEnsureStarted();
+    if (s_tacticalStarted && g_CurrentPlayer) gevrTacticalRestoreNativeMagazine();
+    for (int hand = 0; hand < 2; ++hand) {
+        if (s_physicalLeaving[hand] && g_CurrentPlayer
+            && getCurrentPlayerWeaponId(hand) != s_physicalLeaving[hand]) s_physicalLeaving[hand] = FALSE;
+    }
+    if (gevrTacticalMode() && s_tacticalStarted) {
+        if (g_CurrentPlayer->magnetattracttime >= 0x3c) gevrTacticalMoveMagneticMagazines();
+        for (int k = 0; k < 128; k++) if (s_tacticalWorldMags[k].mag.id && s_tacticalWorldMags[k].falling) {
+            f32 dt = (f32)g_ClockTimer, floor;
+            coord3d probe = s_tacticalWorldMags[k].pos;
+            StandTile *tile = stanFindTileBelowPos(&probe, NULL, &floor);
+            f32 nextX = probe.x + s_tacticalWorldMags[k].vx * dt;
+            f32 nextZ = probe.z + s_tacticalWorldMags[k].vz * dt;
+            s_tacticalWorldMags[k].speed -= .272f * dt;
+            if (tile && !stanTestLineUnobstructed(&tile, probe.x, probe.z, nextX, nextZ,
+                CDTYPE_OBJS | CDTYPE_DOORS | CDTYPE_PATHBLOCKER, 0, 1, 0, 1)) {
+                s_tacticalWorldMags[k].vx = s_tacticalWorldMags[k].vz = 0;
+            } else {
+                s_tacticalWorldMags[k].pos.x = nextX;
+                s_tacticalWorldMags[k].pos.z = nextZ;
+            }
+            if (stanFindTileBelowPos(&s_tacticalWorldMags[k].pos, NULL, &floor)) {
+                GevrWorldMagazine *mag = &s_tacticalWorldMags[k];
+                mag->ground = gevrTacticalSurfaceY(&mag->pos, mag->pos.y, floor, NULL);
+            }
+            s_tacticalWorldMags[k].pos.y += s_tacticalWorldMags[k].speed * dt;
+            const float support = s_tacticalWorldMags[k].ground + s_tacticalWorldMags[k].clearance;
+            if (s_tacticalWorldMags[k].pos.y <= support) {
+                s_tacticalWorldMags[k].pos.y = support;
+                s_tacticalWorldMags[k].speed = s_tacticalWorldMags[k].vx = s_tacticalWorldMags[k].vz = 0;
+                s_tacticalWorldMags[k].falling = FALSE;
+            }
+        }
+    }
+    const s32 tacticalGun = gevrReloadSupportGun();
+    const s32 manual = gevrTacticalManualOn(tacticalGun);
+    if (g_gevrStereo && gevrTacticalMode() && sysArgCheck("--tactical-physical") && s_tacticalStarted) {
+        extern _Bool get_button_state(int hand_index, const char *button_name);
+        const s32 reloadCtrl = manual && !s_physicalLeaving[tacticalGun]
+            ? 1 - gevrTacticalWeaponController(tacticalGun) : -1;
+        for (s32 c = 0; c < 2; ++c) {
+            const s32 trigger = get_button_state(c, "trigger");
+            s_tacticalTriggerPressed[c] = trigger && !s_tacticalTriggerWas[c];
+            s_tacticalTriggerWas[c] = trigger;
+            if (c != reloadCtrl && gevrPullInPlay() && gevrGunFitActive != 1
+                && !gevrWeaponPanelOpen && !lvlGetControlsLockedFlag()) {
+                gevrTacticalLooseMagazineTick(c, trigger);
+            }
+        }
+    }
+    if (manual) {
+        gevrTacticalTick();
+        return;
+    }
+    gevrTacticalOpticFlickReset();
+    s_tacticalActionAsset = -1;
+    s_tacticalActionCtrl = -1;
+    s_tacticalActionCm = 0;
+    s_tacticalClaim = FALSE;
     /* Remote contexts must not clear the local player's held magazine or
      * refund its rounds into a remote player's reserve. */
     if (netIsActive() && get_cur_playernum() != netGetLocalSlot()) return;
@@ -20616,6 +25170,8 @@ enum { GEVR_WC_PISTOLS, GEVR_WC_RIFLES, GEVR_WC_HEAVY, GEVR_WC_GADGETS, GEVR_WC_
 
 s32 gevrWeaponCategory(s32 item)
 {
+    if (item == ITEM_TACTICAL_PKM) return GEVR_WC_HEAVY;
+    if (item >= ITEM_TACTICAL_UZI && item < ITEM_IDS_MAX) item = GEVR_ITEM_AS(item);
     switch (item)
     {
         case ITEM_WPPK: case ITEM_WPPKSIL: case ITEM_TT33: case ITEM_RUGER:
@@ -21702,6 +26258,7 @@ Gfx *maybe_mp_interface(Gfx *gdl)
 
         gdl = gevrBodySlotsDraw(gdl);
     }
+    gdl = gevrTacticalRigDraw(gdl);
 #endif
 #ifdef GEVR
     /* A spectator is a camera on someone else: no hands, guns or watch arm of

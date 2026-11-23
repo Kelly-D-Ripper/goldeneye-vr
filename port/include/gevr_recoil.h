@@ -25,6 +25,7 @@ extern "C" {
 #endif
 /* gunhand: GUNRIGHT 0, GUNLEFT 1; strength scales the class's kick (1 = PD's) */
 void vrRecoilKick(int gunhand, int recoilClass, float strength);
+void vrTacticalRecoilKick(int gunhand, float strength, float ergonomics);
 #ifdef __cplusplus
 }
 #endif

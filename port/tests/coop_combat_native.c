@@ -19,6 +19,7 @@ f32 g_GlobalTimerDelta=8,g_AiAccuracyModifier=1,g_AiDamageModifier=1;
 static struct player players[4];
 struct player *g_playerPointers[MAX_PLAYER_COUNT],*g_CurrentPlayer;
 static PropRecord player_props[4],guard_prop,weapon_prop;
+static StandTile floor_tile;
 static WeaponObjRecord weapon;
 static Model gun_model;
 static ModelFileHeader gun_header;
@@ -26,14 +27,14 @@ static ModelNode muzzle;
 static union ModelRoData muzzle_data;
 static ModelNode *switches[2];
 static Mtxf cameras[4],gun_matrix;
-static int cur,local,hosting=1,downed[4],damage_events;
+static int cur,local,hosting=1,downed[4],visible[4],legacyVisible[4],spectating[4],damage_events,stop_events;
 static float last_damage;
 static u8 raw[64];static unsigned packet_bytes;
 int netGetLocalSlot(void) {return local;}
 bool netIsHost(void) {return hosting;}
 int netCoopActive(void) {return 1;}
 bool netSlotOccupied(int slot) {return slot>=0 && slot<2;}
-bool netSlotIsSpectator(int slot) {(void)slot;return false;}
+bool netSlotIsSpectator(int slot) {return spectating[slot] != 0;}
 int gevrCoopDowned(int slot) {return downed[slot];}
 s32 get_cur_playernum(void) {return cur;}
 void set_cur_player(s32 slot) {assert(slot>=0 && slot<4);cur=slot;g_CurrentPlayer=&players[slot];}
@@ -49,6 +50,14 @@ PropRecord *chrGetEquippedWeaponProp(ChrRecord *chr,GUNHAND hand) {(void)chr;(vo
 Mtxf *modelFindNodeMtx(Model *m,ModelNode *node,s32 index) {(void)m;(void)node;(void)index;return &gun_matrix;}
 void netCoopBroadcast(const unsigned char *data,unsigned size,int reliable) {assert(reliable && size<=sizeof(raw));memcpy(raw,data,size);packet_bytes=size;}
 void sysLogPrintf(s32 level,const char *fmt,...) {(void)level;(void)fmt;}
+s32 sysArgCheck(const char *arg) {(void)arg;return 0;}
+void chrStopFiring(ChrRecord *chr) {(void)chr;stop_events++;}
+int gevrTacticalGuardVisiblePlayer(ChrRecord *chr,int player) {(void)chr;return visible[player];}
+bool check_if_position_in_same_room(ChrRecord *chr,coord3d *pos,StandTile *stan) {
+    (void)chr;(void)stan;
+    for(int i=0;i<4;i++) if(pos==&player_props[i].pos) return legacyVisible[i];
+    return FALSE;
+}
 s32 gevrAllyIs(ChrRecord *chr) {(void)chr;return 0;}
 /* PRODUCTION */
 void record_damage_kills(f32 amount,f32 x,f32 z,s32 attacker,s32 armour) {
@@ -62,15 +71,28 @@ void bondviewCallRecordDamageKills(f32 amount,f32 angle,s32 attacker,s32 armour)
 int main(void) {
     for(int i=0;i<4;i++) {
         g_playerPointers[i]=&players[i];players[i].prop=&player_props[i];
+        player_props[i].stan=&floor_tile;
         players[i].bondhealth=1;players[i].damageshowtime=0;
         for(int k=0;k<4;k++)cameras[i].m[k][k]=1;
     }
     guards[0].prop=&guard_prop;
+    guard_prop.stan=&floor_tile;
     player_props[0].pos.z=500;player_props[1].pos.z=100;
     set_cur_player(0);
     assert(gevrCoopGuardTarget(&guards[0])==1); /* joining player is nearest */
     gevrCoopGuardProvoked(&guards[0],0);assert(gevrCoopGuardTarget(&guards[0])==0);
-    downed[0]=1;assert(gevrCoopGuardTarget(&guards[0])==1);downed[0]=0;
+    /* Same-room geometry may not override a blocked Tactical view. */
+    legacyVisible[1]=1;
+    downed[0]=1;assert(gevrCoopGuardTarget(&guards[0])==-1 && stop_events==1);
+    visible[1]=1;g_GlobalTimer+=12;assert(gevrCoopGuardTarget(&guards[0])==1);
+    spectating[1]=1;assert(gevrCoopGuardTarget(&guards[0])==-1 && stop_events==2);
+    spectating[1]=0;downed[0]=0;g_GlobalTimer+=12;
+    assert(gevrCoopGuardTarget(&guards[0])==1);
+    /* Native actors outside the Tactical sight policy still use their line. */
+    gevrCoopGuardProvoked(&guards[0],0);
+    visible[1]=-1;downed[0]=1;
+    assert(gevrCoopGuardTarget(&guards[0])==1);
+    visible[1]=1;downed[0]=0;
     /* Copies start with a flash timer of zero and never render that flash.
      * It must not prevent probabilistic guard hits on their owner. */
     set_cur_player(1);g_gevrCoopGuardTick=1;
@@ -83,6 +105,11 @@ int main(void) {
     local=1;hosting=0;g_gevrCoopGuardTick=0;set_cur_player(0);
     coopApplyDamage(&b);
     assert(damage_events==1 && last_damage>0 && players[1].bondhealth<1 && cur==0);
+    netbufStartReadData(&b,raw,packet_bytes);b.rp=8;
+    downed[1]=1;
+    coopApplyDamage(&b);
+    assert(damage_events==1 && cur==0);
+    downed[1]=0;
     /* The host's own normal immunity remains in force. */
     local=0;hosting=1;set_cur_player(0);g_gevrCoopGuardTick=1;
     guards[0].shotbondsum=0;chrlvUpdateShotbondsum(&guards[0],&aimed,&hit,ITEM_TT33);

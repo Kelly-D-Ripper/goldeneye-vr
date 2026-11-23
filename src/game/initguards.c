@@ -7,6 +7,7 @@
 #include "initguards.h"
 #ifdef GEVR
 #include "gevr_romlayout.h"
+#include "system.h"
 #endif
 
 void init_guards(void) {
@@ -32,6 +33,9 @@ void alloc_init_GUARDdata_entries(s32 count)
     
     g_NumChrSlots = count + 10; //special guards?
 #ifdef GEVR
+    /* The tactical test keeps bodies and their loot instead of recycling
+     * normal guard slots after death. Leave room for mission reinforcements. */
+    if (sysArgCheck("--tactical-physical")) g_NumChrSlots += 160;
     {
         /* chraction.c: the kept bodies were the last stage's */
         extern void gevrBodiesReset(void);

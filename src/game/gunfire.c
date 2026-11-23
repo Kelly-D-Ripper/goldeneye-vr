@@ -5,6 +5,10 @@
 #include "gevr_model.h"
 #include "gevr_gexweapon.h"
 #include "gevr_hand_reload.h"
+#include "gevr_tactical_mesh.h"
+#include "gevr_tactical_fit.h"
+#include "gevr_tactical_stats.h"
+#include "gevr_hollywood_fx.h"
 #include "gevr_romlayout.h"
 #endif
 #include <ultra64.h>
@@ -30,6 +34,13 @@
 #include "system.h" /* PORT probe logging */
 #ifdef GEVR
 extern bool netIsActive(void);
+extern s32 gevrTacticalManualOn(s32 hand);
+extern int gevrTacticalRacking(void);
+extern s32 gevrTacticalCanFire(s32 hand);
+extern void gevrTacticalShotFired(s32 hand);
+extern int gevrTacticalHeldMagAsset(void);
+extern unsigned int gevrTacticalHeldGearMagazine(void);
+extern s32 gevrReloadSupportGun(void);
 #endif
 /*
  * WeaponStats.RecoilSpeed is initialised as one 32-bit literal per weapon
@@ -163,6 +174,10 @@ void sub_GAME_7F05E808(GUNHAND hand);
 void sub_GAME_7F05EA94(Model *model, s32 val);
 void sub_GAME_7F0649D8(enum GUNHAND hand);
 void sub_GAME_7F068508(GUNHAND handnum, f32 floor_y_pos);
+#ifdef GEVR
+CasingRecord *casingCreate(ModelFileHeader *header, Mtxf *mtx);
+static s32 gevrTacticalEjectCasing(GUNHAND hand, s32 item, f32 floor);
+#endif
 Vtx *dynAllocateVertices(s32 count);
 Mtx *dynAllocateMatrix(void);
 void divide3DCoordinates(coord3d *in, f32 divisor, coord3d *out);
@@ -323,6 +338,12 @@ void gunFireTankShell(s32 handnum)
     obj->runtime_bitflags |= RUNTIME_OWNER_BITS(get_cur_playernum());
 
     gunInitProjectileFromPlayer(obj, &spawnpos, &shellmtx, &velocity, (s32 *) &identitymtx);
+#ifdef GEVR
+    if (weaponid == ITEM_TANKSHELLS) gevrHollywoodTankFired(spawnpos.f, aimdir.f);
+    if (weaponid == ITEM_TANKSHELLS && sysArgCheck("--tactical-sim") && sysArgCheck("--input-script"))
+        sysLogPrintf(LOG_NOTE, "tactical sim: tank cannon fired, %d loaded, %d spare",
+            hand->weapon_ammo_in_magazine, get_ammo_count_for_weapon(ITEM_TANKSHELLS));
+#endif
 
     if (obj->runtime_bitflags & RUNTIMEBITFLAG_00000080)
     {
@@ -692,6 +713,9 @@ void gunUpdateAndFire(GUNHAND handnum)
     if (((item == ITEM_ROCKETLAUNCH) || (item == ITEM_TRIGGER)) || (GEVR_ITEM_AS(item) == ITEM_WATCHLASER))
     {
         gunofs.y += g_CurrentPlayer->ducking_height_offset / (-100.0f);
+#ifdef GEVR
+        if (!g_gevrStereo && gevrTacticalHandheldDetonator(item)) gunofs.y += 7.f;
+#endif
         gunofs.z += (3.0f * g_CurrentPlayer->ducking_height_offset) / (-100.0f);
 
 #ifdef GEVR
@@ -752,7 +776,7 @@ void gunUpdateAndFire(GUNHAND handnum)
 
     if (((item == ITEM_TRIGGER) || (GEVR_ITEM_AS(item) == ITEM_WATCHLASER))
 #ifdef GEVR
-        && !gevrGexHeld(handnum)   /* GE-X's watch rig holds itself as posed */
+        && !gevrGexHeld(handnum) && !gevrTacticalHandheldDetonator(item)
 #endif
         )
     {
@@ -899,6 +923,7 @@ void gunUpdateAndFire(GUNHAND handnum)
         {
             gunmtx.m[r][0] = -gunmtx.m[r][0];
         }
+        if (gevrTacticalUnmirroredItem(item)) gevrTacticalUnmirrorBasis(gunmtx.m);
     }
 #endif
     matrix_4x4_copy(&gunmtx, &hand->gunmtx_camspace);
@@ -989,7 +1014,9 @@ void gunUpdateAndFire(GUNHAND handnum)
 #endif
 
 #ifdef GEVR
-    /* the flat test above without the hide flag, for the listed gadgets */
+    /* Draw the handheld device instead of the wrist model for this slot. */
+    const s32 handheldDetonator = gevrTacticalHandheldDetonator(item);
+    if (handheldDetonator) hand->field_87F = 0;
     s_gevrHiddenShown[handnum] = (g_gevrStereo ? gevrStereoItemShown(item) : gevrScreenGadget(handnum, item))
         && hand->field_87F == 0
         /* the gadget itself in the hand, not only picked on the watch: a mine
@@ -997,7 +1024,7 @@ void gunUpdateAndFire(GUNHAND handnum)
         && getCurrentPlayerWeaponId(handnum) == item
         && get_ptr_weapon_model_header_line(item) != 0
         /* mission devices have only the default stats, which never set the flag */
-        && (gitem_structs[item].has_no_model != 0
+        && (handheldDetonator || gitem_structs[item].has_no_model != 0
             || bondwalkItemCheckBitflags(item, WEAPONSTATBITFLAG_SHOW_FIRST_PERSON) != 0)
         && hand->weapon_action_state != GUN_ANIM_STATE_SWITCH_SWAP
         && hand->weapon_action_state != GUN_ANIM_STATE_SWITCH_HOLD
@@ -1078,7 +1105,8 @@ void gunUpdateAndFire(GUNHAND handnum)
         }
 #endif
 #ifdef GEVR
-        if (((bondwalkItemCheckBitflags(item, WEAPONSTATBITFLAG_MIRROR_DUAL) != 0) && (handnum == GUNLEFT))
+        if ((bondwalkItemCheckBitflags(item, WEAPONSTATBITFLAG_MIRROR_DUAL) != 0
+                && handnum == GUNLEFT && !gevrTacticalUnmirroredItem(item))
             || gevrGexLeftMirrored(handnum))
 #else
         if ((bondwalkItemCheckBitflags(item, WEAPONSTATBITFLAG_MIRROR_DUAL) != 0) && (handnum == GUNLEFT))
@@ -1195,6 +1223,9 @@ void gunUpdateAndFire(GUNHAND handnum)
 
             flashpos = *(coord3d *) flashdata;
 #ifdef GEVR
+            const GevrWeaponStats *flashStats = gevrTacticalHeldStats(handnum, item);
+            const s32 tacticalFlash = (g_gevrStereo && flashStats) || gevrHollywoodWeapon(item);
+            if (flashStats && !g_gevrStereo) flashscale *= flashStats->flash;
             {
                 if (item >= 0 && item < GEVR_MAX_WEAPONS)
                 {
@@ -1294,6 +1325,9 @@ void gunUpdateAndFire(GUNHAND handnum)
 
             if (hand->field_87D != 0)
             {
+#ifdef GEVR
+                if (!tacticalFlash)
+#endif
                 if (flashvisptr != NULL)
                 {
                     *flashvisptr = 1;
@@ -1512,9 +1546,13 @@ void gunUpdateAndFire(GUNHAND handnum)
 
     if (hand->weapon_firing_status != 0)
     {
-        sub_GAME_7F068508(handnum, bondviewGetPlayerStanHeight(g_CurrentPlayer));
+        f32 floor = bondviewGetPlayerStanHeight(g_CurrentPlayer);
+#ifdef GEVR
+        if (!gevrTacticalEjectCasing(handnum, getCurrentPlayerWeaponId(handnum), floor))
+#endif
+            sub_GAME_7F068508(handnum, floor);
 
-        if (item == ITEM_GRENADELAUNCH)
+        if (GEVR_ITEM_AS(item) == ITEM_GRENADELAUNCH)
         {
             gunSpawnGLGrenade(handnum);
             return;
@@ -1541,6 +1579,12 @@ void gunUpdateAndFire(GUNHAND handnum)
         if ((((((((item == ITEM_REMOTEMINE) || (item == ITEM_PROXIMITYMINE)) || (item == ITEM_TIMEDMINE)) || (item == ITEM_BOMBCASE)) || (item == ITEM_BUG)) || (item == ITEM_MICROCAMERA)) || (item == ITEM_GOLDENEYEKEY)) || (item == ITEM_PLASTIQUE))
         {
             generate_player_thrown_object(handnum);
+#ifdef GEVR
+            if (gevrTacticalGuidedThrow(item) && getCurrentPlayerWeaponId(handnum) != item) {
+                s_gevrHiddenShown[handnum] = FALSE;
+                hand->field_87F = 0;
+            }
+#endif
             return;
         }
 
@@ -2292,6 +2336,358 @@ extern s32 gevrGexShowsItem(s32 hand, s32 item);   /* gun.c: GoldenEye X's rig, 
 extern s32 gevrStereoWatchItem(s32 item);  /* bondview2.c: the watch laser, the detonator (#31) */
 extern s32 gevrStereoWatchGrip(void);      /* bondview2.c: the gun hand is at the watch (#31) */
 extern s32 gevrStereoWatchHandMatrix(Mtxf *out);
+extern s32 gevrTacticalTrackedWatch(Mtxf *glove, GevrTacticalWatchMount *mount);
+extern s32 gevrTacticalWatchPressAge(void);
+
+int gevrTacticalGunTrigger(Model *model)
+{
+    if (!g_CurrentPlayer || !model) return FALSE;
+    for (s32 hand = 0; hand < 2; hand++)
+        if (&g_CurrentPlayer->hands[hand].weaponModel == model) return gevrVrTriggerDown[hand];
+    return FALSE;
+}
+
+int gevrTacticalGunGloveMirrored(Model *model)
+{
+    return (gevrHandsMirrored() != 0) != (g_CurrentPlayer && model == &g_CurrentPlayer->hands[GUNLEFT].weaponModel);
+}
+
+/* Experimental private hand mesh. The old hand stays the fallback if the
+ * optional assets are missing. Tracking, firing and reload logic are shared. */
+static Gfx *gevrDrawTacticalList(Gfx *gdl, ModelRenderData *templ, Mtxf *pose, Gfx *list)
+{
+    Mtx *mtx = dynAllocateMatrix();
+    ModelRenderData renderdata = *templ;
+    renderdata.gdl = gdl;
+    guMtxF2L(pose->m, mtx);
+    modelApplyRenderModeType3(&renderdata, TRUE);
+    gdl = renderdata.gdl;
+    gSPMatrix(gdl++, osVirtualToPhysical(mtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+    gSPDisplayList(gdl++, list);
+    return gdl;
+}
+
+extern Gfx *gevrRenderTacticalWatch(Gfx *gdl, ModelRenderData *templ, const Mtxf *glove,
+    const GevrTacticalWatchMount *mount);
+
+static Gfx *gevrDrawTacticalFittedGlove(Gfx *gdl, ModelRenderData *templ, Mtxf *pose,
+    int gun, TacticalGlovePose glovePose, s32 mirrored, s32 watch, s32 *drawn)
+{
+    GevrTacticalWatchMount mount;
+    const s32 liveWatch = watch && gevrTacticalGloveWatchMount(gun, glovePose, mirrored, &mount)
+        && gevrTacticalOriginalWatchReady();
+    Gfx *list = gevrTacticalFittedGloveList(gun, glovePose, mirrored, watch && !liveWatch);
+    *drawn = list != NULL;
+    if (!list) return gdl;
+    gdl = gevrDrawTacticalList(gdl, templ, pose, list);
+    return liveWatch ? gevrRenderTacticalWatch(gdl, templ, pose, &mount) : gdl;
+}
+
+static Gfx *gevrDrawTacticalHand(Gfx *gdl, ModelRenderData *templ, Mtxf *pose, s32 which, s32 *drawn)
+{
+    Gfx *list = (Gfx *)(which == 12 ? gevrTacticalPinchHandList() : which == 11 ? gevrTacticalPistolOpenHandList()
+        : which == 10 ? gevrTacticalAkOpenHandList() : which == 9 ? gevrTacticalAkFreeHandList()
+        : which == 8 ? gevrTacticalAkSupportHandList()
+        : which == 7 ? gevrTacticalAkHandList(1) : which == 6 ? gevrTacticalAkHandList(3)
+        : which == 5 ? gevrTacticalPistolMagazineHandList() : gevrTacticalHandList(which));
+    *drawn = list != NULL;
+    return list ? gevrDrawTacticalList(gdl, templ, pose, list) : gdl;
+}
+
+extern s32 gevrTacticalHeldMagController(void);
+extern s32 gevrTacticalActionController(void);
+extern s32 gevrTacticalWeaponController(s32 hand);
+extern s32 gevrStereoTacticalHandMatrix(s32 ctrl, Mtxf *out);
+extern s32 gevrTacticalActionHandMatrix(Mtxf *out);
+extern int gevrTacticalSupportHolding(void);
+
+static s32 gevrTacticalLeftController(s32 ctrl)
+{
+    return (ctrl == 0) != (gevrHandsMirrored() != 0);
+}
+
+static s32 gevrTacticalContactHands(void)
+{
+    extern int gevrTacticalMode(void);
+    return g_gevrStereo && gevrTacticalMode() && sysArgCheck("--tactical-physical")
+        && sysArgCheck("--tactical-pavlov-hands");
+}
+
+static s32 gevrTacticalLongGunHand(s32 item)
+{
+    const int kind = gevrTacticalItem(item);
+    if (tacticalGunIsExpanded(kind)) return !tacticalGunIsPistol(kind);
+    return item == ITEM_AK47 || item == ITEM_SPECTRE || item == ITEM_MP5K
+        || (item == ITEM_SKORPION && gevrTacticalSkorpionEnabled())
+        || (item == ITEM_SNIPERRIFLE && gevrTacticalSvdEnabled())
+        || (item == ITEM_TACTICAL_AK74N && sysArgCheck("--tactical-variety"));
+}
+
+static void gevrTacticalOffsetHand(Mtxf *pose, f32 up, f32 forward)
+{
+    for (int col = 0; col < 3; ++col)
+        pose->m[3][col] += up * pose->m[1][col] + forward * pose->m[2][col];
+}
+
+static void gevrTacticalFitSmgGlove(s32 item, Mtxf *pose)
+{
+    if (item == ITEM_SPECTRE) gevrTacticalOffsetHand(pose, -25.f, 8.f);
+    if (item == ITEM_MP5K) gevrTacticalOffsetHand(pose, -30.f, 12.f);
+}
+
+/* The detached magazine's long axis is up. Nest its body in the pinch and
+ * pitch the feed lips slightly forward, leaving the base below the palm. */
+static Gfx *gevrDrawTacticalHeldMagazine(Gfx *gdl, ModelRenderData *templ, Mtxf *glove,
+    int asset, unsigned rounds, unsigned capacity, unsigned int part, s32 watch)
+{
+    const s32 pistol = tacticalGunIsPistol(asset);
+    const f32 tilt = pistol ? .12f : .25f;
+    const f32 upright = sqrtf(1.f - tilt*tilt);
+    const f32 gripHeight = pistol ? -10.f : -23.f;
+    Gfx *list = gevrTacticalGearLooseMagList(part, asset);
+    if (!list) list = gevrTacticalHeldMagList(asset);
+    if (!list) return gdl;
+    s32 drawn;
+    gdl = gevrDrawTacticalFittedGlove(gdl, templ, glove, asset, TACTICAL_GLOVE_PINCH, FALSE, watch, &drawn);
+    if (!drawn) {
+        gdl = gevrDrawTacticalHand(gdl, templ, glove, 12, &drawn);
+    }
+
+    Mtxf magazine = *glove;
+    if (asset == TACTICAL_GUN_RPG) {
+        gevrTacticalRocketGrip(glove->m, magazine.m);
+        return gevrDrawTacticalList(gdl, templ, &magazine, list);
+    }
+    gevrTacticalUnmirrorBasis(magazine.m);
+    for (int col = 0; col < 3; ++col) {
+        magazine.m[1][col] = upright * glove->m[1][col] + tilt * glove->m[2][col];
+        magazine.m[2][col] = -tilt * glove->m[1][col] + upright * glove->m[2][col];
+        magazine.m[3][col] = glove->m[3][col] + gevrTacticalPinchPoint[0] * glove->m[0][col]
+            + gevrTacticalPinchPoint[1] * glove->m[1][col] + gevrTacticalPinchPoint[2] * glove->m[2][col]
+            - gripHeight * magazine.m[1][col];
+    }
+    gdl = gevrDrawTacticalList(gdl, templ, &magazine, list);
+    return gevrTacticalDrawMagazineRounds(gdl, asset, rounds, capacity, 0, part);
+}
+
+static Gfx *gevrTacticalPreviewBackdrop(Gfx *gdl)
+{
+    const u32 backdrop = GPACK_RGBA5551(97, 113, 126, 1);
+    gDPPipeSync(gdl++);
+    gDPSetCycleType(gdl++, G_CYC_FILL);
+    gDPSetRenderMode(gdl++, G_RM_NOOP, G_RM_NOOP2);
+    gDPSetFillColor(gdl++, (backdrop << 16) | backdrop);
+    gDPFillRectangle(gdl++, viGetViewLeft(), viGetViewTop(),
+        viGetViewLeft() + viGetViewWidth() - 1, viGetViewTop() + viGetViewHeight() - 1);
+    gDPPipeSync(gdl++);
+    gDPParam(gdl++, 0x7E /* G_CLEAR_DEPTH_EXT */, 0);
+    gSPPerspNormalize(gdl++, matrix_4x4_calc_depth_scale(0.f, 300.f));
+    return gdl;
+}
+
+/* Scripted close-up of the same watch that the tracked open glove draws. */
+static Gfx *gevrTacticalWatchPreview(Gfx *gdl, ModelRenderData *render)
+{
+    GevrTacticalWatchMount mount;
+    if (!gevrTacticalGloveWatchMount(-1, TACTICAL_GLOVE_OPEN, FALSE, &mount)
+        || !gevrTacticalOriginalWatchReady()) return gdl;
+    f32 axis[3], normal[3];
+    const f32 axisScale = sqrtf(SQ(mount.along[0]) + SQ(mount.along[1]) + SQ(mount.along[2]));
+    const f32 normalScale = sqrtf(SQ(mount.normal[0]) + SQ(mount.normal[1]) + SQ(mount.normal[2]));
+    for (int i = 0; i < 3; ++i) {
+        axis[i] = mount.along[i] / axisScale;
+        normal[i] = mount.normal[i] / normalScale;
+    }
+    const f32 side[3] = {axis[1]*normal[2] - axis[2]*normal[1],
+        axis[2]*normal[0] - axis[0]*normal[2], axis[0]*normal[1] - axis[1]*normal[0]};
+    Mtxf glove;
+    matrix_4x4_set_identity(&glove);
+    for (int i = 0; i < 3; ++i) {
+        glove.m[i][0] = .1f * axis[i];
+        glove.m[i][1] = -.1f * side[i];
+        glove.m[i][2] = .1f * normal[i];
+    }
+    const f32 centre[3] = {0, 0, -14};
+    for (int i = 0; i < 3; ++i) glove.m[3][i] = centre[i] - mount.centre[0]*glove.m[0][i]
+        - mount.centre[1]*glove.m[1][i] - mount.centre[2]*glove.m[2][i];
+
+    gdl = gevrTacticalPreviewBackdrop(gdl);
+    s32 drawn;
+    gdl = gevrDrawTacticalFittedGlove(gdl, render, &glove, -1, TACTICAL_GLOVE_OPEN, FALSE, TRUE, &drawn);
+    gSPPerspNormalize(gdl++, viGetPerspNorm());
+    return gdl;
+}
+
+/* Scripted desktop capture of the game's fitted grip and magazine meshes. */
+static Gfx *gevrTacticalGripPreview(Gfx *gdl, ModelRenderData *render, s32 item, int kind)
+{
+    static const f32 depths[TACTICAL_GUN_COUNT] = {75.f, 38.f, 62.f, 47.f, 82.f, 36.f, 43.f, 132.f};
+    static const f32 centres[TACTICAL_GUN_COUNT] = {165.f, 72.f, 146.f, 113.f, 198.f, -58.f, 48.f, 365.f};
+    const s32 pistol = tacticalGunIsPistol(kind);
+    const GevrTacticalExpandedFit *fit = gevrTacticalExpandedFit(kind);
+    const f32 face = sysArgCheck("--tactical-preview-left-side") ? -1.f : 1.f;
+    const f32 depth = fit ? (pistol ? 48.f : 55.f + .11f * fit->muzzle[2]) : depths[kind];
+    Mtxf gun = {.m = {
+        {-.032f, .016f * face, -.0934f * face, 0.f},
+        {0.f, .0986f, .0169f, 0.f},
+        {.0947f * face, .0054f, -.0316f, 0.f},
+        {-.04f * depth, .12f * depth, -depth, 1.f}
+    }};
+    gevrTacticalOffsetHand(&gun, 0.f, fit ? -.39f * fit->muzzle[2] : -centres[kind]);
+    const f32 magDepth = pistol ? 33.f : 51.f;
+    Mtxf mag = {.m = {
+        {.0342f, -.0226f, .0912f, 0.f},
+        {0.f, .0971f, .0239f, 0.f},
+        {.0940f, .0082f, -.0332f, 0.f},
+        {.40f * magDepth, -.16f * magDepth, -magDepth, 1.f}
+    }};
+    Gfx *gunList = gevrTacticalMountedGunList(kind, item == ITEM_WPPKSIL, TRUE);
+    if (!gunList) return gdl;
+
+    gdl = gevrTacticalPreviewBackdrop(gdl);
+    matrix_4x4_7F058C64();
+    gdl = gevrDrawTacticalList(gdl, render, &gun, gunList);
+    s32 drawn;
+    const s32 pair = sysArgCheck("--tactical-twohand-preview")
+        || (kind == TACTICAL_GUN_USP && sysArgCheck("--tactical-ppk-twohand-preview"));
+    const s32 left = sysArgCheck("--tactical-preview-left-hand");
+    const s32 trigger = !pair || sysArgCheck("--tactical-preview-trigger") || sysArgCheck("--tactical-ppk-grip-preview");
+    gdl = gevrDrawTacticalFittedGlove(gdl, render, &gun, kind,
+        trigger ? TACTICAL_GLOVE_TRIGGER : TACTICAL_GLOVE_READY, left, left, &drawn);
+    if (!drawn) {
+        if (pistol) {
+            Gfx *hand = gevrTacticalPistolFiringHandList(kind, trigger, left);
+            if (hand) gdl = gevrDrawTacticalList(gdl, render, &gun, hand);
+        } else {
+            Mtxf legacy = gun;
+            gevrTacticalFitSmgGlove(item, &legacy);
+            gdl = gevrDrawTacticalHand(gdl, render, &legacy, 6, &drawn);
+        }
+    }
+    if (pair) {
+        gdl = gevrDrawTacticalFittedGlove(gdl, render, &gun, kind, TACTICAL_GLOVE_SUPPORT, left, !left, &drawn);
+    } else {
+        gdl = gevrDrawTacticalHeldMagazine(gdl, render, &mag,
+            kind == TACTICAL_GUN_AK74N ? TACTICAL_GUN_AK : kind, 1, 0, 0, !left);
+    }
+    matrix_4x4_7F058C88();
+    gSPPerspNormalize(gdl++, viGetPerspNorm());
+    return gdl;
+}
+
+static Gfx *gevrDrawDetonatorBox(Gfx *gdl, const s16 low[3], const s16 high[3], const u8 colour[3])
+{
+    Vtx *vertices = dynAllocateVertices(8);
+    for (int i = 0; i < 8; ++i) {
+        Vtx *vertex = &vertices[i];
+        *vertex = (Vtx){0};
+        for (int axis = 0; axis < 3; ++axis) {
+            vertex->v.ob[axis] = (i & (1 << axis)) ? high[axis] : low[axis];
+            vertex->v.cn[axis] = colour[axis] * ((i & 2) ? 1.f : .62f);
+        }
+        vertex->v.cn[3] = 255;
+    }
+    gSPVertex(gdl++, osVirtualToPhysical(vertices), 8, 0);
+    gSP2Triangles(gdl++, 0, 2, 3, 0, 0, 3, 1, 0);
+    gSP2Triangles(gdl++, 4, 5, 7, 0, 4, 7, 6, 0);
+    gSP2Triangles(gdl++, 0, 4, 6, 0, 0, 6, 2, 0);
+    gSP2Triangles(gdl++, 1, 3, 7, 0, 1, 7, 5, 0);
+    gSP2Triangles(gdl++, 0, 1, 5, 0, 0, 5, 4, 0);
+    gSP2Triangles(gdl++, 2, 6, 7, 0, 2, 7, 3, 0);
+    return gdl;
+}
+
+static Gfx *gevrDrawHandheldDetonator(Gfx *gdl, const Mtxf *handPose)
+{
+    extern f32 D_800364CC;
+    Mtxf pose = *handPose;
+    const f32 mm = .1f * (g_gevrStereo ? D_800364CC : 1.f);
+    for (int axis = 0; axis < 3; ++axis) {
+        const f32 length = sqrtf(SQ(pose.m[axis][0]) + SQ(pose.m[axis][1]) + SQ(pose.m[axis][2]));
+        if (length <= 1e-6f) return gdl;
+        for (int col = 0; col < 3; ++col) pose.m[axis][col] *= mm / length;
+    }
+
+    Mtx *fixed = dynAllocateMatrix();
+    guMtxF2L(pose.m, fixed);
+    gDPPipeSync(gdl++);
+    gDPSetCycleType(gdl++, G_CYC_1CYCLE);
+    gDPSetRenderMode(gdl++, G_RM_AA_ZB_OPA_SURF, G_RM_AA_ZB_OPA_SURF2);
+    gSPClearGeometryMode(gdl++, G_CULL_BOTH | G_LIGHTING | G_FOG | G_TEXTURE_GEN | G_TEXTURE_GEN_LINEAR);
+    gSPSetGeometryMode(gdl++, G_ZBUFFER | G_SHADE | G_SHADING_SMOOTH);
+    gSPTexture(gdl++, 0, 0, 0, G_TX_RENDERTILE, G_OFF);
+    gDPSetCombineMode(gdl++, G_CC_SHADE, G_CC_SHADE);
+    gSPMatrix(gdl++, osVirtualToPhysical(fixed), G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_NOPUSH);
+    gdl = gevrDrawDetonatorBox(gdl, (s16[]){-20, -15, -45}, (s16[]){20, 12, 29}, (u8[]){55, 61, 62});
+    gdl = gevrDrawDetonatorBox(gdl, (s16[]){-17, 12, -10}, (s16[]){17, 18, 24}, (u8[]){90, 100, 103});
+    gdl = gevrDrawDetonatorBox(gdl, (s16[]){-11, 18, -2}, (s16[]){11, 22, 17}, (u8[]){225, 57, 34});
+    return gevrDrawDetonatorBox(gdl, (s16[]){-4, 12, -28}, (s16[]){4, 14, -20}, (u8[]){232, 190, 62});
+}
+
+static Gfx *gevrDrawGadgetThrowGuide(Gfx *gdl, GUNHAND hand)
+{
+    extern f32 D_800364CC;
+    const struct hand *held = &g_CurrentPlayer->hands[hand];
+    if (!gevrTacticalGuidedThrow(getCurrentPlayerWeaponId(hand)) || held->weapon_ammo_in_magazine <= 0
+        || g_CurrentPlayer->watch_animation_state != 0
+        || g_CurrentPlayer->bonddead) return gdl;
+
+    coord3d direction;
+    gevrTacticalThrowVelocity(hand, &direction);
+    mtx4RotateVecInPlace(camGetWorldToScreenMtxf(), &direction);
+    const f32 speed = sqrtf(direction.x*direction.x + direction.y*direction.y + direction.z*direction.z);
+    if (speed < 0.001f) return gdl;
+    for (int axis = 0; axis < 3; ++axis) direction.f[axis] /= speed;
+    const f32 *origin = held->gunmtx_camspace.m[3];
+    if (origin[2] >= -0.5f) return gdl;
+    coord3d width = {.f = {
+        direction.y * origin[2] - direction.z * origin[1],
+        direction.z * origin[0] - direction.x * origin[2],
+        direction.x * origin[1] - direction.y * origin[0]
+    }};
+    const f32 widthLength = sqrtf(width.x*width.x + width.y*width.y + width.z*width.z);
+    if (widthLength > .001f) {
+        for (int axis = 0; axis < 3; ++axis) width.f[axis] /= widthLength;
+    } else {
+        width = (coord3d){.f = {1.f, 0.f, 0.f}};
+    }
+
+    const f32 units = g_gevrStereo ? D_800364CC : 1.f;
+    Vtx *v = dynAllocateVertices(4);
+    for (int i = 0; i < 4; ++i) {
+        const f32 distance = (i & 2) ? 108.f : 7.f;
+        const f32 edge = (i & 1) ? .52f : -.52f;
+        for (int axis = 0; axis < 3; ++axis)
+            v[i].v.ob[axis] = (s16)(20.f * units * (direction.f[axis] * distance + width.f[axis] * edge));
+        v[i].v.flag = 0;
+        v[i].v.tc[0] = v[i].v.tc[1] = 0;
+        v[i].v.cn[0] = 91;
+        v[i].v.cn[1] = 224;
+        v[i].v.cn[2] = 240;
+        v[i].v.cn[3] = (i & 2) ? 105 : 218;
+    }
+    Mtxf pose;
+    Mtx *fixed = dynAllocateMatrix();
+    matrix_4x4_set_identity(&pose);
+    for (int axis = 0; axis < 3; ++axis) {
+        pose.m[axis][axis] = 0.05f;
+        pose.m[3][axis] = origin[axis];
+    }
+    guMtxF2L(pose.m, fixed);
+    gdl = gevrHandTag(gdl, gevrTacticalWeaponController(hand));
+    gDPPipeSync(gdl++);
+    gDPSetCycleType(gdl++, G_CYC_1CYCLE);
+    gDPSetRenderMode(gdl++, G_RM_AA_ZB_XLU_SURF, G_RM_AA_ZB_XLU_SURF2);
+    gSPClearGeometryMode(gdl++, G_LIGHTING | G_CULL_BOTH | G_TEXTURE_GEN | G_TEXTURE_GEN_LINEAR | G_FOG);
+    gSPSetGeometryMode(gdl++, G_ZBUFFER | G_SHADE | G_SHADING_SMOOTH);
+    gSPTexture(gdl++, 0, 0, 0, G_TX_RENDERTILE, G_OFF);
+    gDPSetCombineMode(gdl++, G_CC_SHADE, G_CC_SHADE);
+    gSPMatrix(gdl++, osVirtualToPhysical(fixed), G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_NOPUSH);
+    gSPVertex(gdl++, osVirtualToPhysical(v), 4, 0);
+    gSP2Triangles(gdl++, 0, 1, 2, 0, 1, 3, 2, 0);
+    gDPPipeSync(gdl++);
+    return gevrHandTag(gdl, -1);
+}
 
 static Gfx *gevrRenderItemHand(Gfx *gdl, ModelRenderData *templ, GUNHAND handnum)
 {
@@ -2303,6 +2699,7 @@ static Gfx *gevrRenderItemHand(Gfx *gdl, ModelRenderData *templ, GUNHAND handnum
     Model *mdl = &s_gevrFistModel;
     ModelFileHeader *hdr = &s_gevrFistHeader;
     u32 *rw = s_gevrFistRw;
+    s32 tacticalRifle = gevrTacticalLongGunHand(item) && gevrTacticalManualOn(handnum);
     /* left-handed mode mirrors the gun matrix too: the left hand's then cancels */
     s32 mirror = gevrStereoMirrored() != (handnum == GUNLEFT);
 
@@ -2311,6 +2708,32 @@ static Gfx *gevrRenderItemHand(Gfx *gdl, ModelRenderData *templ, GUNHAND handnum
         /* the screen: GE-X's hand holds a gadget the flat game never drew (gun.c) */
         extern Gfx *gevrGexDrawItemHand(Gfx *gdl, ModelRenderData *templ, GUNHAND hand, s32 mirror, s32 *drawn);
         s32 drawn = FALSE;
+
+        /* Scripted desktop smoke test: exercise the same loader/list builder
+         * without pretending the headset or controller poses are present. */
+        if (sysArgCheck("--input-script") && sysArgCheck("--tactical-hands-smoke"))
+        {
+            static s32 checked = FALSE;
+            if (!checked)
+            {
+                s32 count = 0;
+                for (s32 pose = 0; pose < 4; pose++) count += gevrTacticalHandList(pose) != NULL;
+                sysLogPrintf(LOG_NOTE, "tactical hands: smoke loaded %d/4 poses", count);
+                checked = TRUE;
+            }
+            /* An intentionally staged flat-screen render of one mesh, for
+             * checking the renderer only; it is not a VR controller pose. */
+            if (handnum == GUNRIGHT && sysArgCheck("--tactical-hands-preview"))
+            {
+                Mtxf preview;
+                s32 rendered;
+                matrix_4x4_set_identity(&preview);
+                preview.m[0][0] = .1f; preview.m[1][1] = 0; preview.m[1][2] = -.1f;
+                preview.m[2][1] = .1f; preview.m[2][2] = 0;
+                preview.m[3][0] = 0; preview.m[3][1] = -10; preview.m[3][2] = -65;
+                gdl = gevrDrawTacticalHand(gdl, templ, &preview, 2, &rendered);
+            }
+        }
 
         if (handnum == GUNRIGHT && s_gevrHiddenShown[handnum] && !g_CurrentPlayer->bonddead
             && g_CurrentPlayer->watch_animation_state == 0)
@@ -2325,7 +2748,37 @@ static Gfx *gevrRenderItemHand(Gfx *gdl, ModelRenderData *templ, GUNHAND handnum
     {
         return gdl;
     }
-    if (g_CurrentPlayer->hands[handnum].field_87F != 0 && !gevrStereoWatchItem(item))
+    const s32 ctrl = handnum == GUNRIGHT ? 1 : 0;
+    const s32 contactHands = gevrTacticalContactHands();
+    if (contactHands && (gevrTacticalHeldMagController() == ctrl || gevrTacticalActionController() == ctrl))
+        return gdl; /* This controller is drawn on the part it grabbed. */
+    /* The right fist is an entire native viewmodel, so draw the tracked glove
+     * here and suppress that model in the weapon pass below. When a gun is in
+     * the left hand, the support-hand pass owns this controller instead. */
+    if (handnum == GUNRIGHT && item == ITEM_FIST && sysArgCheck("--tactical-physical")
+        && sysArgCheck("--tactical-pavlov-hands"))
+    {
+        if (getCurrentPlayerWeaponId(GUNLEFT) == ITEM_FIST || getCurrentPlayerWeaponId(GUNLEFT) == ITEM_UNARMED) {
+            s32 drawn;
+            if (gevrStereoTacticalHandMatrix(ctrl, &armmtx)) {
+                gdl = gevrDrawTacticalFittedGlove(gdl, templ, &armmtx, -1, TACTICAL_GLOVE_OPEN, FALSE,
+                    gevrTacticalLeftController(ctrl), &drawn);
+                if (drawn) return gdl;
+            }
+            extern s32 gevrStereoFreeGunHandMatrix(s32 hand, Mtxf *out);
+            if (gevrStereoFreeGunHandMatrix(handnum, &armmtx)) {
+                matrix_scalar_multiply(IDO_POINT_ONE, armmtx.m[0]);
+                gdl = gevrDrawTacticalHand(gdl, templ, &armmtx, 11, &drawn);
+            }
+        }
+        return gdl;
+    }
+    /* The tracked gloved off hand is drawn later; suppress the separate
+     * vanilla fist when a left-held PPK leaves the right hand free. */
+    if (sysArgCheck("--tactical-ppk-hand-refit") && sysArgCheck("--tactical-physical")
+        && item == ITEM_FIST && handnum != gevrReloadSupportGun()
+        && (getCurrentPlayerWeaponId(gevrReloadSupportGun()) == ITEM_WPPK || getCurrentPlayerWeaponId(gevrReloadSupportGun()) == ITEM_WPPKSIL || (sysArgCheck("--tactical-variety") && getCurrentPlayerWeaponId(gevrReloadSupportGun()) == ITEM_TT33))) return gdl;
+    if (g_CurrentPlayer->hands[handnum].field_87F != 0 && !gevrStereoWatchItem(item) && !tacticalRifle)
     {
         return gdl;     /* the game draws the weapon (with its hand) */
     }
@@ -2351,9 +2804,25 @@ static Gfx *gevrRenderItemHand(Gfx *gdl, ModelRenderData *templ, GUNHAND handnum
     {
         return gdl;     /* the gadget's model has its own hand */
     }
-    if (!gevrStereoGunMatrix(handnum, &armmtx))
+    extern s32 gevrStereoFreeGunHandMatrix(s32 hand, Mtxf *out);
+    const s32 freeRifleHand = tacticalRifle && gevrTacticalSupportHolding();
+    if (!(freeRifleHand ? gevrStereoFreeGunHandMatrix(handnum, &armmtx) : gevrStereoGunMatrix(handnum, &armmtx)))
     {
         return gdl;
+    }
+    if (tacticalRifle && contactHands) {
+        const TacticalGlovePose pose = freeRifleHand ? TACTICAL_GLOVE_OPEN
+            : gevrVrTriggerDown[handnum] ? TACTICAL_GLOVE_TRIGGER : TACTICAL_GLOVE_READY;
+        if (gevrTacticalFittedGloveList(gevrTacticalItem(item), pose, !freeRifleHand && mirror, FALSE)) {
+            if (freeRifleHand) {
+                if (!gevrStereoTacticalHandMatrix(ctrl, &armmtx)) return gdl;
+            } else {
+                matrix_scalar_multiply(IDO_POINT_ONE, armmtx.m[0]);
+            }
+            s32 drawn;
+            return gevrDrawTacticalFittedGlove(gdl, templ, &armmtx, gevrTacticalItem(item), pose,
+                !freeRifleHand && mirror, mirror, &drawn);
+        }
     }
     {
         /* GoldenEye X's models: its hand holds the gadget (gun.c), not GoldenEye's fist */
@@ -2367,7 +2836,7 @@ static Gfx *gevrRenderItemHand(Gfx *gdl, ModelRenderData *templ, GUNHAND handnum
         }
     }
     /* issue #41: a grenade in the taser's gripping hand, not the open fist */
-    if (s_gevrHiddenShown[handnum] && gevrStereoItemHand(item) == 2 && gevrTaserHandLoad())
+    if (((s_gevrHiddenShown[handnum] && gevrStereoItemHand(item) == 2) || tacticalRifle) && gevrTaserHandLoad())
     {
         mdl = &s_gevrTaserHandModel;
         hdr = &s_gevrTaserHandHeader;
@@ -2378,12 +2847,31 @@ static Gfx *gevrRenderItemHand(Gfx *gdl, ModelRenderData *templ, GUNHAND handnum
         return gdl;
     }
 
-    if (handnum == GUNLEFT)
+    if (!freeRifleHand && gevrTacticalUnmirroredItem(item) ? mirror : handnum == GUNLEFT)
     {
         /* a left hand: mirrored in the model's own frame */
         matrix_column_1_scalar_multiply(-1.0f, armmtx.m[0]);
     }
     matrix_scalar_multiply(IDO_POINT_ONE, armmtx.m[0]);
+
+    const s32 gadgetHand = s_gevrHiddenShown[handnum] && sysArgCheck("--tactical-pavlov-hands")
+        && (gevrTacticalGuidedThrow(item) || gevrTacticalHandheldDetonator(item)
+            || (gevrTacticalGadgetsEnabled() && (item == ITEM_DOORDECODER || item == ITEM_KEYCARD
+                || item == ITEM_CREDITCARD || item == ITEM_DATATHIEF || item == ITEM_KEYANALYSERCASE
+                || item == ITEM_BOMBDEFUSER || item == ITEM_EXPLOSIVEFLOPPY)));
+    if (tacticalRifle || gadgetHand)
+    {
+        s32 drawn;
+        const s32 pinch = item == ITEM_KEYCARD || item == ITEM_CREDITCARD || item == ITEM_GOLDENEYEKEY
+            || item == ITEM_EXPLOSIVEFLOPPY || item == ITEM_MICROCAMERA;
+        s32 pose = gadgetHand ? (pinch ? 12 : 5) : tacticalRifle && sysArgCheck("--tactical-physical")
+            ? gevrTacticalSupportHolding() ? (gevrTacticalRacking() || gevrTacticalHeldMagAsset() >= 0 ? 9 : 10)
+                : gevrVrTriggerDown[handnum] ? 7 : 6
+            : gevrVrTriggerDown[handnum] ? 1 : 3;
+        if (contactHands) gevrTacticalFitSmgGlove(item, &armmtx);
+        gdl = gevrDrawTacticalHand(gdl, templ, &armmtx, pose, &drawn);
+        if (drawn) return gdl;
+    }
 
     rwmtx = (Mtxf *) dynAllocate(hdr->numMatrices * ((s32) sizeof(Mtxf)));
     for (j = 0; j < hdr->numMatrices; j++)
@@ -2442,9 +2930,16 @@ static Gfx *gevrRenderLeftArm(Gfx *gdl, ModelRenderData *templ)
     Model *mdl = &s_gevrFistModel;
     ModelFileHeader *hdr = &s_gevrFistHeader;
     u32 *rw = s_gevrFistRw;
-    s32 held = gevrStereoTwoHandGrip();
-    s32 gun = held ? gevrStereoTwoHandGun() : GUNRIGHT;
-    s32 support = held ? 1 - gun : GUNLEFT;
+    s32 racking = sysArgCheck("--tactical-pavlov-hands") && gevrTacticalRacking();
+    /* Reload owns the off hand, including while support state is clearing. */
+    const s32 contactHands = gevrTacticalContactHands();
+    s32 held = gevrStereoTwoHandGrip() && (gevrTacticalSupportHolding() || (gevrTacticalHeldMagAsset() < 0 && !racking));
+    s32 gun = held ? gevrStereoTwoHandGun() : (gevrTacticalHeldMagAsset() >= 0 || racking) ? gevrReloadSupportGun() : GUNRIGHT;
+    const s32 activeGun = gevrReloadSupportGun();
+    const s32 ppkRefit = sysArgCheck("--tactical-ppk-hand-refit") && sysArgCheck("--tactical-physical")
+        && (getCurrentPlayerWeaponId(activeGun) == ITEM_WPPK || getCurrentPlayerWeaponId(activeGun) == ITEM_WPPKSIL || (sysArgCheck("--tactical-variety") && getCurrentPlayerWeaponId(activeGun) == ITEM_TT33));
+    if ((ppkRefit || contactHands) && !held) gun = activeGun;
+    s32 support = held || gevrTacticalHeldMagAsset() >= 0 || racking || ppkRefit || contactHands ? 1 - gun : GUNLEFT;
     s32 item = get_item_in_hand_or_watch_menu(support);
     s32 mirror = (support == GUNLEFT) != gevrStereoMirrored();
 
@@ -2455,6 +2950,8 @@ static Gfx *gevrRenderLeftArm(Gfx *gdl, ModelRenderData *templ)
     {
         return gdl;
     }
+    if (contactHands && !held
+        && (gevrTacticalHeldMagController() == gun || gevrTacticalActionController() == gun)) return gdl;
     /*
      * Issue #35: holding the gun, it is the taser's gripping hand (#41, the
      * grenade's hand; user) rather than the clenched fist, and bondview2.c
@@ -2474,11 +2971,72 @@ static Gfx *gevrRenderLeftArm(Gfx *gdl, ModelRenderData *templ)
             return gdl;   /* GoldenEye X's left hand has the magazine (gun.c) */
         }
     }
-    if (!gevrStereoGunMatrix(held ? gun : support, &armmtx))
+    extern s32 gevrStereoFreeGunHandMatrix(s32 hand, Mtxf *out);
+    const s32 freeAkHand = !held && sysArgCheck("--tactical-physical")
+        && (getCurrentPlayerWeaponId(gun) == ITEM_AK47 || (getCurrentPlayerWeaponId(gun) == ITEM_TACTICAL_AK74N && sysArgCheck("--tactical-variety"))) && (gevrTacticalHeldMagAsset() >= 0 || racking);
+    const s32 freePpkHand = ppkRefit && !held;
+    const s32 freeTacticalHand = !held && sysArgCheck("--tactical-physical")
+        && sysArgCheck("--tactical-pavlov-hands");
+    extern s32 gevrStereoReloadHandMatrix(Mtxf *out);
+    if (!(freePpkHand && (gevrTacticalHeldMagAsset() >= 0 || racking) ? gevrStereoReloadHandMatrix(&armmtx)
+          : freePpkHand || freeAkHand || freeTacticalHand ? gevrStereoFreeGunHandMatrix(support, &armmtx)
+          : gevrStereoGunMatrix(held ? gun : support, &armmtx)))
     {
         return gdl;
     }
-    if (held && gevrTaserHandLoad())
+    const s32 heldItem = getCurrentPlayerWeaponId(gun);
+    const int kind = gevrTacticalItem(heldItem);
+    if (contactHands) {
+        s32 drawn;
+        if (held) {
+            Mtxf glove = armmtx;
+            matrix_scalar_multiply(IDO_POINT_ONE, glove.m[0]);
+            gdl = gevrDrawTacticalFittedGlove(gdl, templ, &glove, kind, TACTICAL_GLOVE_SUPPORT, !mirror, mirror, &drawn);
+            if (drawn) return gdl;
+        } else if (!racking && gevrTacticalHeldMagAsset() < 0) {
+            Mtxf glove;
+            if (gevrStereoTacticalHandMatrix(1 - support, &glove)) {
+                gdl = gevrDrawTacticalFittedGlove(gdl, templ, &glove, kind, TACTICAL_GLOVE_OPEN, FALSE, mirror, &drawn);
+                if (drawn) return gdl;
+            }
+        }
+    }
+    if (held && sysArgCheck("--tactical-physical") && gevrTacticalLongGunHand(heldItem)) {
+        s32 drawn;
+        matrix_scalar_multiply(IDO_POINT_ONE, armmtx.m[0]);
+        if (gevrTacticalUnmirroredItem(heldItem) && !mirror)
+            matrix_column_1_scalar_multiply(-1.f, armmtx.m[0]);
+        s32 pose = 8;
+        if (heldItem == ITEM_TACTICAL_AK74N) gevrTacticalOffsetHand(&armmtx, 0.f, 27.f);
+        if (heldItem == ITEM_SPECTRE) gevrTacticalOffsetHand(&armmtx, -5.f, -22.f);
+        if (heldItem == ITEM_MP5K) {
+            /* A vertical grip needs a curled palm instead of a hand under the barrel. */
+            matrix_column_1_scalar_multiply(-1.f, armmtx.m[0]);
+            gevrTacticalOffsetHand(&armmtx, 18.f, 232.f);
+            pose = 6;
+        }
+        gdl = gevrDrawTacticalHand(gdl, templ, &armmtx, pose, &drawn);
+        if (drawn) return gdl;
+    }
+    /* PPK support wraps the pistol hand in the gun's own space. The tracked
+     * support grip still decides when this hand appears. */
+    if (held && sysArgCheck("--tactical-ppk") && sysArgCheck("--tactical-pavlov-hands")
+        && (getCurrentPlayerWeaponId(gun) == ITEM_WPPK || getCurrentPlayerWeaponId(gun) == ITEM_WPPKSIL || (sysArgCheck("--tactical-variety") && getCurrentPlayerWeaponId(gun) == ITEM_TT33)))
+    {
+        Gfx *list = heldItem == ITEM_TT33 ? gevrTacticalMakarovSupportList() : gevrTacticalPistolSupportList();
+        if (list) {
+            ModelRenderData rd = *templ;
+            Mtx *mtx = dynAllocateMatrix();
+            matrix_scalar_multiply(IDO_POINT_ONE, armmtx.m[0]);
+            if (gevrTacticalUnmirroredItem(heldItem) && !mirror)
+                matrix_column_1_scalar_multiply(-1.f, armmtx.m[0]);
+            guMtxF2L(armmtx.m, mtx); rd.gdl = gdl; modelApplyRenderModeType3(&rd, TRUE); gdl = rd.gdl;
+            gSPMatrix(gdl++, osVirtualToPhysical(mtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+            gSPDisplayList(gdl++, list);
+            return gdl;
+        }
+    }
+    if ((held || gevrTacticalHeldMagAsset() >= 0) && gevrTaserHandLoad())
     {
         mdl = &s_gevrTaserHandModel;
         hdr = &s_gevrTaserHandHeader;
@@ -2491,12 +3049,23 @@ static Gfx *gevrRenderLeftArm(Gfx *gdl, ModelRenderData *templ)
 
     /* Mirror only a logical left support hand, then apply the viewmodel scale. */
     if (support == GUNLEFT) matrix_column_1_scalar_multiply(-1.0f, armmtx.m[0]);
-    matrix_scalar_multiply(IDO_POINT_ONE, armmtx.m[0]);
+    if (!(freePpkHand && (gevrTacticalHeldMagAsset() >= 0 || racking)))
+        matrix_scalar_multiply(IDO_POINT_ONE, armmtx.m[0]);
     if (held)
     {
         extern s32 gevrStereoTwoHandMatrix(Mtxf *m);
 
         gevrStereoTwoHandMatrix(&armmtx);
+    }
+
+    if (held || gevrTacticalHeldMagAsset() >= 0 || racking || freePpkHand || freeTacticalHand)
+    {
+        s32 drawn;
+        s32 pose = freeAkHand ? 9 : freePpkHand ? (gevrTacticalHeldMagAsset() >= 0 || racking ? 5 : 11) : freeTacticalHand ? 11 : (held || racking) ? 1 : 2;
+        if (!held && !racking && sysArgCheck("--tactical-ppk")
+            && (getCurrentPlayerWeaponId(gun) == ITEM_WPPK || getCurrentPlayerWeaponId(gun) == ITEM_WPPKSIL || (sysArgCheck("--tactical-variety") && getCurrentPlayerWeaponId(gun) == ITEM_TT33))) pose = 5;
+        gdl = gevrDrawTacticalHand(gdl, templ, &armmtx, pose, &drawn);
+        if (drawn) return gdl;
     }
 
     rwmtx = (Mtxf *) dynAllocate(hdr->numMatrices * ((s32) sizeof(Mtxf)));
@@ -2791,7 +3360,11 @@ static Gfx *gevrRenderWatchGripHand(Gfx *gdl, ModelRenderData *templ)
         }
     }
 
-    gevrWatchHandAnimateFinger(&s_gevrWatchHandHeader, &base, rwmtx, g_CurrentPlayer->hands[GUNRIGHT].field_A84);
+    const s32 pressAge = gevrTacticalWatchPressAge();
+    const f32 angle = pressAge > 0
+        ? get_value_if_watch_is_on_hand_or_not(GUNRIGHT) * fminf(1.f, fminf(pressAge, 13.f-pressAge)/3.f)
+        : g_CurrentPlayer->hands[GUNRIGHT].field_A84;
+    gevrWatchHandAnimateFinger(&s_gevrWatchHandHeader, &base, rwmtx, angle);
 
     /* Only the pressing hand draws here. Outfit sleeves belong to the
      * separately rendered regular watch arm. */
@@ -2801,7 +3374,9 @@ static Gfx *gevrRenderWatchGripHand(Gfx *gdl, ModelRenderData *templ)
     s_gevrWatchHandModel.render_pos = (RenderPosView *) rwmtx;
 
     renderdata = *templ;
-    renderdata.gdl = gdl;
+    /* The pressing hand is attached to the watch, so both use the same
+     * controller's late pose update even though the other trigger presses. */
+    renderdata.gdl = gevrHandTag(gdl, 0);
     renderdata.PropType = 4;
     renderdata.envcolour.word = g_CurrentPlayer->tileColor.a
                               | ((u32)g_CurrentPlayer->tileColor.r << 24)
@@ -2823,11 +3398,71 @@ static Gfx *gevrRenderWatchGripHand(Gfx *gdl, ModelRenderData *templ)
     bondviewTransformManyPosToViewMatrix(s_gevrWatchHandModel.render_pos, n);
     matrix_4x4_7F058C88();
 
-    return gdl;
+    return gevrHandTag(gdl, -1);
 }
 #endif
 
 // Address: 0x7F062BE4
+#ifdef GEVR
+static Gfx *gevrDrawWeaponFlash(Gfx *gdl, s32 hand, s32 item)
+{
+    extern s32 gevrTacticalMuzzle(s32 hand, f32 out[3]);
+    if (gevrHollywoodWeapon(item))
+        return gevrHollywoodPlayerMuzzle(gdl, hand, item, &g_CurrentPlayer->hands[hand].weaponModel);
+    if (!g_gevrStereo || !g_CurrentPlayer->hands[hand].field_87D) return gdl;
+    const GevrWeaponStats *stats = gevrTacticalHeldStats(hand, item);
+    Mtxf pose;
+    f32 muzzle[3];
+    if (!stats || stats->flash <= .01f || !gevrStereoGunMatrix(hand, &pose) || !gevrTacticalMuzzle(hand, muzzle))
+        return gdl;
+    const unsigned phase = g_CurrentPlayer->hands[hand].volley & 3;
+    const f32 scale = .1f * stats->flash * (.88f + .11f * phase);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (int i = 0; i < 3; ++i) pose.m[axis][i] *= scale;
+        pose.m[3][axis] = muzzle[axis];
+    }
+    Mtx *matrix = dynAllocateMatrix();
+    guMtxF2L(pose.m, matrix);
+    Vtx *verts = dynAllocateVertices(15);
+    /* Three intersecting translucent ribbons give both eyes the same compact
+     * hot core and tapered edges. Length and rotation vary per shot. */
+    for (int strip = 0; strip < 3; ++strip) {
+        const f32 angle = (f32)strip * M_PI_F / 3.f + .49f * phase;
+        const s16 x = lroundf(cosf(angle) * (34 + 6 * strip));
+        const s16 y = lroundf(sinf(angle) * (34 + 6 * strip));
+        Vtx *v = &verts[5 * strip];
+        for (int i = 0; i < 5; ++i) {
+            v[i] = (Vtx){0};
+            v[i].v.cn[0] = 255;
+            v[i].v.cn[1] = i == 0 ? 240 : 134;
+            v[i].v.cn[2] = i == 0 ? 166 : 26;
+            v[i].v.cn[3] = i == 0 ? (stats->flash < .30f ? 148 : 224) : 0;
+        }
+        v[0].v.ob[2] = 32;
+        v[1].v.ob[2] = -4;
+        v[2].v.ob[0] = x; v[2].v.ob[1] = y; v[2].v.ob[2] = 30;
+        v[3].v.ob[2] = 135 + 23 * strip;
+        v[4].v.ob[0] = -x; v[4].v.ob[1] = -y; v[4].v.ob[2] = 30;
+    }
+    gDPPipeSync(gdl++);
+    gSPMatrix(gdl++, osVirtualToPhysical(matrix), G_MTX_MODELVIEW | G_MTX_LOAD | G_MTX_NOPUSH);
+    gSPClearGeometryMode(gdl++, G_LIGHTING | G_FOG | G_CULL_BOTH | G_TEXTURE_GEN | G_TEXTURE_GEN_LINEAR);
+    gSPSetGeometryMode(gdl++, G_SHADE | G_SHADING_SMOOTH | G_ZBUFFER);
+    gDPSetCycleType(gdl++, G_CYC_1CYCLE);
+    gDPSetRenderMode(gdl++, G_RM_AA_ZB_XLU_SURF, G_RM_AA_ZB_XLU_SURF2);
+    gDPSetCombineMode(gdl++, G_CC_SHADE, G_CC_SHADE);
+    gSPTexture(gdl++, 0, 0, 0, G_TX_RENDERTILE, G_OFF);
+    gSPVertex(gdl++, osVirtualToPhysical(verts), 15, 0);
+    for (int i = 0; i < 15; i += 5) {
+        gSP2Triangles(gdl++, i, i+1, i+2, 0, i, i+2, i+3, 0);
+        gSP2Triangles(gdl++, i, i+3, i+4, 0, i, i+4, i+1, 0);
+    }
+    gDPPipeSync(gdl++);
+    gDPSetRenderMode(gdl++, G_RM_AA_ZB_OPA_SURF, G_RM_AA_ZB_OPA_SURF2);
+    return gdl;
+}
+#endif
+
 void gunRenderFirstPersonGunModels(Gfx **gdlptr)
 {
     Gfx *gdl = *gdlptr;
@@ -2840,6 +3475,20 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
     renderdata.zbufferenabled = TRUE;
     renderdata.flags = 3;
 #ifdef GEVR
+    if (!g_gevrStereo && sysArgCheck("--input-script") && sysArgCheck("--tactical-watch-preview"))
+    {
+        *gdlptr = gevrTacticalWatchPreview(gdl, &renderdata);
+        return;
+    }
+    if (!g_gevrStereo && sysArgCheck("--input-script") && sysArgCheck("--tactical-grip-preview"))
+    {
+        const s32 item = getCurrentPlayerWeaponId(GUNRIGHT);
+        const int kind = gevrTacticalItem(item);
+        if (kind >= 0) {
+            *gdlptr = gevrTacticalGripPreview(gdl, &renderdata, item, kind);
+            return;
+        }
+    }
     /*
      * The right fist first (issue #19): a gadget held in it does not write
      * depth, so a fist drawn after it painted over the gadget wherever the two
@@ -2868,15 +3517,22 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
 
         extern s32 gevrStereoClubBat(s32 hand);   /* bondview2.c: the other hand on the bat is its own */
 
-        if (gevrStereoTwoHandGrip() && !gevrGexSupportHandShown(gevrStereoTwoHandGun())
+        if (gevrStereoTwoHandGrip() && (gevrTacticalSupportHolding()
+                || (gevrTacticalHeldMagAsset() < 0 && !gevrTacticalRacking()))
+            && !gevrGexSupportHandShown(gevrStereoTwoHandGun())
             && !gevrStereoClubBat(gevrStereoTwoHandGun()))
         {
             /* Bean's own off hand holds (bondview2.c), else the taser's hand */
             extern Gfx *gevrRenderBeanGripArm(Gfx *gdl, ModelRenderData *templ, s32 *drawn);
             s32 drawn = FALSE;
 
-            gdl = gevrHandTag(gdl, 1 - gevrStereoTwoHandGun());
-            gdl = gevrRenderBeanGripArm(gdl, &renderdata, &drawn);
+            const s32 gun = gevrStereoTwoHandGun();
+            gdl = gevrHandTag(gdl, gevrTacticalWeaponController(gun));
+            const s32 watch = gevrTacticalLeftController(gun);
+            const int kind = gevrTacticalItem(getCurrentPlayerWeaponId(gun));
+            if (!gevrTacticalContactHands()
+                || !gevrTacticalFittedGloveList(kind, TACTICAL_GLOVE_SUPPORT, !watch, FALSE))
+                gdl = gevrRenderBeanGripArm(gdl, &renderdata, &drawn);
             if (!drawn)
             {
                 gdl = gevrRenderLeftArm(gdl, &renderdata);
@@ -2910,7 +3566,10 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
         {
             continue;
         }
-        gdl = gevrHandTag(gdl, handnum == GUNRIGHT ? 1 : 0);
+        if (g_gevrStereo && handnum == GUNRIGHT && item == ITEM_FIST
+            && sysArgCheck("--tactical-physical") && sysArgCheck("--tactical-pavlov-hands"))
+            continue;
+        gdl = gevrHandTag(gdl, gevrTacticalWeaponController(handnum));
 #endif
 
         if (GEVR_ITEM_AS(item) != ITEM_WATCHLASER)
@@ -3014,7 +3673,8 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
 
                 /* Bean's launcher carries its own round (DAB fpRound), GE-X's
                  * its own rocket (gun.c gevrGexPoseGun) */
-                if (!gevrBeanHasRound(handptr->weaponModel.obj) && !gevrGexHeld(handnum))
+                if (!gevrBeanHasRound(handptr->weaponModel.obj) && !gevrGexHeld(handnum)
+                    && !gevrTacticalRpgEnabled())
                 {
                     subdraw(&renderdata, model);
                 }
@@ -3041,7 +3701,8 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
             extern int gevrBeanHasRound(const void *header);
             extern s32 gevrGexHeld(s32 hand);
 
-            if (!gevrBeanHasRound(handptr->weaponModel.obj) && !gevrGexHeld(handnum))
+            if (!gevrBeanHasRound(handptr->weaponModel.obj) && !gevrGexHeld(handnum)
+                && !gevrTacticalRpgEnabled())
 #endif
             subdraw(&renderdata, model);
             bondviewTransformManyPosToViewMatrix(model->render_pos, model->obj->numMatrices);
@@ -3085,7 +3746,9 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
         }
         /* left-handed mode mirrors the gun matrix (stereo: bondview2.c, screen: gunUpdateAndFire),
          * and a left-hand gadget is mirrored once more (gevrLeftGadgetMirrored) */
-        if ((gevrHandsMirrored() != gevrLeftGadgetMirrored(handnum, item)) != gevrGexLeftMirrored(handnum))
+        const s32 cullMirrored = !gevrTacticalUnmirroredItem(item)
+            && ((gevrHandsMirrored() != gevrLeftGadgetMirrored(handnum, item)) != gevrGexLeftMirrored(handnum));
+        if (cullMirrored)
         {
             gDPNoOpTag(renderdata.gdl++, 0x56580000); /* VR_CULL_MIRROR_BEGIN */
         }
@@ -3097,11 +3760,18 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
         extern s32 gevrBeanMagShown(s32 hand);
         gevrBeanSetMagazine(gevrBeanMagShown(handnum));
         /* issue #31: the watch items' arm is the tracked watch arm (bondview2.c gevrStereoWatchItem) */
-        if (!gevrStereoWatchItem(item))
+        if (gevrTacticalHandheldDetonator(item))
+            renderdata.gdl = gevrDrawHandheldDetonator(renderdata.gdl, &handptr->gunmtx_camspace);
+        else if (!gevrStereoWatchItem(item))
 #endif
         subdraw(&renderdata, &handptr->weaponModel);
 #ifdef GEVR
         gevrBeanSetLoaded(1);
+        GevrTacticalWatchMount mount;
+        const s32 watchMatrix = gevrTacticalPistolWatchMount(&handptr->weaponModel, &mount);
+        if (watchMatrix >= 0 && watchMatrix < handptr->weaponModel.obj->numMatrices)
+            renderdata.gdl = gevrRenderTacticalWatch(renderdata.gdl, &renderdata,
+                &handptr->weaponModel.render_pos[watchMatrix].pos, &mount);
         gevrBeanSetMagazine(0);
         {
             /* a GoldenEye X gun's hands, on its matrices (gun.c) */
@@ -3137,7 +3807,7 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
 #endif
         gdl = renderdata.gdl;
 #ifdef GEVR
-        if ((gevrHandsMirrored() != gevrLeftGadgetMirrored(handnum, item)) != gevrGexLeftMirrored(handnum))
+        if (cullMirrored)
         {
             gDPNoOpTag(gdl++, 0x56580001); /* VR_CULL_MIRROR_END */
         }
@@ -3145,6 +3815,7 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
         {
             gDPNoOpTag(gdl++, 0x565B0000); /* VR_CULL_OFF_BEGIN again */
         }
+        gdl = gevrDrawWeaponFlash(gdl, handnum, item);
 #endif
 
         if (bondwalkItemCheckBitflags(item, WEAPONSTATBITFLAG_MIRROR_DUAL) != 0) 
@@ -3180,7 +3851,56 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
 
         extern s32 gevrStereoClubBat(s32 hand);   /* bondview2.c: on the bat the other hand is its own */
 
-        if (!gevrStereoTwoHandGrip() || gevrStereoClubBat(gevrStereoTwoHandGun()))
+        Mtxf watchGlove;
+        GevrTacticalWatchMount wristMount;
+        if (gevrTacticalTrackedWatch(&watchGlove, &wristMount))
+        {
+            gdl = gevrDrawTacticalFittedGlove(gdl, &renderdata, &watchGlove, -1,
+                TACTICAL_GLOVE_OPEN, FALSE, TRUE, &drawn);
+        }
+        else if (gevrTacticalContactHands())
+        {
+            Mtxf pose;
+            const s32 magCtrl = gevrTacticalHeldMagController();
+            const s32 magAsset = gevrTacticalHeldMagAsset();
+            const s32 actionCtrl = gevrTacticalActionController();
+            if (!gevrStereoTwoHandGrip()) {
+                gdl = gevrHandTag(gdl, gevrReloadSupportGun());
+                gdl = gevrRenderLeftArm(gdl, &renderdata);
+            }
+            if (magCtrl >= 0 && magAsset >= 0 && gevrStereoTacticalHandMatrix(magCtrl, &pose)) {
+                extern unsigned gevrTacticalHeldMagRounds(void), gevrTacticalHeldMagCapacity(void);
+                gdl = gevrHandTag(gdl, magCtrl);
+                gdl = gevrDrawTacticalHeldMagazine(gdl, &renderdata, &pose, magAsset,
+                    gevrTacticalHeldMagRounds(), gevrTacticalHeldMagCapacity(), gevrTacticalHeldGearMagazine(),
+                    gevrTacticalLeftController(magCtrl));
+            }
+            if (actionCtrl >= 0 && gevrTacticalActionHandMatrix(&pose)) {
+                /* Use the weapon's tag so late XR updates keep both together. */
+                const s32 gun = gevrReloadSupportGun();
+                gdl = gevrHandTag(gdl, gevrTacticalWeaponController(gun));
+                gdl = gevrDrawTacticalFittedGlove(gdl, &renderdata, &pose,
+                    gevrTacticalItem(getCurrentPlayerWeaponId(gun)), TACTICAL_GLOVE_PINCH,
+                    FALSE, gevrTacticalLeftController(actionCtrl), &drawn);
+                if (!drawn) gdl = gevrDrawTacticalHand(gdl, &renderdata, &pose, 12, &drawn);
+            }
+        }
+        else if (gevrTacticalHeldMagAsset() >= 0 || (sysArgCheck("--tactical-pavlov-hands") && gevrTacticalRacking()))
+        {
+            gdl = gevrRenderLeftArm(gdl, &renderdata);
+        }
+        else if (sysArgCheck("--tactical-ppk-hand-refit") && sysArgCheck("--tactical-physical")
+            && !gevrStereoTwoHandGrip() && (getCurrentPlayerWeaponId(gevrReloadSupportGun()) == ITEM_WPPK
+                || getCurrentPlayerWeaponId(gevrReloadSupportGun()) == ITEM_WPPKSIL || (sysArgCheck("--tactical-variety") && getCurrentPlayerWeaponId(gevrReloadSupportGun()) == ITEM_TT33)))
+        {
+            gdl = gevrRenderLeftArm(gdl, &renderdata);
+        }
+        else if (sysArgCheck("--tactical-physical") && sysArgCheck("--tactical-pavlov-hands")
+            && !gevrStereoTwoHandGrip())
+        {
+            gdl = gevrRenderLeftArm(gdl, &renderdata);
+        }
+        else if (!gevrStereoTwoHandGrip() || gevrStereoClubBat(gevrStereoTwoHandGun()))
         {
             /* GoldenEye X's left arm with the watch (gun.c), else the watch arm */
             extern Gfx *gevrGexDrawOffHand(Gfx *gdl, ModelRenderData *templ, s32 *drawn);
@@ -3196,8 +3916,35 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
             }
         }
         gdl = gevrRenderWatchGripHand(gdl, &renderdata);
+        if (!gevrTacticalContactHands()) {
+            const int asset = gevrTacticalHeldMagAsset();
+            Gfx *mag = gevrTacticalGearLooseMagList(gevrTacticalHeldGearMagazine(), asset);
+            if (!mag && asset >= 0) mag = gevrTacticalHandMagList(asset);
+            Mtxf handPose;
+            extern s32 gevrStereoReloadHandMatrix(Mtxf *out);
+            extern s32 gevrReloadSupportGun(void);
+            if (mag && gevrStereoReloadHandMatrix(&handPose))
+            {
+                Mtx *mtx = dynAllocateMatrix();
+                ModelRenderData magRender = renderdata;
+                gevrTacticalUnmirrorBasis(handPose.m);
+                guMtxF2L(handPose.m, mtx);
+                gdl = gevrHandTag(gdl, gevrReloadSupportGun());
+                magRender.gdl = gdl;
+                modelApplyRenderModeType3(&magRender, TRUE);
+                gdl = magRender.gdl;
+                gSPMatrix(gdl++, osVirtualToPhysical(mtx), G_MTX_NOPUSH | G_MTX_LOAD | G_MTX_MODELVIEW);
+                gSPDisplayList(gdl++, mag);
+                extern unsigned gevrTacticalHeldMagRounds(void);
+                extern unsigned gevrTacticalHeldMagCapacity(void);
+                gdl = gevrTacticalDrawMagazineRounds(gdl, asset, gevrTacticalHeldMagRounds(),
+                    gevrTacticalHeldMagCapacity(), 1, gevrTacticalHeldGearMagazine());
+            }
+        }
         gdl = gevrHandTag(gdl, -1);
     }
+    gdl = gevrDrawGadgetThrowGuide(gdl, GUNRIGHT);
+    gdl = gevrDrawGadgetThrowGuide(gdl, GUNLEFT);
 #endif
     *gdlptr = gdl;
 }
@@ -4210,7 +4957,7 @@ void sub_GAME_7F0649D8(enum GUNHAND hand)
         return;
     }
 
-    if ((item_id == ITEM_SHOTGUN) || (item_id == ITEM_AUTOSHOT))
+    if ((GEVR_ITEM_AS(item_id) == ITEM_SHOTGUN) || (GEVR_ITEM_AS(item_id) == ITEM_AUTOSHOT))
     {
         ammo_in_hands = get_ammo_in_hands_weapon(hand);
         if (ammo_in_hands >= 5)
@@ -4558,6 +5305,25 @@ void gunTickHandState(enum GUNHAND hand, s32 triggerOn)
 
     handptr->field_92C = 0;
 
+#ifdef GEVR
+    const s32 tacticalReady = g_ClockTimer > 0 && !lvlGetControlsLockedFlag()
+        && !g_CurrentPlayer->bonddead && !g_CurrentPlayer->mpmenuon
+        && !g_CurrentPlayer->watch_animation_state && !handptr->weapon_current_animation
+        && (handptr->weapon_action_state == GUN_ANIM_STATE_IDLE
+            || handptr->weapon_action_state == GUN_ANIM_STATE_TRIGGER_PRESS
+            || handptr->weapon_action_state == GUN_ANIM_STATE_FIRE);
+    const s32 tacticalFire = gevrTacticalFireRequest(hand, var_s1, triggerOn, tacticalReady,
+        handptr->weapon_ammo_in_magazine > 0 && gevrTacticalCanFire(hand));
+    if (tacticalFire > GEVR_FIRE_WAIT) {
+        handptr->weapon_action_state = GUN_ANIM_STATE_FIRE;
+        handptr->field_890 = 0;
+        handptr->field_88C = 0;
+    } else if (tacticalFire == GEVR_FIRE_WAIT
+        && (handptr->weapon_action_state == GUN_ANIM_STATE_FIRE
+            || handptr->weapon_action_state == GUN_ANIM_STATE_TRIGGER_PRESS)) {
+        handptr->weapon_action_state = GUN_ANIM_STATE_IDLE;
+    }
+#endif
     if (handptr->weapon_action_state == GUN_ANIM_STATE_IDLE)
     {
 #if defined(VERSION_JP) || defined(VERSION_EU)
@@ -4570,6 +5336,7 @@ void gunTickHandState(enum GUNHAND hand, s32 triggerOn)
             (handptr->weapon_hold_time != 0)
             && (var_s1 != ITEM_UNARMED)
 #ifdef GEVR
+            && tacticalFire < 0
             /* in the headset melee is the player's own arm only (bondview2.c
              * gevrHandChopTick; user: "normalize it for vr to not have trigger do
              * any melee weapon attacks"): no trigger punch, rifle butt (any model)
@@ -4603,6 +5370,9 @@ void gunTickHandState(enum GUNHAND hand, s32 triggerOn)
 
         if ((handptr->weapon_action_state == GUN_ANIM_STATE_IDLE)
             && (handptr->weapon_ammo_in_magazine == 0)
+#ifdef GEVR
+            && !gevrTacticalManualOn(hand)
+#endif
             && (sp1C4 != 0))
         {
             if ((lvlGetControlsLockedFlag() == 0) && (g_CurrentPlayer->mpmenuon == 0))
@@ -4863,9 +5633,24 @@ void gunTickHandState(enum GUNHAND hand, s32 triggerOn)
 
     if (handptr->weapon_action_state == GUN_ANIM_STATE_FIRE)
     {
-        if ((get_ammo_type_for_weapon(var_s1) == 0) || (handptr->weapon_ammo_in_magazine > 0))
+        if (((get_ammo_type_for_weapon(var_s1) == 0) || (handptr->weapon_ammo_in_magazine > 0))
+#ifdef GEVR
+            && gevrTacticalCanFire(hand)
+#endif
+        )
         {
-            switch (GEVR_ITEM_AS(var_s1))
+#ifdef GEVR
+            if (tacticalFire == GEVR_FIRE_SHOT) {
+                handptr->field_87D = handptr->weapon_firing_status = 1;
+                sub_GAME_7F05E808(hand);
+            } else
+#endif
+            {
+            s32 firingStyle = GEVR_ITEM_AS(var_s1);
+#ifdef GEVR
+            if (var_s1 == ITEM_TACTICAL_GLOCK18C) firingStyle = ITEM_UZI;
+#endif
+            switch (firingStyle)
             {
             case ITEM_CAMERA:
             case ITEM_WATCHMAGNETATTRACT:
@@ -4984,6 +5769,7 @@ void gunTickHandState(enum GUNHAND hand, s32 triggerOn)
                 }
                 break;
             }
+            }
 
             if (handptr->weapon_firing_status != 0)
             {
@@ -4994,6 +5780,10 @@ void gunTickHandState(enum GUNHAND hand, s32 triggerOn)
                 }
 
                 handptr->weapon_ammo_in_magazine -= 1;
+#ifdef GEVR
+                gevrTacticalShotFired(hand);
+                gevrHollywoodFired(hand, var_s1);
+#endif
                 handptr->volley += 1;
             }
 
@@ -5001,7 +5791,12 @@ void gunTickHandState(enum GUNHAND hand, s32 triggerOn)
             {
                 sp1B4 = 0;
 
+#ifdef GEVR
+                const int suppressed = gevrTacticalWeaponSuppressed(var_s1, hand);
+                if (tacticalFire < 0 && !suppressed && bondwalkItemGetSoundTriggerRate(var_s1) > 0)
+#else
                 if (bondwalkItemGetSoundTriggerRate(var_s1) > 0)
+#endif
                 {
                     if ((g_CurrentPlayer->hands[1 - hand].field_A50 != g_GlobalTimer)
                         && (handptr->field_A4C < g_GlobalTimer))
@@ -5030,18 +5825,25 @@ void gunTickHandState(enum GUNHAND hand, s32 triggerOn)
                             sndDeactivate((struct ALSoundState *) handptr->field_A48);
                         }
 
-                        if (bondwalkItemGetSound(var_s1) != 0)
+#ifdef GEVR
+                        u16 sound = gevrTacticalShotSound(var_s1, suppressed);
+                        if (sysArgCheck("--input-script") && (suppressed || var_s1 == ITEM_SNIPERRIFLE))
+                            sysLogPrintf(LOG_NOTE, "tactical shot sound: item %d suppressed %d sample %u", var_s1, suppressed, sound);
+#else
+                        u16 sound = bondwalkItemGetSound(var_s1);
+#endif
+                        if (sound != 0)
                         {
                             if (handptr->audioHandle == NULL)
                             {
-                                sndPlaySfx((struct ALBankAlt_s *) g_musicSfxBufferPtr, bondwalkItemGetSound(var_s1), (struct ALSoundState *) &handptr->audioHandle);
+                                sndPlaySfx((struct ALBankAlt_s *) g_musicSfxBufferPtr, sound, (struct ALSoundState *) &handptr->audioHandle);
 #ifdef GEVR
                                 gevrPlaceRemoteGunSound(handptr->audioHandle, hand);
 #endif
                             }
                             else if ((struct ALSoundState *)handptr->field_A48 == 0)
                             {
-                                sndPlaySfx((struct ALBankAlt_s *) g_musicSfxBufferPtr, bondwalkItemGetSound(var_s1), (struct ALSoundState *) &handptr->field_A48);
+                                sndPlaySfx((struct ALBankAlt_s *) g_musicSfxBufferPtr, sound, (struct ALSoundState *) &handptr->field_A48);
 #ifdef GEVR
                                 gevrPlaceRemoteGunSound((ALSoundState *) handptr->field_A48, hand);
 #endif
@@ -5380,7 +6182,7 @@ void gunTickHandState(enum GUNHAND hand, s32 triggerOn)
 #endif
                 if (
 #ifdef GEVR
-                    !g_gevrStereo &&
+                    !g_gevrStereo && !(sysArgCheck("--tactical-sim") && sysArgCheck("--input-script")) &&
 #endif
                     (temp_v1_5->weapon_action_state != GUN_ANIM_STATE_SWITCH_SWAP) && (temp_v1_5->weapon_action_state != GUN_ANIM_STATE_SWITCH_LOWER))
                 {
@@ -6070,7 +6872,11 @@ void gunTickHandState(enum GUNHAND hand, s32 triggerOn)
         {
             tempf = WEAPON_1P_ANIM_TIME(handptr->field_890);
             
-            if (gunSample1PTransform(proxMineThrowKeyframes, tempf, &handptr->field_8EC, hand) != 0)
+            if (
+#ifdef GEVR
+                !gevrTacticalGuidedThrow(var_s1) &&
+#endif
+                gunSample1PTransform(proxMineThrowKeyframes, tempf, &handptr->field_8EC, hand) != 0)
             {
                 handptr->field_92C = 1;
             }
@@ -6186,6 +6992,7 @@ void gunTickHandState(enum GUNHAND hand, s32 triggerOn)
     }
 #ifdef GEVR
     {
+        gevrTacticalDecoderTick(hand);
         /* a GoldenEye X gun animates itself (gun.c): its fire animation's
          * clock, and its reload animation in place of the reload tilt */
         extern s32 gevrGexHeld(s32 hand);
@@ -6355,26 +7162,64 @@ f32 get_45_degree_angle(s32 unk) {
 }
 
 
+#ifdef GEVR
+static const char *gevrTacticalDisplayName(ITEM_IDS item)
+{
+    extern int gevrTacticalMode(void);
+    if (!gevrTacticalMode()) return NULL;
+    switch (item) {
+    case ITEM_AK47: return "AKS-74UN\n";
+    case ITEM_WPPK: case ITEM_WPPKSIL: return sysArgCheck("--tactical-ppk") ? "Walther PPK\n" : "USP .45\n";
+    case ITEM_TT33: return sysArgCheck("--tactical-variety") ? "Makarov PM\n" : NULL;
+    case ITEM_TACTICAL_AK74N: return sysArgCheck("--tactical-variety") ? "AK-74N\n" : NULL;
+    case ITEM_TACTICAL_KATANA: return "Tsuki no Hana\n";
+#define TACTICAL_EXPANDED(id, group, native, gun, prop, capacity, cadence, name) \
+    case ITEM_TACTICAL_##id: return name "\n";
+#include "gevr_tactical_expanded.inc.h"
+#undef TACTICAL_EXPANDED
+    case ITEM_SPECTRE: return "MP5\n";
+    case ITEM_MP5K: return "MP5K\n";
+    case ITEM_SKORPION: return gevrTacticalSkorpionEnabled() ? "Skorpion vz. 61\n" : NULL;
+    case ITEM_SNIPERRIFLE: return gevrTacticalSvdEnabled() ? "SVD Dragunov\n" : NULL;
+    default: return NULL;
+    }
+}
+#endif
 u16 *get_ptr_first_title_line_item(ITEM_IDS item)
 {
+#ifdef GEVR
+    const char *name = gevrTacticalDisplayName(item);
+    if (name) return (u16 *)name;
+#endif
   return langGet(gitem_structs[item].upper_watch_text);
 }
 
 
 u16 *get_ptr_second_title_line_item(ITEM_IDS item)
 {
+#ifdef GEVR
+    if (gevrTacticalDisplayName(item)) return (u16 *)"\n";
+#endif
     return langGet(gitem_structs[item].lower_watch_text);
 }
 
 
 u16 *get_ptr_short_watch_text_for_item(ITEM_IDS item)
 {
+#ifdef GEVR
+    const char *name = gevrTacticalDisplayName(item);
+    if (name) return (u16 *)name;
+#endif
     return langGet(gitem_structs[item].watch_equipment_text);
 }
 
 
 u16 *get_ptr_long_watch_text_for_item(ITEM_IDS item)
 {
+#ifdef GEVR
+    const char *name = gevrTacticalDisplayName(item);
+    if (name) return (u16 *)name;
+#endif
     return langGet(gitem_structs[item].weapon_of_choice_text);
 }
 
@@ -6411,7 +7256,11 @@ f32 get_depth_offset_solo_watch_menu_inventory_page_for_item(ITEM_IDS item)
 
 f32 getCurrentPlayerNoise(GUNHAND hand)
 {
-    return g_CurrentPlayer->hands[hand].noise;
+    const f32 noise = g_CurrentPlayer->hands[hand].noise;
+#ifdef GEVR
+    if (gevrTacticalWeaponSuppressed(getCurrentPlayerWeaponId(hand), hand)) return .35f * noise;
+#endif
+    return noise;
 }
 
 
@@ -6724,6 +7573,7 @@ void gunTickGameplay(s32 triggerOn)
 #endif
 #ifdef GEVR
     if (gevrSpectating()) trigger_state.triggerOn[0] = trigger_state.triggerOn[1] = 0;
+    else gevrTacticalGadgetInput(trigger_state.triggerOn);
 #endif
     gunTickHandState(0, trigger_state.triggerOn[0]); // Right hand
 #ifdef GEVR
@@ -6738,7 +7588,8 @@ void gunTickGameplay(s32 triggerOn)
             int rate = bondwalkItemGetAutomaticFiringRate(item);
             next_fire[slot] = g_GlobalTimer + (rate > 0 ? rate : 6);
             left->weapon_firing_status = left->field_87D = 1;
-            if (bondwalkItemGetSound(item)) gevrPlaceRemoteGunSound(sndPlaySfx(g_musicSfxBufferPtr, bondwalkItemGetSound(item), NULL), GUNLEFT);
+            const u16 sound = gevrTacticalShotSound(item, gevrTacticalWeaponSuppressed(item, GUNLEFT));
+            if (sound) gevrPlaceRemoteGunSound(sndPlaySfx(g_musicSfxBufferPtr, sound, NULL), GUNLEFT);
         }
     } else
 #endif
@@ -7203,6 +8054,60 @@ static Mtxf *gevrCasingThrowMtx(s32 handnum)
         }
     }
     return &m;
+}
+
+static s32 gevrTacticalEjectCasing(GUNHAND hand, s32 item, f32 floor)
+{
+    const int kind = gevrTacticalItem(item);
+    if (kind < 0 || !gevrTacticalUnmirroredItem(item) || !gevrTacticalLocalPlayer()) return FALSE;
+    if (kind == TACTICAL_GUN_RPG || kind == TACTICAL_GUN_M32A1) return TRUE;
+
+    ModelFileHeader *header = get_ptr_item_statistics(item)->ptr_cartridge_struct;
+    if (tacticalGunIsPistol(kind)) header = &cartridge_header;
+    else if (kind == TACTICAL_GUN_SAIGA12K) header = &cartshell_header;
+    else if (!header) header = &cartrifle_header;
+
+    const s32 physical = sysArgCheck("--tactical-physical");
+    coord3d port, direction;
+    Mtxf throwPose = *gevrCasingThrowMtx(hand);
+    Mtxf displayPose = throwPose;
+    gevrTacticalEjectionPort(kind, sysArgCheck("--tactical-ppk"), physical, port.f);
+    const f32 side = port.x >= 0.f ? 1.f : -1.f;
+    const f32 jitter = (f32)(randomGetNext() & 255) / 255.f;
+    const bool downward = kind == TACTICAL_GUN_P90;
+    direction = (coord3d){.f = {downward ? 0.f : side * (2.6f + .55f*jitter),
+        downward ? -1.5f : 3.1f, downward ? -.5f : -.24f}};
+    for (int axis = 0; axis < 3; ++axis) port.f[axis] *= 0.1f;
+    mtx4TransformVecInPlace(&throwPose, &port);
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!isfinite(port.f[axis])) return TRUE;
+        displayPose.m[3][axis] = port.f[axis];
+        const f32 *row = throwPose.m[axis];
+        const f32 length = sqrtf(SQ(row[0]) + SQ(row[1]) + SQ(row[2]));
+        if (!(length > 1e-6f)) return TRUE;
+        for (int k = 0; k < 3; ++k) {
+            displayPose.m[axis][k] *= 1.28f;
+            throwPose.m[axis][k] /= length;
+        }
+    }
+    CasingRecord *casing = casingCreate(header, &displayPose);
+    if (!casing) return TRUE;
+
+    /* Cases live in world space after leaving the weapon's own port. */
+    coord3d spin = {.f = {0.31f, 0.38f + 0.22f * jitter, -0.25f}};
+    casing->floor_y_pos = floor;
+    casing->vel = direction;
+    mtx4RotateVecInPlace(&throwPose, &casing->vel);
+#if VERSION_EU
+    Mtxf rotation;
+    matrix_4x4_set_rotation_around_xyz(&spin, &rotation);
+    matrix_7f05842c_eu(&rotation, casing->rot_velocity_mtx);
+#else
+    matrix_4x4_set_rotation_around_xyz(&spin, &casing->rot_velocity_mtx);
+#endif
+    if (sysArgCheck("--input-script"))
+        sysLogPrintf(LOG_NOTE, "tactical: casing ejected from item %d kind %d", item, kind);
+    return TRUE;
 }
 #define THROWMTX     (gevrCasingThrowMtx(handnum))
 #define THROWPOS(k)  (g_CurrentPlayer->hands[handnum].throw_item_pos_related.m[3][k])
@@ -8249,12 +9154,49 @@ Gfx *gunDrawHudInteger(Gfx *gdl, s32 value, s32 x, s32 halign, s32 y, s32 valign
 }
 
 
+#ifdef GEVR
+static Gfx *gevrDrawTacticalMineCount(Gfx *gdl)
+{
+    const s32 item = getCurrentPlayerWeaponId(GUNRIGHT);
+    if ((item != ITEM_TIMEDMINE && item != ITEM_REMOTEMINE && item != ITEM_PROXIMITYMINE) || !gevrTacticalGuidedThrow(item)
+        || g_CurrentPlayer->watch_animation_state != 0 || g_CurrentPlayer->mpmenuon
+        || g_CurrentPlayer->bonddead) return gdl;
+
+    const s32 ammo = get_ammo_type_for_weapon(item);
+    const s32 count = g_CurrentPlayer->ammoheldarr[ammo] + g_CurrentPlayer->hands[GUNRIGHT].weapon_ammo_in_magazine;
+    const s32 x = viGetViewLeft() + viGetViewWidth() - 59;
+    const s32 y = viGetViewTop() + viGetViewHeight();
+    struct sImageTableEntry *icon = texGetAmmoIcon(ammo_related[ammo].IconImage);
+    PORT_HUD_ASPECT(gdl, GE_HUD_ASPECT_RIGHT);
+    if (icon)
+        gdl = set_rgba_redirect_generate_microcode(gdl, icon, x, 1.f, y - 20, 0, ammo_related[ammo].IconYOffset, 1);
+    gdl = microcode_constructor(gdl);
+    gdl = gunDrawHudInteger(gdl, count, x + (icon ? icon->width / 2 + 4 : 0), 1, y - 18, 2, TRUE);
+    return combiner_bayer_lod_perspective(gdl);
+}
+#endif
+
 /**
  * Draw magazine ammo number, ammo type icon, and total ammo number at the bottom right of the viewport.
  * Render an additional ammo counter at the bottom left of the viewport when dual wielding.
  */
 Gfx *generate_ammo_total_microcode(Gfx *gdl)
 {
+#ifdef GEVR
+    extern int gevrTacticalMode(void);
+    if (gevrTacticalMode() && sysArgCheck("--tactical-physical")) {
+        const char *mode = gevrTacticalFireNotice();
+        if (mode) {
+            char label[24];
+            snprintf(label, sizeof(label), "Fire mode  %s", mode);
+            gdl = microcode_constructor(gdl);
+            gdl = gunDrawHudString(gdl, label, viGetViewLeft() + viGetViewWidth() / 2, 0,
+                viGetViewTop() + viGetViewHeight() - 25, 2, TRUE);
+            gdl = combiner_bayer_lod_perspective(gdl);
+        }
+        return gevrDrawTacticalMineCount(gdl);
+    }
+#endif
     GUNHAND rightDisplayHand = GUNRIGHT;
     GUNHAND leftDisplayHand = GUNLEFT;
 #ifdef GEVR
@@ -8976,7 +9918,7 @@ void gunDrawSight(Gfx **gdl) {
         {
             extern int VrAimSight;   /* launcher / VR options "Aim: crosshair" (user) */
 
-            if (!VrAimSight)
+            if (!VrAimSight || gevrTacticalManualOn(GUNRIGHT) || gevrTacticalManualOn(GUNLEFT))
             {
                 return;   /* neither hand's sight, nor the scopes' */
             }

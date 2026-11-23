@@ -7,8 +7,10 @@
 #ifdef GEVR
 #include "gevr_hand_reload.h"
 #include "gevr_bean.h"
+#include "gevr_ragdoll.h"
 #include "vtxstore.h"
 #include "gevr_oddjobhat.h"
+#include "gevr_tactical_mesh.h"
 #endif
 #include "../rmon.h" /*<PR/rmon.h>*/
 #include "bondview.h"
@@ -68,7 +70,7 @@ Model *modelmgrInstantiateModel(ModelFileHeader *header)
     {
         s32 i;
 
-        for (i = 0; i < (g_MaxModelSlots - 30); i++) 
+        for (i = 0; i < g_NumSetupModelSlots; i++) 
         {
             if (g_ModelSlots[i].unk08 == 0) 
             {
@@ -4397,7 +4399,8 @@ void modelRenderNodeGundl(ModelRenderData* renderdata, Model* model, ModelNode* 
 #ifdef GEVR
     /* Mods: Oddjob's hat draws in the knife's nodes, ahead of Bean (gevr_oddjobhat.c) */
     void *hatGdl = NULL;
-    const s32 hat = gevrHatNodeGdl(arg1, model, &hatGdl);
+    const s32 tactical = gevrTacticalMeshNode(arg1, model, &hatGdl);
+    const s32 hat = tactical || gevrHatNodeGdl(arg1, model, &hatGdl);
     s32 shownType = hat ? rodata->ModelType : gevrBeanShownModelType(arg1, rodata->ModelType);
     /* a Bean list keeps the replaced list's render mode (G_GEVR_NODE_STATE) */
     s32 nodeType = hat ? shownType : gevrBeanNodeModeType(arg1, shownType);
@@ -4459,7 +4462,11 @@ void modelRenderNodeGundl(ModelRenderData* renderdata, Model* model, ModelNode* 
             gSPDisplayList(renderdata->gdl++, shownPrimary);
 #endif
 
-            if ((shownType == 3) && rodata->Secondary)
+            if ((shownType == 3) && rodata->Secondary
+#ifdef GEVR
+                && !tactical
+#endif
+            )
             {
                 modelApplyRenderModeType3(renderdata, 0);
                 gSPDisplayList(renderdata->gdl++, rodata->Secondary);
@@ -4478,7 +4485,11 @@ void modelRenderNodeGundl(ModelRenderData* renderdata, Model* model, ModelNode* 
         }
         else
 #endif
-        if ((renderdata->flags & 2) && shownPrimary && (shownType == 4) && rodata->Secondary)
+        if ((renderdata->flags & 2) && shownPrimary && (shownType == 4) && rodata->Secondary
+#ifdef GEVR
+            && !tactical
+#endif
+        )
         {
             gSPSegment(renderdata->gdl++, SPSEGMENT_MODEL_COL1, osVirtualToPhysical(rodata->BaseAddr));
 
@@ -5663,7 +5674,11 @@ void subdraw(ModelRenderData *mrData, Model *mdl)
         visited++;
 #endif
 
-        if (root->Child)
+        if (root->Child
+#ifdef GEVR
+            && ((root->Opcode & 255) != MODELNODE_OPCODE_HEAD || !gevrRagdollHidesHead(mdl))
+#endif
+        )
         {
             root = root->Child;
         }
