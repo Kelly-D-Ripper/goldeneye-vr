@@ -6,27 +6,30 @@ typedef struct GevrReinforcementRules {
     bool open;
 } GevrReinforcementRules;
 
+/* 0.17.1 (user, 2026-11-23): larger, more frequent groups on every map,
+ * including the enclosed ones. Tight maps (Frigate, Train, Cradle, Egypt)
+ * still send small groups through their few safe doors. */
 static const GevrReinforcementRules s_reinforcementRules[LEVELID_SURFACE2 + 1] = {
-    [LEVELID_DAM]      = {6, 18, 2, 4.2f, FALSE},
-    [LEVELID_FACILITY] = {5, 15, 2, 5.0f, FALSE},
-    [LEVELID_RUNWAY]   = {8, 24, 4, 4.2f, TRUE},
-    [LEVELID_SURFACE]  = {9, 27, 5, 4.5f, TRUE},
-    [LEVELID_BUNKER1]  = {4, 12, 2, 5.7f, FALSE},
-    [LEVELID_SILO]     = {5, 15, 2, 5.2f, FALSE},
-    [LEVELID_FRIGATE]  = {3, 10, 1, 2.8f, FALSE},
-    [LEVELID_SURFACE2] = {9, 27, 5, 4.5f, TRUE},
-    [LEVELID_BUNKER2]  = {5, 15, 2, 5.5f, FALSE},
-    [LEVELID_STATUE]   = {5, 14, 2, 5.2f, FALSE},
-    [LEVELID_ARCHIVES] = {5, 15, 2, 5.2f, FALSE},
-    [LEVELID_STREETS]  = {9, 27, 5, 4.5f, TRUE},
-    [LEVELID_DEPOT]    = {7, 22, 4, 4.6f, TRUE},
-    [LEVELID_TRAIN]    = {3,  9, 1, 3.0f, FALSE},
-    [LEVELID_JUNGLE]   = {9, 25, 5, 4.6f, TRUE},
-    [LEVELID_CONTROL]  = {4, 12, 2, 6.0f, FALSE},
-    [LEVELID_CAVERNS]  = {4, 12, 2, 6.0f, FALSE},
-    [LEVELID_CRADLE]   = {3,  9, 1, 3.0f, FALSE},
-    [LEVELID_AZTEC]    = {4, 11, 2, 5.8f, FALSE},
-    [LEVELID_EGYPT]    = {3,  8, 1, 4.7f, FALSE},
+    [LEVELID_DAM]      = {10, 30, 4, 2.8f, FALSE},
+    [LEVELID_FACILITY] = { 8, 24, 3, 3.2f, FALSE},
+    [LEVELID_RUNWAY]   = {12, 36, 5, 2.8f, TRUE},
+    [LEVELID_SURFACE]  = {14, 40, 6, 3.0f, TRUE},
+    [LEVELID_BUNKER1]  = { 7, 20, 3, 3.6f, FALSE},
+    [LEVELID_SILO]     = { 8, 24, 3, 3.4f, FALSE},
+    [LEVELID_FRIGATE]  = { 5, 15, 2, 2.4f, FALSE},
+    [LEVELID_SURFACE2] = {14, 40, 6, 3.0f, TRUE},
+    [LEVELID_BUNKER2]  = { 8, 24, 3, 3.4f, FALSE},
+    [LEVELID_STATUE]   = { 8, 22, 3, 3.4f, FALSE},
+    [LEVELID_ARCHIVES] = { 8, 24, 3, 3.4f, FALSE},
+    [LEVELID_STREETS]  = {14, 40, 6, 3.0f, TRUE},
+    [LEVELID_DEPOT]    = {11, 33, 5, 3.0f, TRUE},
+    [LEVELID_TRAIN]    = { 5, 14, 2, 2.6f, FALSE},
+    [LEVELID_JUNGLE]   = {14, 40, 6, 3.0f, TRUE},
+    [LEVELID_CONTROL]  = { 7, 20, 3, 3.8f, FALSE},
+    [LEVELID_CAVERNS]  = { 7, 20, 3, 3.8f, FALSE},
+    [LEVELID_CRADLE]   = { 5, 14, 2, 2.6f, FALSE},
+    [LEVELID_AZTEC]    = { 7, 18, 3, 3.6f, FALSE},
+    [LEVELID_EGYPT]    = { 5, 12, 2, 3.2f, FALSE},
 };
 
 static const struct GevrReinforcementApproaches {
@@ -45,7 +48,7 @@ static const struct GevrReinforcementApproaches {
     {LEVELID_JUNGLE,   477, {246, 404, 478, 158, 419, 412}},
 };
 
-enum { REINFORCEMENT_WAVE_MAX = 5, REINFORCEMENT_PENDING_MAX = 40 };
+enum { REINFORCEMENT_WAVE_MAX = 6, REINFORCEMENT_PENDING_MAX = 40 };
 typedef struct GevrReinforcementWave {
     coord3d caller, contact;
     StandTile *callerFloor, *contactFloor;
@@ -55,7 +58,7 @@ typedef struct GevrReinforcementWave {
     f32 nextMember, deadline, heading;
 } GevrReinforcementWave;
 
-static const GevrReinforcementRules s_reinforcementDefault = {4, 12, 2, 5.5f, FALSE};
+static const GevrReinforcementRules s_reinforcementDefault = {7, 20, 3, 3.6f, FALSE};
 static const GevrReinforcementRules *s_reinforcementRule = &s_reinforcementDefault;
 static GevrReinforcementWave s_reinforcementWave;
 static int s_reinforcementCount, s_reinforcementSequence, s_reinforcementActors;
@@ -107,7 +110,10 @@ static f32 reinforcementDist(const coord3d *a, const coord3d *b)
 
 bool gevrTacticalReinforcementRequest(const ChrRecord *guard, const coord3d *point, StandTile *floor, s32 scripted)
 {
-    if (!gevrTacticalReinforcementsEnabled() || (!scripted && !s_reinforcementRule->open)
+    /* Every map answers a sighting now, not only the open ones (0.16 left
+     * Facility, Dam and the other enclosed maps to scripted alarms). */
+    (void)scripted;
+    if (!gevrTacticalReinforcementsEnabled()
         || !guard || !guard->model || !guard->prop || !guard->prop->stan || !point || !floor
         || guard->tacticalReinforcement || (guard->hidden & CHRHIDDEN_REMOVE)
         || (guard->chrflags & CHRFLAG_HIDDEN) || guard->actiontype == ACT_DIE || guard->actiontype == ACT_DEAD
@@ -150,7 +156,12 @@ static int reinforcementFindPad(const GevrReinforcementWave *wave, bool protectS
     const bool open = s_reinforcementRule->open;
     const int stage = bossGetStageNum();
     const f32 targetDist = open ? 2450.0f : 1500.0f;
-    const f32 heading = wave->heading + wave->sent * (open ? 0.70f : 0.16f);
+    /* Members split into a pincer: the first from the wave's heading, then
+     * alternately from either side of it. */
+    static const f32 openSpread[REINFORCEMENT_WAVE_MAX] = {0.0f, 1.25f, -1.25f, 0.55f, -0.55f, 2.0f};
+    static const f32 closedSpread[REINFORCEMENT_WAVE_MAX] = {0.0f, 0.9f, -0.9f, 0.4f, -0.4f, 1.5f};
+    const int member = wave->sent < REINFORCEMENT_WAVE_MAX ? wave->sent : REINFORCEMENT_WAVE_MAX - 1;
+    const f32 heading = wave->heading + (open ? openSpread : closedSpread)[member];
     const f32 aheadX = sinf(heading), aheadZ = cosf(heading);
     const f32 callerGround = stanGetPositionYValue(wave->callerFloor, wave->caller.x, wave->caller.z);
 

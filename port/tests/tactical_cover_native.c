@@ -12,6 +12,7 @@
 static struct player { s32 bonddead; } player, *g_CurrentPlayer = &player;
 static StandTile lower, upper;
 static ChrRecord guard;
+static PropRecord rifle;
 static PropRecord stand, target;
 static TacticalGuardMind mind;
 static s32 g_GlobalTimer;
@@ -143,6 +144,7 @@ static void reset(void)
     stand = (PropRecord){.stan = &lower};
     target = (PropRecord){.stan = &lower, .pos = {.y = 170.0f, .z = 1000.0f}, .type = PROP_TYPE_PLAYER};
     guard = (ChrRecord){.prop = &stand, .chrheight = 185.0f, .chrnum = 1, .actiontype = ACT_STAND};
+    guard.weapons_held[GUNRIGHT] = &rifle;
     mind = (TacticalGuardMind){.location = target.pos, .floor = target.stan, .expires = 800, .contact = CONTACT_TEAM};
     player.bonddead = FALSE;
     enabled = ordinary = targetable = visibleToGuards = facing = hasMuzzle = clearStep = clearWidth = TRUE;
@@ -157,7 +159,7 @@ static void reset(void)
 static void geometry(void)
 {
     reset();
-    assert(!tacticalGuardFindCover(&guard, &mind, FALSE, FALSE));
+    assert(!tacticalGuardFindCover(&guard, &mind, FALSE, FALSE, FALSE));
     assert(!mind.coverFloor && !steps); /* an exposed location cannot be cover */
     addWall(120.0f, -33.0f, 33.0f, CDTYPE_OBJS);
     coord3d point;
@@ -177,25 +179,32 @@ static void geometry(void)
     assert(!tacticalCoverPeekPoint(&guard, &mind, &stand.pos, stand.stan, 1, &point, &tile, &side));
 
     reset();
-    addWall(120.0f, 65.0f, 105.0f, CDTYPE_OBJS);
+    addWall(60.0f, 20.0f, 130.0f, CDTYPE_OBJS); /* a crate beside the spot: strict cover is within 1.4 m */
     clearStep = FALSE;
-    assert(!tacticalGuardFindCover(&guard, &mind, FALSE, FALSE));
+    assert(!tacticalGuardFindCover(&guard, &mind, FALSE, FALSE, FALSE));
     clearStep = TRUE;
     clearWidth = FALSE;
-    assert(!tacticalGuardFindCover(&guard, &mind, FALSE, FALSE));
+    assert(!tacticalGuardFindCover(&guard, &mind, FALSE, FALSE, FALSE));
     clearWidth = TRUE;
-    assert(tacticalGuardFindCover(&guard, &mind, FALSE, FALSE));
+    assert(tacticalGuardFindCover(&guard, &mind, FALSE, FALSE, FALSE));
     assert(steps == 1 && mind.cover.x > 0.0f && mind.cover.z < 0.0f && mind.order == ORDER_COVER);
     assert(fabsf(stepDirection[0] * stepDirection[0] + stepDirection[1] * stepDirection[1] - 1.0f) < .001f);
     assert(tacticalGuardHoldCover(&guard, &mind) && !kneels); /* still en route */
     stand.pos = mind.cover;
     assert(tacticalGuardHoldCover(&guard, &mind) && pose == GEVR_GUARD_COVER_DUCK && kneels == 1);
+
+    reset();
+    addWall(200.0f, -400.0f, 400.0f, CDTYPE_OBJS);
+    assert(!tacticalGuardFindCover(&guard, &mind, FALSE, FALSE, FALSE)); /* hidden, but 2 m from the wall */
+    reset();
+    addWall(100.0f, -6.0f, 6.0f, CDTYPE_OBJS);
+    assert(!tacticalGuardFindCover(&guard, &mind, FALSE, FALSE, FALSE)); /* a post is no cover */
 }
 
 static void plantedCover(void)
 {
     addWall(120.0f, -33.0f, 33.0f, CDTYPE_OBJS);
-    assert(tacticalGuardFindCover(&guard, &mind, FALSE, FALSE));
+    assert(tacticalGuardFindCover(&guard, &mind, FALSE, FALSE, FALSE));
     assert(!steps && mind.coverFloor == &lower);
     assert(tacticalGuardHoldCover(&guard, &mind));
     assert(pose == GEVR_GUARD_COVER_DUCK && kneels == 1 && !aimCount);
@@ -208,7 +217,7 @@ static void visiblePeek(void)
     plantedCover();
     assert(tacticalGuardHoldCover(&guard, &mind));
     assert(aimCount == 1 && aimType == TARGET_BOND && spotted == 1);
-    assert(pose == GEVR_GUARD_COVER_LEAN_RIGHT && poseOffset[0] == 46.0f && mind.order == ORDER_PEEK);
+    assert(pose == GEVR_GUARD_COVER_LEAN_RIGHT && fabsf(poseOffset[0] - 46.0f / 0.72f) < 0.01f && mind.order == ORDER_PEEK);
     assert(stand.pos.x == 0.0f && stand.pos.z == 0.0f && !steps);
     poseBlend = .79f;
     assert(!tacticalGuardSightFromCover(&guard, &target));
@@ -218,7 +227,7 @@ static void visiblePeek(void)
     assert(tacticalGuardHoldCover(&guard, &mind) && stops == 1 && pose == GEVR_GUARD_COVER_DUCK);
     g_GlobalTimer = mind.nextPeek;
     assert(tacticalGuardHoldCover(&guard, &mind));
-    assert(aimCount == 2 && pose == GEVR_GUARD_COVER_LEAN_LEFT && poseOffset[0] == -46.0f);
+    assert(aimCount == 2 && pose == GEVR_GUARD_COVER_LEAN_LEFT && fabsf(poseOffset[0] + 46.0f / 0.72f) < 0.01f);
     tacticalGuardLeaveCover(&guard, &mind);
     assert(!mind.coverFloor && pose == GEVR_GUARD_COVER_NONE && stops == 2);
 }
@@ -253,8 +262,9 @@ static void shots(void)
     plantedCover();
     assert(tacticalGuardCoverShot(&guard, GUNRIGHT, &muzzle, &tile) == 0); /* tucked */
     assert(tacticalGuardHoldCover(&guard, &mind));
-    hasMuzzle = FALSE;
-    assert(tacticalGuardCoverShot(&guard, GUNRIGHT, &muzzle, &tile) == 0);
+    hasMuzzle = FALSE; /* off screen: the lean's own reach stands in for the drawn muzzle */
+    assert(tacticalGuardCoverShot(&guard, GUNRIGHT, &muzzle, &tile) == 1);
+    assert(fabsf(muzzle.x - poseOffset[0] * 0.72f) < 0.01f && fabsf(muzzle.z - poseOffset[1] * 0.72f) < 0.01f);
     hasMuzzle = TRUE;
     assert(tacticalGuardCoverShot(&guard, GUNLEFT, &muzzle, &tile) == 0);
     actualMuzzle.y = 20.0f;
@@ -285,6 +295,6 @@ int main(void)
     visiblePeek();
     blindPeek();
     shots();
-    puts("PASS: Tactical cover geometry, step and stance, both lean directions, fresh suppression, actual muzzle and friendly blocking");
+    puts("PASS: Tactical cover geometry, strict solid cover, step and stance, both lean directions, fresh suppression, actual muzzle and friendly blocking");
     return 0;
 }

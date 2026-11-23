@@ -7,9 +7,12 @@
 #include "gevr_guard_cover.h"
 
 enum { TACTICAL_AI_SLOTS = 512, TACTICAL_SENSE_TICKS = 6, TACTICAL_GUARD_REPORTS = 32 };
+/* ASSAULT is the brave rusher, SUPPORT suppresses, CROUCH and COVER are
+ * riflemen who bound cover to cover, FLANK works round the side. */
 enum TacticalGuardRole { GUARD_ASSAULT, GUARD_SUPPORT, GUARD_CROUCH, GUARD_FLANK, GUARD_COVER };
 enum TacticalContact { CONTACT_NONE, CONTACT_IMPACT, CONTACT_BODY, CONTACT_COMBAT, CONTACT_SOUND, CONTACT_TEAM, CONTACT_SIGHT };
-enum TacticalGuardOrder { ORDER_NONE, ORDER_SEARCH, ORDER_CHARGE, ORDER_FIRE, ORDER_FLANK, ORDER_COVER, ORDER_PEEK };
+enum TacticalGuardOrder { ORDER_NONE, ORDER_SEARCH, ORDER_CHARGE, ORDER_FIRE, ORDER_FLANK, ORDER_COVER, ORDER_PEEK,
+    ORDER_ADVANCE, ORDER_SUPPRESS, ORDER_FALLBACK };
 
 typedef struct TacticalGuardMind {
     Model *model;
@@ -23,6 +26,7 @@ typedef struct TacticalGuardMind {
     coord3d cover;
     StandTile *coverFloor;
     s32 coverArriveBy, nextPeek, peekUntil;
+    s32 nextAdvance, flankBy, suppressUntil;
     s8 peekPose, peekSide;
     enum TacticalContact contact;
     enum TacticalGuardOrder order;
@@ -225,6 +229,12 @@ static void tacticalGuardDischarge(ChrRecord *guard, bool suppressed)
     if (!tacticalGuardAiAllowed() || !tacticalGuardOrdinary(guard)) return;
     TacticalGuardMind *mind = tacticalGuardMind(guard);
     if (!mind || g_GlobalTimer - mind->lastDischarge < 10) return;
+    if (s_traceGuardAi && g_GlobalTimer - mind->lastDischarge > 45) {
+        static const char *const names[] = {"hold", "search", "charge", "fire", "flank", "cover", "peek",
+            "advance", "suppress", "fall back"};
+        sysLogPrintf(LOG_NOTE, "tactical AI: guard %d opened fire (%s%s)", guard->chrnum, names[mind->order],
+            mind->peekPose >= GEVR_GUARD_COVER_BLIND_LEFT ? ", blind" : "");
+    }
     mind->lastDischarge = g_GlobalTimer;
     /* Guards who hear this turn toward the threat, not toward the friendly
      * shooter (0.16 had them kneel facing the guard who fired). */
@@ -328,6 +338,15 @@ static void tacticalGuardTeam(ChrRecord *guard, TacticalGuardMind *mind, int squ
         const TacticalGuardMind *partner = &s_guardMinds[i];
         ChrRecord *other = &g_ChrSlots[i];
         const bool sameGroup = squad >= 0 && squad == partner->group;
+        /* A squad passes word of a body or gunfire along without needing
+         * line of sight to each other, so the whole group goes on alert. */
+        if (sameGroup && partner != mind && partner->contact >= CONTACT_BODY && partner->contact < CONTACT_TEAM
+            && partner->contact > mind->contact && partner->expires > g_GlobalTimer + 60 && partner->floor
+            && partner->model == other->model && tacticalGuardAlive(other)
+            && tacticalDistance(&guard->prop->pos, &other->prop->pos) < SQR(2200.0f)) {
+            tacticalGuardNotice(mind, &partner->location, partner->floor, partner->contact, 300);
+            continue;
+        }
         if (partner == mind || partner->contact != CONTACT_SIGHT || partner->clearUntil <= g_GlobalTimer
             || partner->model != other->model || !tacticalGuardAlive(other) || !tacticalGuardHostile(other)
             || tacticalDistance(&guard->prop->pos, &other->prop->pos) > SQR(sameGroup ? 1800.0f : 1050.0f)) continue;
@@ -486,13 +505,103 @@ static void tacticalGuardFaceContact(ChrRecord *guard, const TacticalGuardMind *
 static void tacticalGuardOrder(TacticalGuardMind *mind, enum TacticalGuardOrder order)
 {
     if (s_traceGuardAi && mind->order != order) {
-        static const char *const names[] = {"hold", "search", "charge", "fire", "flank", "cover", "peek"};
+        static const char *const names[] = {"hold", "search", "charge", "fire", "flank", "cover", "peek",
+            "advance", "suppress", "fall back"};
         sysLogPrintf(LOG_NOTE, "tactical AI: guard %d order %s", mind->chrnum, names[order]);
     }
     mind->order = order;
 }
 
 #include "gevr_tactical_cover_ai.inc.h"
+
+/* Jungle's five-man squads get one of each role; paired posts a suppressor,
+ * a rifleman and a flanker. Others draw a stable personality: about one in
+ * six is a brave rusher. */
+static enum TacticalGuardRole tacticalGuardRole(const ChrRecord *guard, const TacticalGuardMind *mind)
+{
+    if (mind->group >= 0 && mind->group < 100) return (enum TacticalGuardRole)(mind->member % 5);
+    if (mind->group >= 100)
+        return mind->member == 0 ? GUARD_SUPPORT : mind->member == 1 ? GUARD_CROUCH : GUARD_FLANK;
+    const unsigned roll = ((u16)guard->chrnum * 37u + (u8)guard->headnum * 11u + (u8)guard->bodynum * 3u) % 100u;
+    return roll < 17 ? GUARD_ASSAULT : roll < 42 ? GUARD_CROUCH : roll < 66 ? GUARD_SUPPORT
+        : roll < 86 ? GUARD_FLANK : GUARD_COVER;
+}
+
+/* Bounding overwatch: a rifleman moves while someone else in his group is
+ * putting rounds out, and no more than two of the group move at once. A
+ * guard without a group moves after his own burst. */
+static bool tacticalGuardCovered(const TacticalGuardMind *mind)
+{
+    if (mind->group < 0) return g_GlobalTimer - mind->lastDischarge < 90;
+    bool covering = FALSE;
+    int moving = 0;
+    for (int i = 0; i < g_NumChrSlots && i < TACTICAL_AI_SLOTS; i++) {
+        const TacticalGuardMind *other = &s_guardMinds[i];
+        const ChrRecord *chr = &g_ChrSlots[i];
+        if (other == mind || other->group != mind->group || other->model != chr->model
+            || !tacticalGuardAlive(chr)) continue;
+        if ((other->order == ORDER_ADVANCE || other->order == ORDER_FLANK || other->order == ORDER_CHARGE)
+            && chr->actiontype == ACT_GOPOS) moving++;
+        if ((other->order == ORDER_FIRE || other->order == ORDER_SUPPRESS || other->order == ORDER_PEEK)
+            && g_GlobalTimer - other->lastDischarge < 75) covering = TRUE;
+    }
+    return covering && moving < 2;
+}
+
+/* A clear lane from a crouched muzzle to the last known position: fire there
+ * keeps the player's head down, and never goes through a wall or a friend. */
+static bool tacticalGuardSuppressLane(ChrRecord *guard, const TacticalGuardMind *mind)
+{
+    return mind->floor && mind->expires > g_GlobalTimer
+        && (mind->contact == CONTACT_SIGHT || mind->contact == CONTACT_TEAM || mind->contact == CONTACT_SOUND)
+        && tacticalDistance(&guard->prop->pos, &mind->location) < SQR(3400.0f)
+        && tacticalTrace(guard, &guard->prop->pos, guard->prop->stan, &mind->location, mind->floor,
+            guard->chrheight - 50.0f, tacticalEvidenceHeight(mind), CDTYPE_CHRS);
+}
+
+static bool tacticalGuardSuppress(ChrRecord *guard, TacticalGuardMind *mind)
+{
+    if (!tacticalGuardSuppressLane(guard, mind)) return FALSE;
+    const coord3d *pos = &guard->prop->pos;
+    const f32 angle = atan2f(mind->location.x - pos->x, mind->location.z - pos->z);
+    if (!actor_kneel_aim_at_actor(guard, TARGET_COMPASS, (s32)(angle * 65536.0f / M_TAU_F) & 0xffff)) return FALSE;
+    mind->crouched = TRUE;
+    mind->suppressUntil = g_GlobalTimer + 150;
+    tacticalGuardOrder(mind, ORDER_SUPPRESS);
+    return TRUE;
+}
+
+/* Work round to the contact's side, 5-7 m out, on floor joined to it. */
+static bool tacticalGuardFlank(ChrRecord *guard, TacticalGuardMind *mind)
+{
+    if (!mind->floor) return FALSE;
+    const coord3d *at = &guard->prop->pos;
+    const f32 base = atan2f(at->x - mind->location.x, at->z - mind->location.z);
+    const f32 side = guard->chrnum & 1 ? 1.0f : -1.0f;
+    const f32 ground = stanGetPositionYValue(mind->floor, mind->location.x, mind->location.z);
+    static const f32 swings[] = {1.15f, 0.8f, 1.55f};
+    static const f32 radii[] = {720.0f, 520.0f};
+    for (size_t r = 0; r < ARRAYCOUNT(radii); r++) {
+        for (size_t w = 0; w < ARRAYCOUNT(swings); w++) {
+            for (int mirror = 0; mirror < 2; mirror++) {
+                const f32 angle = base + swings[w] * (mirror ? -side : side);
+                coord3d point = {.x = mind->location.x + sinf(angle) * radii[r],
+                                 .z = mind->location.z + cosf(angle) * radii[r]};
+                StandTile *tile = mind->floor;
+                if (!tacticalPeekTile(&mind->location, &tile, &point) || fabsf(point.y - ground) > 60.0f
+                    || tacticalDistance(&point, at) < SQR(260.0f) || !chrlvIsPosClearOfObjectBounds(&point, tile))
+                    continue;
+                if (!tacticalGuardRoute(guard, &point, tile, SPEED_RUN)) return FALSE;
+                mind->flankBy = g_GlobalTimer + 420;
+                if (s_traceGuardAi) sysLogPrintf(LOG_NOTE, "tactical AI: guard %d flanking to %.0f,%.0f",
+                    guard->chrnum, (double)point.x, (double)point.z);
+                tacticalGuardOrder(mind, ORDER_FLANK);
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
 
 static void tacticalGuardResumePatrol(ChrRecord *guard, TacticalGuardMind *mind)
 {
@@ -534,10 +643,7 @@ static bool tacticalGuardThink(ChrRecord *guard)
     }
     const s32 now = g_GlobalTimer;
     const int squad = mind->group;
-    const enum TacticalGuardRole role = squad < 0
-        ? ((u16)guard->chrnum * 7u + (u8)guard->headnum) % 5
-        : squad < 100 ? mind->member
-        : mind->member == 0 ? GUARD_SUPPORT : mind->member == 1 ? GUARD_CROUCH : GUARD_FLANK;
+    const enum TacticalGuardRole role = tacticalGuardRole(guard, mind);
 
     if (now >= mind->nextSense) {
         mind->nextSense = now + TACTICAL_SENSE_TICKS;
@@ -601,8 +707,8 @@ static bool tacticalGuardThink(ChrRecord *guard)
         return TRUE;
     }
 
-    const bool wounded = guard->numarghs > 0 && guard->maxdamage > 0.0f
-        && guard->damage >= guard->maxdamage * 0.50f;
+    const f32 hurt = guard->maxdamage > 0.0f ? guard->damage / guard->maxdamage : 0.0f;
+    const bool wounded = guard->numarghs > 0 && hurt >= (role == GUARD_ASSAULT ? 0.75f : 0.50f);
     mind->nextOrder = now + 28 + ((u16)guard->chrnum % 12);
     if (gevrCampaignGuardIsMarksman(guard)) {
         /* Overwatch stays on its post. A lost firing line results in facing
@@ -617,42 +723,113 @@ static bool tacticalGuardThink(ChrRecord *guard)
         }
         return TRUE;
     }
-    if (now >= mind->nextCover && (role != GUARD_ASSAULT || wounded)
-        && (clear || mind->contact >= CONTACT_BODY) && tacticalCoverProbeAvailable()) {
-        mind->nextCover = now + 135 + ((u16)guard->chrnum % 63);
-        if (tacticalGuardFindCover(guard, mind, wounded, role == GUARD_FLANK)) return TRUE;
-    }
-    if (clear) {
-        if (guard->actiontype == ACT_ATTACK) return TRUE;
-        mind->crouched = role != GUARD_ASSAULT;
-        if (role == GUARD_ASSAULT) {
-            if (guard->actiontype == ACT_ATTACKWALK || actor_runs_and_fires(guard)) {
-                tacticalGuardOrder(mind, ORDER_CHARGE);
-                return TRUE;
-            }
-            actor_aim_at_actor(guard, TARGET_BOND, 0);
-        } else {
-            actor_kneel_aim_at_actor(guard, TARGET_BOND, 0);
-            if (role == GUARD_SUPPORT && guard->actiontype == ACT_ATTACK && guard->act_attack.unk37)
-                guard->act_attack.unk34 = 7;
-        }
-        tacticalGuardOrder(mind, ORDER_FIRE);
+
+    /* A flank in progress runs its course unless the player shows himself. */
+    if (mind->order == ORDER_FLANK && guard->actiontype == ACT_GOPOS && now < mind->flankBy && !clear) {
+        mind->nextOrder = now + 12;
         return TRUE;
     }
 
-    if (guard->actiontype == ACT_ATTACKWALK || guard->actiontype == ACT_ATTACK) {
-        chrStopFiring(guard);
-        chrlvMergeKneelToStand(guard, 10.0f);
+    /* Wounded guards fall back to cover behind them, whatever their role. */
+    if (wounded && now >= mind->nextCover && tacticalCoverProbeAvailable()) {
+        mind->nextCover = now + 150 + ((u16)guard->chrnum % 63);
+        if (tacticalGuardFindCover(guard, mind, TRUE, FALSE, FALSE)) return TRUE;
     }
-    if (mind->contact >= CONTACT_TEAM && evidenceDist < SQR(2000.0f)) {
-        if (role == GUARD_SUPPORT || role == GUARD_CROUCH) {
-            tacticalGuardFaceContact(guard, mind);
-            tacticalGuardOrder(mind, ORDER_NONE);
+
+    const f32 range2 = evidenceDist;
+    if (clear) {
+        switch (role) {
+        case GUARD_ASSAULT:
+            /* The brave one: runs at the player spraying, then stands and
+             * keeps the trigger down, re-aimed as each burst ends. */
+            mind->crouched = FALSE;
+            mind->nextOrder = now + 8;
+            if (guard->actiontype == ACT_ATTACKWALK) return TRUE;
+            if (range2 > SQR(1000.0f) && actor_runs_and_fires(guard)) {
+                tacticalGuardOrder(mind, ORDER_CHARGE);
+                return TRUE;
+            }
+            if (guard->actiontype != ACT_ATTACK) actor_aim_at_actor(guard, TARGET_BOND, 0);
+            tacticalGuardOrder(mind, ORDER_FIRE);
+            return TRUE;
+        case GUARD_SUPPORT:
+            /* Holds and pins the player with crouched bursts, back to back. */
+            mind->crouched = TRUE;
+            mind->nextOrder = now + 12;
+            if (guard->actiontype == ACT_ATTACK) return TRUE;
+            if (now >= mind->nextCover && tacticalCoverProbeAvailable()) {
+                mind->nextCover = now + 200 + ((u16)guard->chrnum % 63);
+                if (tacticalGuardFindCover(guard, mind, FALSE, FALSE, FALSE)) return TRUE;
+            }
+            actor_kneel_aim_at_actor(guard, TARGET_BOND, 0);
+            tacticalGuardOrder(mind, ORDER_FIRE);
+            return TRUE;
+        case GUARD_FLANK:
+            if (now >= mind->nextAdvance && range2 > SQR(900.0f) && tacticalGuardCovered(mind)) {
+                mind->nextAdvance = now + 300 + ((u16)guard->chrnum % 90);
+                if (tacticalGuardFlank(guard, mind)) return TRUE;
+            }
+            /* fall through: otherwise fights like a rifleman */
+        default:
+            /* Riflemen: a burst from where they are, then a bound to cover
+             * nearer the player while the squad covers the move. */
+            if (guard->actiontype == ACT_ATTACK) return TRUE;
+            if (now >= mind->nextAdvance && now - mind->lastDischarge < 120 && tacticalGuardCovered(mind)
+                && tacticalCoverProbeAvailable()) {
+                mind->nextAdvance = now + 190 + ((u16)guard->chrnum % 70);
+                if (tacticalGuardFindCover(guard, mind, FALSE, FALSE, TRUE)) return TRUE;
+            }
+            if (now >= mind->nextCover && role == GUARD_COVER && tacticalCoverProbeAvailable()) {
+                mind->nextCover = now + 135 + ((u16)guard->chrnum % 63);
+                if (tacticalGuardFindCover(guard, mind, FALSE, FALSE, FALSE)) return TRUE;
+            }
+            mind->crouched = ((guard->chrnum + now / 240) & 1) != 0;
+            if (mind->crouched) actor_kneel_aim_at_actor(guard, TARGET_BOND, 0);
+            else actor_aim_at_actor(guard, TARGET_BOND, 0);
+            tacticalGuardOrder(mind, ORDER_FIRE);
             return TRUE;
         }
     }
-    if (mind->floor && evidenceDist > SQR(standOff) && mind->contact != CONTACT_IMPACT
-        && tacticalGuardRoute(guard, &mind->location, mind->floor, SPEED_RUN)) {
+
+    /* No firing line to the player. */
+    if (guard->actiontype == ACT_ATTACKWALK || (guard->actiontype == ACT_ATTACK && mind->order != ORDER_SUPPRESS)) {
+        chrStopFiring(guard);
+        chrlvMergeKneelToStand(guard, 10.0f);
+    }
+    if (mind->order == ORDER_SUPPRESS && guard->actiontype == ACT_ATTACK && now < mind->suppressUntil
+        && tacticalGuardSuppressLane(guard, mind)) return TRUE;
+
+    /* The suppressor keeps rounds on the last known position while the
+     * others move; with no clear lane he takes cover and watches. */
+    if (role == GUARD_SUPPORT && mind->contact >= CONTACT_SOUND && mind->contact != CONTACT_BODY) {
+        if (tacticalGuardSuppress(guard, mind)) return TRUE;
+        if (now >= mind->nextCover && tacticalCoverProbeAvailable()) {
+            mind->nextCover = now + 135 + ((u16)guard->chrnum % 63);
+            if (tacticalGuardFindCover(guard, mind, FALSE, FALSE, FALSE)) return TRUE;
+        }
+        tacticalGuardFaceContact(guard, mind);
+        if (guard->actiontype != ACT_KNEEL) check_if_able_to_then_kneel(guard);
+        tacticalGuardOrder(mind, ORDER_NONE);
+        return TRUE;
+    }
+    if (role == GUARD_FLANK && mind->contact >= CONTACT_SOUND && now >= mind->nextAdvance
+        && range2 > SQR(800.0f)) {
+        mind->nextAdvance = now + 300 + ((u16)guard->chrnum % 90);
+        if (tacticalGuardFlank(guard, mind)) return TRUE;
+    }
+    if ((role == GUARD_CROUCH || role == GUARD_COVER) && mind->contact >= CONTACT_SOUND
+        && now >= mind->nextAdvance && tacticalGuardCovered(mind) && tacticalCoverProbeAvailable()) {
+        mind->nextAdvance = now + 190 + ((u16)guard->chrnum % 70);
+        if (tacticalGuardFindCover(guard, mind, FALSE, FALSE, TRUE)) return TRUE;
+    }
+
+    /* Searching: the brave run in, the rest move in ready, and a squad sends
+     * at most two forward to check a body or a noise. */
+    const bool investigate = role == GUARD_ASSAULT || mind->group < 0 || mind->member < 2
+        || mind->contact >= CONTACT_TEAM;
+    if (investigate && mind->floor && range2 > SQR(standOff) && mind->contact != CONTACT_IMPACT
+        && tacticalGuardRoute(guard, &mind->location, mind->floor,
+            role == GUARD_ASSAULT ? SPEED_SPRINT : mind->contact >= CONTACT_COMBAT ? SPEED_RUN : SPEED_WALK)) {
         tacticalGuardOrder(mind, ORDER_SEARCH);
     } else {
         tacticalGuardFaceContact(guard, mind);
@@ -672,6 +849,8 @@ static bool tacticalGuardCanFire(ChrRecord *guard)
         && !(guard->actiontype == ACT_ATTACK && (guard->act_attack.attacktype & TARGET_BOND))) return TRUE;
     if (managed && mind->coverFloor)
         return mind->peekPose && mind->peekUntil > g_GlobalTimer && bondviewGetVisibleToGuardsFlag();
+    if (managed && mind->order == ORDER_SUPPRESS)
+        return g_GlobalTimer < mind->suppressUntil && tacticalGuardSuppressLane(guard, mind);
     const PropRecord *target = getCurrentPlayerProp();
     const bool crouched = managed && guard->actiontype == ACT_ATTACK && mind->crouched;
     const bool clear = target && bondviewGetVisibleToGuardsFlag() && !g_CurrentPlayer->bonddead

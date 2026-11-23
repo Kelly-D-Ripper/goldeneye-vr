@@ -103,7 +103,14 @@ enum {
     CAMPAIGN_PATROL_FIRST_ID = 25000,
     CAMPAIGN_PATROL_STRIDE = 5,
     CAMPAIGN_EXPANSION_FIRST_ID = 26000,
-    CAMPAIGN_EXPANSION_STRIDE = 3
+    CAMPAIGN_EXPANSION_STRIDE = 3,
+    /* Lone stock guards (chrnum below 100) get partners 22000+ and 22100+
+     * their own number, the same ranges the authored posts use. */
+    CAMPAIGN_BUDDY_SENTRY_LIMIT = 100,
+    CAMPAIGN_BUDDY_MAX = 18,
+    /* SVD marksmen on high ground found at load on open maps */
+    CAMPAIGN_PERCH_FIRST_ID = 23100,
+    CAMPAIGN_PERCH_MAX = 2
 };
 
 /* Only regular armed posts with an adjacent, clear pad on that same floor. */
@@ -170,6 +177,7 @@ int gevrCampaignExtraGuardCapacity(int stage)
 {
     if (!tacticalEncountersEnabled()) return 0;
     int count = stage == LEVELID_JUNGLE ? GEVR_JUNGLE_PATROL_CAPACITY : stage == LEVELID_SURFACE;
+    count += CAMPAIGN_BUDDY_MAX + CAMPAIGN_PERCH_MAX; /* lone guards' partners and perches, placed at load */
     for (size_t i = 0; i < ARRAYCOUNT(campaignGuardPosts); i++) {
         if (campaignGuardPosts[i].stage == stage) count += campaignGuardPosts[i].partners;
     }
@@ -196,10 +204,13 @@ bool gevrCampaignGuardIsMarksman(const ChrRecord *chr)
 {
     const int row = campaignEncounterIndex(chr);
     if (row >= 0) return campaignExpansions[row].role == ENCOUNTER_MARKSMAN;
+    if (chr && chr->chrnum >= CAMPAIGN_PERCH_FIRST_ID && chr->chrnum < CAMPAIGN_PERCH_FIRST_ID + CAMPAIGN_PERCH_MAX)
+        return tacticalEncountersEnabled();
     if (!chr || chr->bodynum != BODY_Siberian_Special_Forces || !tacticalEncountersEnabled()) return FALSE;
     const int stage = bossGetStageNum();
     return (stage == LEVELID_SURFACE && chr->chrnum == SURFACE_ROOF_MARKSMAN)
-        || (stage == LEVELID_SURFACE2 && chr->chrnum == SURFACE2_ROOF_MARKSMAN);
+        || (stage == LEVELID_SURFACE2 && chr->chrnum == SURFACE2_ROOF_MARKSMAN)
+        || (chr->chrnum >= CAMPAIGN_PERCH_FIRST_ID && chr->chrnum < CAMPAIGN_PERCH_FIRST_ID + CAMPAIGN_PERCH_MAX);
 }
 
 struct patrol_path *gevrCampaignGuardRoute(const ChrRecord *chr)
@@ -221,6 +232,24 @@ int gevrJunglePatrolSquad(const ChrRecord *chr)
         return -1;
     const int member = chr->chrnum - JUNGLE_PATROL_FIRST_ID;
     return member >= 0 && member < GEVR_JUNGLE_PATROL_CAPACITY ? member / GEVR_JUNGLE_SQUAD_SIZE : -1;
+}
+
+extern s32 g_GlobalTimer; /* lv.c */
+/* Whether stock guard n has a partner actor, rechecked once a second. */
+static bool campaignHasBuddy(int sentry)
+{
+    static s32 checked[CAMPAIGN_BUDDY_SENTRY_LIMIT];
+    static bool result[CAMPAIGN_BUDDY_SENTRY_LIMIT];
+    static const void *setup;
+    if (setup != g_CurrentSetup.pads) {
+        memset(checked, 0, sizeof(checked));
+        setup = g_CurrentSetup.pads;
+    }
+    if (!checked[sentry] || g_GlobalTimer - checked[sentry] > 60 || g_GlobalTimer < checked[sentry]) {
+        checked[sentry] = g_GlobalTimer | 1;
+        result[sentry] = chrFindByLiteralId(CAMPAIGN_PARTNER_FIRST_ID + sentry) != NULL;
+    }
+    return result[sentry];
 }
 
 int gevrCampaignGuardPost(const ChrRecord *chr, int *member)
@@ -250,6 +279,18 @@ int gevrCampaignGuardPost(const ChrRecord *chr, int *member)
         else if (campaignGuardPosts[i].partners == 2 && chr->chrnum == CAMPAIGN_THIRD_FIRST_ID + sentry) *member = 2;
         else continue;
         return sentry;
+    }
+    if (chr->chrnum >= CAMPAIGN_PARTNER_FIRST_ID && chr->chrnum < CAMPAIGN_PARTNER_FIRST_ID + CAMPAIGN_BUDDY_SENTRY_LIMIT) {
+        *member = 1;
+        return chr->chrnum - CAMPAIGN_PARTNER_FIRST_ID;
+    }
+    if (chr->chrnum >= CAMPAIGN_THIRD_FIRST_ID && chr->chrnum < CAMPAIGN_THIRD_FIRST_ID + CAMPAIGN_BUDDY_SENTRY_LIMIT) {
+        *member = 2;
+        return chr->chrnum - CAMPAIGN_THIRD_FIRST_ID;
+    }
+    if (chr->chrnum >= 0 && chr->chrnum < CAMPAIGN_BUDDY_SENTRY_LIMIT && campaignHasBuddy(chr->chrnum)) {
+        *member = 0;
+        return chr->chrnum;
     }
     return -1;
 }
@@ -425,6 +466,107 @@ static void spawnCampaignSentryPairs(int stage, int npads)
         }
         if (first) setsubroty(sentry->model, atan2f(towardX, towardZ));
     }
+}
+
+/* 0.17.1 (user, 2026-11-23): a guard stood alone gets a partner facing him,
+ * and some get a third, so posts read as people talking, smoking or keeping
+ * each other awake. Only plain idle sentries on the standard lists qualify;
+ * crowded rooms, patrols, scripted and objective actors are left alone, and
+ * every spot passes the same start-area, sightline, floor and standing-space
+ * checks as the authored posts. */
+static int s_buddyReject[6];
+static bool campaignLoneSentry(ChrRecord *chr)
+{
+    extern u8 m_StandardGuard[], m_SimpleGuard[], m_SimpleGuardDeaf[], m_IdleAnimations[];
+    if (!chr->prop || !chr->model || !chr->prop->stan || chr->chrnum < 0
+        || chr->chrnum >= CAMPAIGN_BUDDY_SENTRY_LIMIT || chr->prop->type != PROP_TYPE_CHR
+        || chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD || chr->actiontype == ACT_PATROL
+        || (chr->chrflags & (CHRFLAG_INVINCIBLE | CHRFLAG_COUNT_DEATH_AS_CIVILIAN | CHRFLAG_CAN_SHOOT_CHRS
+                             | CHRFLAG_HIDDEN | CHRFLAG_CLONE))
+        || (chr->hidden & CHRHIDDEN_REMOVE) || gevrCampaignGuardRoute(chr)) { s_buddyReject[0]++; return FALSE; }
+    /* Guards on a level's own idle script qualify too (most of Facility's
+     * do); campaignBuddyTurns keeps their facing for the script. */
+    if (chr->chrflags & CHRFLAG_INVINCIBLE) { s_buddyReject[1]++; return FALSE; }
+    const PropRecord *weapon = chr->weapons_held[GUNRIGHT] ? chr->weapons_held[GUNRIGHT] : chr->weapons_held[GUNLEFT];
+    if (!weapon || !weapon->weapon || !gevrCampaignGunIsFirearm(weapon->weapon->weaponnum)) { s_buddyReject[2]++; return FALSE; }
+    int member;
+    if (gevrCampaignGuardPost(chr, &member) >= 0) { s_buddyReject[3]++; return FALSE; }
+    /* Alone: no other guard within 6.5 m, and the room isn't already busy. */
+    int roommates = 0;
+    for (int i = 0; i < g_NumChrSlots; i++) {
+        const ChrRecord *other = &g_ChrSlots[i];
+        if (other == chr || !other->model || !other->prop || other->prop->type != PROP_TYPE_CHR || !other->prop->stan
+            || other->actiontype == ACT_DIE || other->actiontype == ACT_DEAD) continue;
+        const f32 d2 = SQR(other->prop->pos.x - chr->prop->pos.x) + SQR(other->prop->pos.z - chr->prop->pos.z);
+        if (d2 < SQR(650.0f) && fabsf(other->prop->pos.y - chr->prop->pos.y) < 150.0f) { s_buddyReject[4]++; return FALSE; }
+        if (other->prop->stan->room == chr->prop->stan->room) roommates++;
+    }
+    if (roommates >= 3) s_buddyReject[5]++;
+    return roommates < 3;
+}
+
+static bool campaignBuddyTurns(const ChrRecord *chr)
+{
+    extern u8 m_StandardGuard[], m_SimpleGuard[], m_SimpleGuardDeaf[], m_IdleAnimations[];
+    const void *list = chr->ailist;
+    return list == m_StandardGuard || list == m_SimpleGuard || list == m_SimpleGuardDeaf || list == m_IdleAnimations;
+}
+
+static void spawnCampaignLoneBuddies(int stage)
+{
+    AIRecord *ai = ailistFindById(GAILIST_STANDARD_GUARD);
+    if (!ai) return;
+    int placed = 0, threes = 0;
+    memset(s_buddyReject, 0, sizeof(s_buddyReject));
+    for (int i = 0; i < g_NumChrSlots && placed < CAMPAIGN_BUDDY_MAX - 1; i++) {
+        ChrRecord *sentry = &g_ChrSlots[i];
+        if (!campaignLoneSentry(sentry)) continue;
+        const PropRecord *weapon = sentry->weapons_held[GUNRIGHT] ? sentry->weapons_held[GUNRIGHT]
+                                                                  : sentry->weapons_held[GUNLEFT];
+        /* First choice: 1.5 m in front of him, where he is already looking. */
+        const f32 yaw = getsubroty(sentry->model);
+        PadRecord ahead = {0};
+        ahead.pos = sentry->prop->pos;
+        ahead.pos.x += 150.0f * sinf(yaw);
+        ahead.pos.z += 150.0f * cosf(yaw);
+        ahead.stan = sentry->prop->stan;
+        if (!walkTilesBetweenPoints_NoCallback(&ahead.stan, sentry->prop->pos.x, sentry->prop->pos.z,
+                                               ahead.pos.x, ahead.pos.z)) ahead.stan = NULL;
+        ahead.pos.y = ahead.stan ? stanGetPositionYValue(ahead.stan, ahead.pos.x, ahead.pos.z) : sentry->prop->pos.y;
+        const int want = (sentry->chrnum % 3 == 0 && placed < CAMPAIGN_BUDDY_MAX - 2) ? 2 : 1;
+        const coord3d *at = &sentry->prop->pos;
+        PropRecord *first = NULL;
+        f32 towardX = 0.0f, towardZ = 0.0f;
+        for (int member = 0; member < want; member++) {
+            const int id = (member == 0 ? CAMPAIGN_PARTNER_FIRST_ID : CAMPAIGN_THIRD_FIRST_ID) + sentry->chrnum;
+            int attemptUsed = 0;
+            const char *failure = "no usable position";
+            PropRecord *partner = spawnSentryPartner(sentry, &ahead, ai, id, first, &attemptUsed, &failure);
+            if (!partner) {
+                sysLogPrintf(LOG_NOTE, "tactical buddy: skipped stage %d guard %d partner %d, %s",
+                             stage, sentry->chrnum, id, failure);
+                break;
+            }
+            partner->chr->visionrange = sentry->visionrange;
+            if (!gevrCloneGuardWeapon(partner->chr, weapon, 0)) {
+                partner->chr->hidden |= CHRHIDDEN_REMOVE;
+                partner->chr->chrflags |= CHRFLAG_HIDDEN;
+                break;
+            }
+            if (!first) first = partner;
+            towardX += partner->pos.x - at->x;
+            towardZ += partner->pos.z - at->z;
+            setsubroty(partner->chr->model, atan2f(at->x - partner->pos.x, at->z - partner->pos.z));
+            placed++;
+            threes += member == 1;
+            sysLogPrintf(LOG_NOTE, "tactical buddy: stage %d guard %d partner %d attempt %d at %.0f %.0f %.0f",
+                         stage, sentry->chrnum, id, attemptUsed, partner->pos.x, partner->pos.y, partner->pos.z);
+        }
+        if (first && campaignBuddyTurns(sentry)) setsubroty(sentry->model, atan2f(towardX, towardZ));
+    }
+    sysLogPrintf(LOG_NOTE, "tactical buddy: stage %d placed %d partners (%d threes); passed over %d inactive/patrol,"
+        " %d invincible, %d unarmed, %d posted, %d with company, %d busy rooms", stage, placed, threes,
+        s_buddyReject[0], s_buddyReject[1], s_buddyReject[2], s_buddyReject[3], s_buddyReject[4], s_buddyReject[5]);
 }
 
 static bool campaignPatrolConnected(const coord3d *from, StandTile *start, const PadRecord *pad, f32 maxDistance)
@@ -637,6 +779,108 @@ static void spawnSurfaceMarksman(int npads)
     sysLogPrintf(LOG_NOTE, "tactical marksman: Surface I roof has no clear stand");
 }
 
+/* High ground on the open maps (user, 2026-11-23: "on maps that are big and
+ * open give guards elevated positions ... an SVD"). A perch stands at least
+ * 2.5 m above most pads around it and sees down to four or more of them 12-65
+ * m away. It must pass the same start-area, sightline and standing checks as
+ * every added guard, and keep clear of the authored marksmen. */
+static bool campaignOpenStage(int stage)
+{
+    switch (stage) {
+    case LEVELID_DAM: case LEVELID_RUNWAY: case LEVELID_SURFACE: case LEVELID_SURFACE2:
+    case LEVELID_STREETS: case LEVELID_DEPOT: case LEVELID_JUNGLE:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static void spawnCampaignPerches(int stage, int npads)
+{
+    if (!campaignOpenStage(stage) || npads <= 0) return;
+    AIRecord *ai = ailistFindById(GAILIST_STANDARD_GUARD);
+    if (!ai) return;
+    enum { CANDIDATES = 12 };
+    int best[CANDIDATES], bestScore[CANDIDATES], found = 0;
+    for (int i = 1; i < npads; i++) {
+        const PadRecord *pad = &g_CurrentSetup.pads[i];
+        if (!pad->stan) continue;
+        const f32 ground = stanGetPositionYValue(pad->stan, pad->pos.x, pad->pos.z);
+        int below = 0, around = 0;
+        for (int j = 1; j < npads; j++) {
+            const PadRecord *other = &g_CurrentSetup.pads[j];
+            if (j == i || !other->stan) continue;
+            const f32 d2 = SQR(other->pos.x - pad->pos.x) + SQR(other->pos.z - pad->pos.z);
+            if (d2 < SQR(1200.0f) || d2 > SQR(6500.0f)) continue;
+            around++;
+            below += stanGetPositionYValue(other->stan, other->pos.x, other->pos.z) < ground - 250.0f;
+        }
+        if (around < 8 || below * 3 < around * 2) continue;
+        int slot = found < CANDIDATES ? found++ : CANDIDATES;
+        while (slot > 0 && below > bestScore[slot - 1]) {
+            if (slot < CANDIDATES) { best[slot] = best[slot - 1]; bestScore[slot] = bestScore[slot - 1]; }
+            slot--;
+        }
+        if (slot < CANDIDATES) { best[slot] = i; bestScore[slot] = below; }
+    }
+    int placed = 0, rejectNear = 0, rejectClear = 0, rejectSight = 0;
+    coord3d used[CAMPAIGN_PERCH_MAX];
+    for (int c = 0; c < found && placed < CAMPAIGN_PERCH_MAX; c++) {
+        const PadRecord *pad = &g_CurrentSetup.pads[best[c]];
+        bool near = FALSE;
+        for (int k = 0; k < placed; k++)
+            near |= SQR(used[k].x - pad->pos.x) + SQR(used[k].z - pad->pos.z) < SQR(2500.0f);
+        for (int k = 0; k < g_NumChrSlots && !near; k++) {
+            const ChrRecord *chr = &g_ChrSlots[k];
+            near = chr->model && chr->prop && gevrCampaignGuardIsMarksman(chr)
+                && SQR(chr->prop->pos.x - pad->pos.x) + SQR(chr->prop->pos.z - pad->pos.z) < SQR(2500.0f);
+        }
+        if (near) { rejectNear++; continue; }
+        if (!gevrCampaignOpeningPointClear(pad)) { rejectClear++; continue; }
+        /* Count the lower pads it can actually see, and face their middle. */
+        const f32 ground = stanGetPositionYValue(pad->stan, pad->pos.x, pad->pos.z);
+        int seen = 0, tested = 0;
+        f32 lookX = 0.0f, lookZ = 0.0f;
+        for (int j = 1; j < npads && tested < 40; j++) {
+            const PadRecord *other = &g_CurrentSetup.pads[(best[c] * 7 + j * 13) % (npads - 1) + 1];
+            if (!other->stan || other == pad) continue;
+            const f32 d2 = SQR(other->pos.x - pad->pos.x) + SQR(other->pos.z - pad->pos.z);
+            if (d2 < SQR(1200.0f) || d2 > SQR(6500.0f)
+                || stanGetPositionYValue(other->stan, other->pos.x, other->pos.z) > ground - 250.0f) continue;
+            tested++;
+            if (!campaignMarksmanSight(pad, other)) continue;
+            seen++;
+            lookX += other->pos.x - pad->pos.x;
+            lookZ += other->pos.z - pad->pos.z;
+        }
+        if (seen < 4) { rejectSight++; continue; }
+        /* Wear the uniform of the guards already on the map. */
+        s32 body = BODY_Russian_Soldier;
+        for (int k = 0; k < g_NumChrSlots; k++) {
+            const ChrRecord *chr = &g_ChrSlots[k];
+            if (chr->model && chr->prop && chr->prop->type == PROP_TYPE_CHR && chr->chrnum >= 0 && chr->chrnum < 100
+                && !(chr->chrflags & (CHRFLAG_INVINCIBLE | CHRFLAG_COUNT_DEATH_AS_CIVILIAN))) {
+                body = chr->bodynum;
+                break;
+            }
+        }
+        const int id = CAMPAIGN_PERCH_FIRST_ID + placed;
+        PropRecord *actor = gevrSpawnCampaignGuard(body, pad, atan2f(lookX, lookZ), ai, id);
+        if (!actor) continue;
+        if (!chrGiveWeapon(actor->chr, PROP_CHRSNIPERRIFLE, ITEM_SNIPERRIFLE, 0)) {
+            actor->chr->hidden |= CHRHIDDEN_REMOVE;
+            actor->chr->chrflags |= CHRFLAG_HIDDEN;
+            continue;
+        }
+        actor->chr->visionrange = 160.0f;
+        used[placed++] = pad->pos;
+        sysLogPrintf(LOG_NOTE, "tactical perch: stage %d marksman %d pad %d sees %d/%d lower pads at %.0f %.0f %.0f",
+                     stage, id, best[c], seen, tested, actor->pos.x, actor->pos.y, actor->pos.z);
+    }
+    sysLogPrintf(LOG_NOTE, "tactical perch: stage %d placed %d of %d candidates (%d near a marksman, %d start or"
+        " standing space, %d without a view)", stage, placed, found, rejectNear, rejectClear, rejectSight);
+}
+
 void gevrCampaignEncountersStageLoaded(int stage)
 {
     memset(campaignRoutes, 0, sizeof(campaignRoutes));
@@ -652,6 +896,10 @@ void gevrCampaignEncountersStageLoaded(int stage)
         spawnCampaignPatrols(stage, npads);
     }
     spawnCampaignExpansions(stage, npads, host);
+    if (host && !sysArgCheck("--tactical-classic-ai")) {
+        spawnCampaignPerches(stage, npads);
+        if (stage != LEVELID_JUNGLE) spawnCampaignLoneBuddies(stage);
+    }
 }
 #endif
 

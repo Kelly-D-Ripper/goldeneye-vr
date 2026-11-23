@@ -100,6 +100,55 @@ static float ease(float progress)
     return t*t*(3.f - 2.f*t);
 }
 
+/* Paired guards who don't smoke talk with their free hand, and every so
+ * often wave across to the man they're stood with (user, 2026-11-23). The
+ * hand works from the head's own frame, so it follows the guard's stance. */
+static float guardGesture(ChrRecord *guard, unsigned roll, float foregrip[3])
+{
+    Model *model = guard->model;
+    ModelNode *head = mouthHitbox(model->obj->RootNode);
+    if (!head) return 0.f;
+    const struct bbox *box = &head->Data->BoundingBox.Bounds;
+    const Mtxf *headLocal = modelFindNodeMtx(model, head, 0);
+    Mtxf *viewToWorld = currentPlayerGetViewToWorldMtxf();
+    if (!headLocal || !viewToWorld) return 0.f;
+    Mtxf pose;
+    matrix_4x4_multiply(viewToWorld, (Mtxf *)headLocal, &pose);
+    coord3d chin = {.f = {(box->xmin + box->xmax) * .5f, box->ymin, (box->zmin + box->zmax) * .5f}};
+    mtx4TransformVecInPlace(&pose, &chin);
+    coord3d out, up, across;
+    memcpy(across.f, pose.m[0], sizeof(across.f));
+    memcpy(up.f, pose.m[1], sizeof(up.f));
+    memcpy(out.f, pose.m[2], sizeof(out.f));
+    normalize(&across); normalize(&up); normalize(&out);
+
+    /* A 9-13 s cycle: 1 s to bring the hand up, talking, then once a
+     * cycle a 1.6 s wave, and the hand goes back to the gun for a while. */
+    const int cycle = 540 + (int)(roll % 240);
+    const int t = (g_GlobalTimer + (int)(roll % 997)) % cycle;
+    const int talkEnd = cycle - 150;
+    const float reach = ease(t / 45.f) * ease((talkEnd - t) / 45.f);
+    if (reach <= 0.f) return 0.f;
+    const float waveAt = talkEnd * .55f, waveLength = 96.f;
+    const float wave = t >= waveAt && t < waveAt + waveLength
+        ? ease((t - waveAt) / 18.f) * ease((waveAt + waveLength - t) / 18.f) : 0.f;
+    const float beat = sinf(t * .21f + (roll & 7)), lilt = sinf(t * .13f + (roll >> 3 & 7));
+    const float swing = sinf(t * .42f);
+    for (int k = 0; k < 3; ++k) {
+        /* talking: hand out at chest height, moving with the words */
+        const float talk = chin.f[k] + 30.f * out.f[k] - 34.f * up.f[k] + 16.f * across.f[k]
+            + 6.f * beat * across.f[k] + 5.f * lilt * up.f[k];
+        /* waving: raised beside the head, swinging side to side */
+        const float raised = chin.f[k] + 16.f * out.f[k] + 14.f * up.f[k] + 30.f * across.f[k]
+            + 11.f * swing * across.f[k];
+        const float wrist = talk + wave * (raised - talk);
+        foregrip[k] += reach * (wrist - foregrip[k]);
+    }
+    if (s_trace && t == (int)waveAt)
+        sysLogPrintf(LOG_NOTE, "guard gesture: guard %d waves", guard->chrnum);
+    return reach;
+}
+
 float gevrGuardCigarettePose(ChrRecord *guard, float foregrip[3])
 {
     if ((!s_enabled && !s_groups) || !guard || guard->chrnum < 0 || g_gevrExtraPass
@@ -117,6 +166,10 @@ float gevrGuardCigarettePose(ChrRecord *guard, float foregrip[3])
     const bool lit = state->guard == guard;
     const bool quiet = gevrCoopPuppets() ? netCoopGuardIdle(guard) : guard->actiontype == ACT_STAND
         && !(guard->hidden & (CHRHIDDEN_FIRE_WEAPON_RIGHT | CHRHIDDEN_FIRE_WEAPON_LEFT));
+    if (grouped && !preview && !lit && roll % 100 < 45) {
+        if (!quiet || !foregrip || (guard->chrflags & (CHRFLAG_INVINCIBLE | CHRFLAG_COUNT_DEATH_AS_CIVILIAN))) return 0.f;
+        return guardGesture(guard, roll, foregrip);
+    }
     if (!lit && (!quiet || (guard->chrflags & (CHRFLAG_INVINCIBLE | CHRFLAG_COUNT_DEATH_AS_CIVILIAN)))) return 0.f;
     if (lit && state->ejected) return 0.f;
 
