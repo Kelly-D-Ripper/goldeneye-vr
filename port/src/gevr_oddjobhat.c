@@ -37,6 +37,7 @@
  * the knife's axis, pitch across the hand, roll about the forearm).
  */
 
+#include "gevr_android_paths.h"
 #include <ultra64.h>
 #include <PR/gbi.h>
 #include <math.h>
@@ -57,7 +58,7 @@
 #include "gevr_gexweapon.h"
 
 #ifdef __ANDROID__
-#define HAT_DIR "/sdcard/Android/data/com.gevr.port/files/"
+#define HAT_DIR GEVR_ANDROID_EXTERNAL_FILES "/"
 #else
 #define HAT_DIR ""
 #endif

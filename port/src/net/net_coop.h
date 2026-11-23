@@ -19,6 +19,21 @@ struct ObjectRecord;
 struct WeaponObjRecord;
 struct PropRecord;
 
+typedef struct GevrCoopCorpse {
+    unsigned id, cuts;
+    int immediate, headBurst, stabbed, part, weapon;
+    float direction[3];
+} GevrCoopCorpse;
+
+int gevrCoopGuardGore(const struct ChrRecord *chr);
+void gevrCoopGuardImpactPoint(const struct ChrRecord *chr, const struct coord3d *at, int matrix, int stabbed);
+void gevrCoopGuardBlood(struct ChrRecord *chr, int weapon, int matrix, int fatal,
+    const struct coord3d *at, const struct coord3d *direction);
+void gevrCoopSendCorpse(struct ChrRecord *chr, const GevrCoopCorpse *corpse);
+void gevrCoopSendCorpseCuts(unsigned id, unsigned cuts);
+void netCoopSendCorpsePose(unsigned id, unsigned sequence, int count, const float (*joints)[16], int final);
+void netCoopApplyPendingCorpsePose(unsigned id);
+
 /* The net layer (net_core.c) */
 void netCoopHostTick(void);                 /* netPoll: the guards' state, ten times a second */
 void netCoopStageLoaded(void);              /* netStageLoaded: a new mission's guards */
@@ -31,7 +46,9 @@ struct ChrRecord *netCoopGuardOfHostSlot(int hostslot);    /* this headset's gua
 /* The game */
 int gevrCoopPuppets(void);                  /* a co-op client: its guards are the host's puppets */
 int gevrCoopHostGuards(void);               /* the co-op host: it runs the guards */
+int gevrCoopPlayerTargetable(int player);
 void netCoopPuppetTick(struct ChrRecord *chr, int tickamount);    /* chr.c chrTick, a client's guard */
+int netCoopGuardIdle(const struct ChrRecord *chr);
 int gevrCoopGuardTarget(struct ChrRecord *chr);                   /* the host: the player a guard acts on */
 void gevrCoopGuardProvoked(struct ChrRecord *chr, int player);
 /* Cached guard matrices belong to the observing view, even while firing as
@@ -45,6 +62,7 @@ void gevrCoopChrSpawned(struct ChrRecord *chr, struct AIRecord *ailist, int spaw
 void gevrCoopChrIdentityChanged(struct ChrRecord *chr); /* cloning assigns/reassigns IDs after the initial spawn */
 void gevrCoopChrRemoved(struct ChrRecord *chr);   /* chr.c chrTick, CHRHIDDEN_REMOVE */
 void gevrCoopGuardLaunched(struct ObjectRecord *obj);   /* chraction.c: a guard's grenade or rocket, on the host */
+void gevrCoopTurretSound(int pad, int target, const struct coord3d *pos);
 int gevrCoopGuardExplosive(struct ObjectRecord *obj);   /* explosion.c explosionCreate: one of those, going off */
 int gevrCoopGuardBlastNow(void);            /* explosion.c: the host is running a guard: its blast is the world's */
 int gevrCoopGuardCopy(struct ObjectRecord *obj);        /* explosion.c: a client's copy of a guard's explosive (no blast of its own) */
@@ -124,6 +142,13 @@ void gevrCoopMenuTick(void);                /* front.c menu_init: the host's scr
 void gevrCoopPrepareSaveFolder(void);       /* stage load: keep a local folder even when its picker was skipped */
 int gevrCoopMenuFollowing(void);            /* this headset shows the host's screen: no input of its own */
 void netCoopReceiveMenu(struct netbuf *b);  /* net_core.c: NET_MSG_COOP_MENU */
+int gevrCoopTacticalKitMenu(void);
+int gevrCoopTacticalKitGuest(void);
+int gevrCoopTacticalKitReady(void);
+int gevrCoopTacticalKitCount(int *total);
+void gevrCoopTacticalKitSetReady(int ready);
+void netCoopReceiveKitReady(int slot, struct netbuf *b);
+void netCoopKitForgetSlot(int slot);
 void netCoopMenuReset(void);                /* a stage's load: wait for the host's word again */
 void netCoopHostStartMission(int stage, int difficulty);   /* front.c init_menu0B_runstage, the host */
 

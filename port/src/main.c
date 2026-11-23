@@ -1,4 +1,5 @@
 
+#include "gevr_android_paths.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -349,7 +350,7 @@ int SDL_main(int argc, char* argv[]) {
 const char* sysGetDataPath(void) {
     if (g_data_path[0] == '\0') {
         // Default to SDL2's internal storage path for Android
-        strcpy(g_data_path, "/data/data/com.gevr.port/files");
+        strcpy(g_data_path, GEVR_ANDROID_INTERNAL_FILES);
         sysLogPrintf(LOG_NOTE, "Using default Android data path: %s", g_data_path);
     }
     return g_data_path;
@@ -556,6 +557,9 @@ int main(int argc, const char **argv)
             debug_enable_all_levels_flag = 1;
             debug_007_unlock_flag = 1;
             sysLogPrintf(LOG_NOTE, "unlock all: missions, 007 mode and cheats");
+        } else if (sysArgCheck("--unlock-missions")) {
+            debug_enable_all_levels_flag = 1;
+            sysLogPrintf(LOG_NOTE, "campaign: unlocked all missions for this launch");
         }
     }
 #ifndef GEVR_HEADLESS

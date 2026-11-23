@@ -28,7 +28,7 @@ with tempfile.TemporaryDirectory(prefix="gevr-body-slots-") as temp:
     # headset with those until the slots stopped using them.
     game = [str(ROOT / "src/game" / name) for name in ("math_atan2f.c", "math_asinfacosf.c", "math_asinacos.c")]
     exe = Path(temp) / "body_slots_game_math.exe"
-    subprocess.run([shutil.which("gcc") or "gcc", "-std=c11", "-O2", "-D_LANGUAGE_C",
+    subprocess.run([shutil.which("gcc") or "gcc", "-std=c11", "-O2", "-D_LANGUAGE_C", "-Wno-error=incompatible-pointer-types",
                     "-I" + str(ROOT / "port/include"), "-I" + str(ROOT / "include"), "-I" + str(ROOT / "src"),
                     "-I" + str(ROOT / "src/game"),
                     str(ROOT / "port/tests/body_slots_native.c"), str(ROOT / "port/src/gevr_bodyslot.c"), *game,

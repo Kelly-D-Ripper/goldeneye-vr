@@ -1,4 +1,13 @@
 #include "chrai.h"
+#ifdef GEVR
+#include "gevr_tactical_loadouts.h"
+#include "gevr_tactical_range.h"
+#include "gevr_tactical_mesh.h"
+#include "gevr_tactical_guard_ai.h"
+#include "prop.h"
+#include <math.h>
+#include <string.h>
+#endif
 #include "bg.h"
 #include "bgfog.h"
 #include "bondinv.h"
@@ -37,6 +46,9 @@
 #include <ultra64.h>
 #ifdef GEVR
 #include "net_coop.h"
+extern bool netIsActive(void);
+#include "system.h"
+#include "gevr_tactical_reinforcements.inc.h"
 #endif
 
 // hack? used to match as called with 2 args, but decompiled code takes 1
@@ -1262,12 +1274,18 @@ void                   ai(PropDefHeaderRecord *Entityp, PROP_TYPE EntityType)
                 {
                     AiIFChrDoesNotExistRecord *ai  = AiListp + Offset;
                     ChrRecord                 *chr = chrFindById(ChrEntityp, ai->CHR_NUM);
-                    if (!chr || !chr->model
+                    bool gone = !chr || !chr->model;
 #ifdef GEVR
-                        || gevrBodyRetireForAi(chr)
-                        || (ai->CHR_NUM == (u8)CHR_CLONE && gevrFastReinforcements())
+                    if (!gone) gone = gevrBodyRetireForAi(chr);
+                    if (ai->CHR_NUM == (u8)CHR_CLONE && gevrFastReinforcements())
+                    {
+                        if (!gevrTacticalReinforcementsEnabled()) gone = TRUE;
+                        else if (ChrEntityp && (ChrEntityp->chrflags & CHRFLAG_CLONE)
+                            && AiListp == (void *)ailistFindById(GAILIST_TRY_CLONE_SEND_OR_RUN_TO_BOND))
+                            gone = gevrTacticalReinforcementHasRoom();
+                    }
 #endif
-                        )
+                    if (gone)
                     {
                         Offset = chraiGoToLabel(AiListp, Offset, ai->GOTOLABEL);
                     }
@@ -1281,7 +1299,12 @@ void                   ai(PropDefHeaderRecord *Entityp, PROP_TYPE EntityType)
                 {
                     AiIFISeeBondRecord *ai = AiListp + Offset;
 
+#ifdef GEVR
+                    const s32 sensed = gevrTacticalGuardScriptSight(ChrEntityp);
+                    if (sensed < 0 ? chrCheckTargetInSight(ChrEntityp) : sensed)
+#else
                     if (chrCheckTargetInSight(ChrEntityp))
+#endif
                     {
                         Offset = chraiGoToLabel(AiListp, Offset, ai->GOTOLABEL);
                     }
@@ -1847,7 +1870,12 @@ void                   ai(PropDefHeaderRecord *Entityp, PROP_TYPE EntityType)
                 case AI_IFIHeardBond:
                 {
                     AiIFIHeardBondRecord *ai = AiListp + Offset;
+#ifdef GEVR
+                    const s32 sensed = gevrTacticalGuardScriptHear(ChrEntityp, FALSE);
+                    if (sensed < 0 ? chrIsHearingBond(ChrEntityp) : sensed)
+#else
                     if (chrIsHearingBond(ChrEntityp))
+#endif
                     {
                         Offset = chraiGoToLabel(AiListp, Offset, ai->GOTOLABEL);
                     }
@@ -1873,7 +1901,11 @@ void                   ai(PropDefHeaderRecord *Entityp, PROP_TYPE EntityType)
                 case AI_IFISeeSomeoneDie:
                 {
                     AiIFISeeSomeoneDieRecord *ai = AiListp + Offset;
+#ifdef GEVR
+                    if (chrSawDeath(ChrEntityp) || gevrTacticalGuardScriptBody(ChrEntityp))
+#else
                     if (chrSawDeath(ChrEntityp))
+#endif
                     {
                         Offset = chraiGoToLabel(AiListp, Offset, ai->GOTOLABEL);
                     }
@@ -1925,7 +1957,12 @@ void                   ai(PropDefHeaderRecord *Entityp, PROP_TYPE EntityType)
                 case AI_IFIHeardBondRecently:
                 {
                     AiIFIHeardBondRecentlyRecord *ai = AiListp + Offset;
+#ifdef GEVR
+                    const s32 sensed = gevrTacticalGuardScriptHear(ChrEntityp, TRUE);
+                    if (sensed < 0 ? chrHeardTargetRecently(ChrEntityp) : sensed)
+#else
                     if (chrHeardTargetRecently(ChrEntityp))
+#endif
                     {
                         Offset = chraiGoToLabel(AiListp, Offset, ai->GOTOLABEL);
                     }
@@ -3810,7 +3847,11 @@ void                   ai(PropDefHeaderRecord *Entityp, PROP_TYPE EntityType)
                     bool                  ok       = FALSE;
                     if (ChrEntityp && ChrEntityp->prop && ChrEntityp->model)
                     {
-                        ok = hatCreateForChr(ChrEntityp, modelnum, flags);
+#ifdef GEVR
+                        if (gevrCampaignGuardHelmet(ChrEntityp) == GEVR_LOADOUT_NO_HELMET) ok = TRUE;
+                        else
+#endif
+                        ok = hatCreateForChr(ChrEntityp, modelnum, flags) != NULL;
                     }
                     if (ok)
                     {
@@ -3843,7 +3884,18 @@ void                   ai(PropDefHeaderRecord *Entityp, PROP_TYPE EntityType)
                     WeaponObjRecord       *srcweaponR       = NULL;
                     PropRecord            *hatprop;
                     ObjectRecord          *hatobj;
-                    // bool tryhat;
+#ifdef GEVR
+                    const bool tactical = gevrTacticalReinforcementsEnabled();
+                    if (tactical && ailistid == GAILIST_STANDARD_CLONE && chr
+                        && (chr->chrflags & CHRFLAG_CLONE)
+                        && AiListp == (void *)ailistFindById(GAILIST_TRY_CLONE_SEND_OR_RUN_TO_BOND)) {
+                        const bool requested = gevrTacticalReinforcementRequest(chr,
+                            &chr->lastknowntargetpos, chr->targetTile, TRUE);
+                        if (requested) Offset = chraiGoToLabel(AiListp, Offset, ai->GOTOLABEL);
+                        else Offset += sizeof(AiTRYCloningChrRecord);
+                        break;
+                    }
+#endif
                     if (chr && (chr->chrflags & CHRFLAG_CLONE))
                     {
                         cloneprop = chrSpawnAtChr(ChrEntityp, chr->bodynum, -1, chr->chrnum, ailist, 0);
@@ -3853,7 +3905,7 @@ void                   ai(PropDefHeaderRecord *Entityp, PROP_TYPE EntityType)
                             chrnum = chr->chrnum + 10000;
                             ChrRecord *previous = chrFindById(ChrEntityp, chrnum);
 #ifdef GEVR
-                            if (previous && gevrFastReinforcements())
+                            if (previous && gevrFastReinforcements() && !tactical)
                             {
                                 /* Fast mode permits several reinforcements per
                                  * guard. Keep every ID unique, and make CHR_CLONE
@@ -3877,7 +3929,11 @@ void                   ai(PropDefHeaderRecord *Entityp, PROP_TYPE EntityType)
                             if (srcweaponRprop)
                             {
                                 srcweaponR       = srcweaponRprop->weapon;
+#ifdef GEVR
+                                cloneweaponRprop = gevrCloneGuardWeapon(clone, srcweaponRprop, 0);
+#else
                                 cloneweaponRprop = chrGiveWeapon(clone, srcweaponR->obj, srcweaponR->weaponnum, 0);
+#endif
                                 if (cloneweaponRprop)
                                 {
                                     cloneweaponR = cloneweaponRprop->weapon;
@@ -3888,7 +3944,11 @@ void                   ai(PropDefHeaderRecord *Entityp, PROP_TYPE EntityType)
                             if (srcweaponLprop)
                             {
                                 srcweaponL       = srcweaponLprop->weapon;
+#ifdef GEVR
+                                cloneweaponLprop = gevrCloneGuardWeapon(clone, srcweaponLprop, PROPFLAG_WEAPON_LEFTHANDED);
+#else
                                 cloneweaponLprop = chrGiveWeapon(clone, srcweaponL->obj, srcweaponL->weaponnum, 0x10000000);
+#endif
                                 if (cloneweaponLprop)
                                 {
                                     cloneweaponL = cloneweaponLprop->weapon;
@@ -3905,7 +3965,10 @@ void                   ai(PropDefHeaderRecord *Entityp, PROP_TYPE EntityType)
                                 {
                                     hatobj = hatprop->obj;
 
-                                    hatCreateForChr(clone, hatobj->obj, 0);
+#ifdef GEVR
+                                    if (hatobj->obj != PROP_TACTICAL_ALTYN && hatobj->obj != PROP_TACTICAL_FAST_TROOPER)
+#endif
+                                        hatCreateForChr(clone, hatobj->obj, 0);
                                 }
                             }
                             /* PD extras */

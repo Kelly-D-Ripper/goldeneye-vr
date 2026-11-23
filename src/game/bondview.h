@@ -2757,6 +2757,7 @@ void bondviewSelectCuff(Model *model, ModelFileHeader *header, s32 switchindex);
 void sub_GAME_7F08976C(f32 param_1);
 
 #ifdef GEVR
+s32 gevrStereoWatchItem(s32 item);
 s32 gevrLeftPanelAvailable(void);
 void gevrCycleHandWeapon(s32 hand, s32 dir);
 void gevrAutoAdvanceHand(s32 hand);

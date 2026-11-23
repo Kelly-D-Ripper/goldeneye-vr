@@ -15,6 +15,10 @@ void audioPause(void);
 void audioResume(void);
 void audioShutdown(void);
 s32 audioIsPaused(void);
+s32 audioRequestQueueRefill(s32 targetFrames);
+/* Private, locally supplied handling sounds mixed into the game output. */
+enum { TACT_AUDIO_SKORPION_BASE = 8 };
+void audioTacticalPlay(int sound);
 /* A new output stream (the hold-Menu panel's Reset sound, #229). */
 void audioReset(void);
 #endif

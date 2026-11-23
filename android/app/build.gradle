@@ -19,6 +19,26 @@ if (rootProject.file("local.properties").exists()) localProperties.load(new File
 def discordSdk = file(localProperties.getProperty("gevr.discordSdk", "${rootProject.projectDir}/../build/discord/discord_partner_sdk.aar"))
 def withDiscord = discordSdk.exists()
 logger.lifecycle("Discord Social SDK: " + (withDiscord ? discordSdk : "not found, building without Discord"))
+def tacticalAssets = providers.gradleProperty("gevrTacticalAssets").orNull
+def configureTacticalPreview = { flavor, packageName, joinScheme, deviceArguments ->
+    flavor.dimension = 'device'
+    flavor.applicationId = packageName
+    flavor.versionCode = 18
+    flavor.versionName = '0.17-test'
+    flavor.manifestPlaceholders = [gevrJoinScheme: joinScheme]
+    flavor.buildConfigField 'boolean', 'TACTICAL', 'true'
+    flavor.externalNativeBuild {
+        cmake {
+            arguments("-DGEVR_TACTICAL_QUEST=ON", "-DGEVR_DISCORD=OFF", *deviceArguments)
+            def cachedDeps = providers.gradleProperty("gevrTacticalDependencyCache").orNull
+            if (cachedDeps) {
+                for (def dependency in ['opus', 'joltphysics']) {
+                    arguments "-DFETCHCONTENT_SOURCE_DIR_${dependency.toUpperCase(java.util.Locale.ROOT)}=${cachedDeps}/${dependency}"
+                }
+            }
+        }
+    }
+}
 
 android {
     namespace 'com.gevr.port'
@@ -30,6 +50,8 @@ android {
         targetSdk 34
         versionCode 138
         versionName "0.5.25"
+        manifestPlaceholders = [gevrJoinScheme: "goldeneyevr"]
+        buildConfigField 'boolean', 'TACTICAL', 'false'
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
 
@@ -77,7 +99,7 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-            if (keystorePropertiesFile.exists()) {
+            if (keystorePropertiesFile.exists() && tacticalAssets == null) {
                 signingConfig signingConfigs.release
             }
             ndk { debugSymbolLevel 'SYMBOL_TABLE' }
@@ -102,6 +124,17 @@ android {
     productFlavors {
         quest {
             dimension 'device'
+        }
+        tactical {
+            configureTacticalPreview(delegate, 'com.gevr.tactical', 'gevrtactical', [])
+        }
+        tacticalMobile {
+            configureTacticalPreview(delegate, 'com.gevr.tactical.mobile', 'gevrtacticalmobile',
+                ["-DGEVR_MOBILE=ON"])
+        }
+        tacticalFrame {
+            configureTacticalPreview(delegate, 'com.gevr.tactical.frame', 'gevrtacticalframe',
+                ["-DGEVR_FRAME=ON"])
         }
         mobile {
             dimension 'device'
@@ -150,6 +183,31 @@ android {
         quest {
             jniLibs.srcDirs = ['../../OpenXR/Libs/Android']   // Meta's OpenXR loader: the Quest's only
         }
+        tactical {
+            jniLibs.srcDirs = ['../../OpenXR/Libs/Android']
+            if (tacticalAssets != null) assets.srcDir(file(tacticalAssets))
+        }
+        tacticalMobile {
+            manifest.srcFile 'src/mobile/AndroidManifest.xml'
+            res.srcDir 'src/tactical/res'
+            if (tacticalAssets != null) assets.srcDir(file(tacticalAssets))
+        }
+        tacticalFrame {
+            manifest.srcFile 'src/frame/AndroidManifest.xml'
+            res.srcDir 'src/tactical/res'
+            if (tacticalAssets != null) assets.srcDir(file(tacticalAssets))
+        }
+    }
+}
+
+tasks.configureEach { task ->
+    if (task.name ==~ /preTactical(Mobile|Frame)?(Release|Debug)Build/) {
+        task.doFirst {
+            if (tacticalAssets == null || !file("$tacticalAssets/tactical-launch.args").isFile()
+                    || !file("$tacticalAssets/mods/tactical/gear/catalog.txt").isFile()) {
+                throw new GradleException("Set -PgevrTacticalAssets to the staged Tactical release assets.")
+            }
+        }
     }
 }
 
@@ -163,6 +221,7 @@ dependencies {
     }
     // the Steam Frame's OpenXR loader (Khronos's; the Quest's is Meta's, in OpenXR/Libs)
     frameImplementation 'org.khronos.openxr:openxr_loader_for_android:1.1.65'
+    tacticalFrameImplementation 'org.khronos.openxr:openxr_loader_for_android:1.1.65'
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'org.json:json:20240303'  // Real JSON parsing in local JVM tests
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'

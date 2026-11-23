@@ -33,6 +33,7 @@ struct GfxMeshDrawParams {
     float normal_axis[4][3];
     int num_inputs;
     bool skinned, lit, has_bounds, invert_y, authored_color, world_vertices;
+    bool tactical_gear;
     float lo[3], hi[3];
     int cull, num_lights;
     float ambient[3], light_dir[7][3], light_color[7][3];
@@ -109,6 +110,8 @@ struct GfxRenderingAPI {
                       uint32_t num_indices, uint32_t first, uint32_t count, const struct GfxMeshDrawParams* params);
     void (*delete_mesh)(void* gpu);
     bool (*scope_sees_mesh)(const float* mp, const float* lo, const float* hi);
+    void (*prepare_mesh)(void** gpu, const void* vertices, uint32_t num_vertices,
+                         const uint32_t* indices, uint32_t num_indices);
 
 };
 

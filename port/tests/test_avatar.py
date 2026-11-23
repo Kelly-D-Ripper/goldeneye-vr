@@ -28,7 +28,7 @@ if __name__ == "__main__":
         sources = [ROOT / p for p in ("port/tests/avatar_math_native.c", "port/src/gevr_avatar_math.c", "port/src/net/netbuf.c")]
         subprocess.run(["gcc", *flags, *map(str, sources), "-lm", "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
-        maths = ["matrix_4x4_set_identity", "matrix_4x4_multiply", "matrix_4x4_multiply_homogeneous",
+        maths = ["matrix_4x4_set_identity", "matrix_4x4_rotate_vector", "mtx4RotateVecInPlace", "mtx4TransformVecInPlace", "matrix_4x4_multiply", "matrix_4x4_multiply_homogeneous",
                  "matrix_4x4_set_position", "matrix_4x4_set_rotation_around_xyz", "matrix_4x4_get_rotation_around_xyz",
                  "matrix_4x4_set_position_and_rotation_around_xyz", "matrix_4x4_set_position_and_rotation_around_y",
                  "matrix_4x4_set_rotation_around_y", "matrix_column_3_scalar_multiply_2", "matrix_scalar_multiply_2"]
@@ -44,6 +44,13 @@ if __name__ == "__main__":
         fixture = Path(temp) / "avatar_rig.c"
         fixture.write_text((ROOT / "port/tests/avatar_rig_native.c").read_text().replace("/* PRODUCTION_BUILDERS */", builders))
         binary = Path(temp) / "avatar_rig"
-        sources = [fixture, ROOT / "port/src/gevr_avatar.c", ROOT / "port/src/gevr_avatar_math.c"]
+        # The fixture has no texture, model asset or graphics render backend.
+        adapter_source = "port/src/gevr_avatar.c"
+        adapter_code = (ROOT / adapter_source).read_text()
+        for draw in ("drawTacticalGear", "tacticalBodyFit", "gevrAvatarTacticalDraw"):
+            adapter_code = adapter_code.replace(function(adapter_source, draw), "")
+        adapter = Path(temp) / "avatar_adapter.c"
+        adapter.write_text(adapter_code)
+        sources = [fixture, adapter, ROOT / "port/src/gevr_avatar_math.c"]
         subprocess.run(["gcc", *flags, "-Wno-incompatible-pointer-types", *map(str, sources), "-lm", "-o", str(binary)], check=True)
         subprocess.run([str(binary)], check=True)

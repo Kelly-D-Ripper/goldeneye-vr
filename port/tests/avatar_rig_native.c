@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include "gevr_avatar.h"
+#include "gevr_guard_cover.h"
+#include "gevr_tactical_gear.h"
 #include "net/net_core.h"
 #include "model.h"
 #include "player.h"
@@ -21,12 +23,32 @@ static GevrAvatarPose received;
 static float weights[3]={1,1,1};
 static int active=1,ready=1,tracked[2]={1,1};
 static int focused=1,aiming;
+static int tacticalTestOn;
+
+int gevrTacticalGuardSupportContact(const Model *model, int item, float out[3])
+{
+    (void)model;
+    if (item != ITEM_AK47) return 0;
+    out[0] = -137.f;
+    out[1] = -8.f;
+    out[2] = 38.f;
+    return 1;
+}
 static uint64_t now=1000000;
 static coord3d eye;
 static struct player remote;
 struct player *g_playerPointers[MAX_PLAYER_COUNT];
 int g_gevrStereo=1,VrLeftHandedMode;
-s32 g_gevrExtraPass;
+s32 g_gevrExtraPass, g_GlobalTimer;
+PropRecord *chrGetEquippedWeaponProp(ChrRecord *chr, GUNHAND hand) { return chr->weapons_held[hand]; }
+int gevrTacticalMeshMuzzleFrame(const Model *model, int item, float out[4][4], const GevrGearAssembly **gear)
+{
+    (void)item;
+    *gear = NULL;
+    if (!model || !model->render_pos) return 0;
+    memcpy(out, model->render_pos[0].pos.m, sizeof(Mtxf));
+    return 1;
+}
 int gevrVrReady(void) {return ready;}
 int gevrVrSessionFocused(void) {return focused;}
 s32 gevrStereoShotWorld(s32 role,coord3d *origin,coord3d *dir) {(void)role;memset(origin,0,sizeof(*origin));dir->x=1;dir->y=dir->z=0;return aiming;}
@@ -40,6 +62,8 @@ int gevrVrGripPoseCamera(int ctrl,float pos[3],float q[4]) {
 coord3d *gevrEyePosition(void) {return &eye;}
 u64 sysGetMicroseconds(void) {return now;}
 void sysLogPrintf(s32 level,const char *fmt,...) {(void)level;(void)fmt;}
+s32 sysArgCheck(const char *arg) {return tacticalTestOn && (!strcmp(arg,"--tactical-enemy-rigs") || !strcmp(arg,"--tactical-mesh"));}
+bool netIsActive(void) {return false;}
 Mtxf *camGetWorldToScreenMtxf(void) {return &view;}
 Mtxf *currentPlayerGetViewToWorldMtxf(void) {return &world;}
 s32 getPlayerPointerIndex(PropRecord *p) {(void)p;return 1;}
@@ -56,6 +80,11 @@ coord3d D_80036094,D_800360A0,D_800360AC,D_800360B8;
 void sub_GAME_7F06DEC0(s32 j,s32 flip,ModelSkeleton *s,ModelAnimation *a,uintptr_t bits,coord3d *rot)
 {(void)j;(void)flip;(void)s;(void)a;(void)bits;memset(rot,0,sizeof(*rot));}
 void sub_GAME_7F06D160(coord3d *a,coord3d *b,f32 t) {for(int k=0;k<3;k++)a->f[k]+=(b->f[k]-a->f[k])*t;}
+bool gevrCampaignGuardIsIdleGroupMember(const ChrRecord *guard) {(void)guard;return false;}
+float gevrGuardCigarettePose(ChrRecord *guard, float foregrip[3]) {(void)guard;(void)foregrip;return 0.f;}
+void gevrGuardCigaretteGrip(const ChrRecord *guard, const float target[3], const float wrist[3])
+{ (void)guard; (void)target; (void)wrist; }
+
 /* PRODUCTION_BUILDERS */
 
 void modelUpdateMatrices(ModelRenderData *data,Model *m) {
@@ -162,4 +191,70 @@ static void capture(void) {
     float grip[3][3];gevrPoseQuatMatrix(p.hand[0].q,grip);near(-grip[1][0],1);near(-grip[1][1],0);near(-grip[1][2],0);
     aiming=0;focused=0;gevrAvatarCapture(&p,&pl);assert(!p.flags);focused=1;clearFrame();
 }
-int main(void) {rig(1,0,0,-10);rig(.2f,0,0,-40);rig(1,1,0,20);rig(1,0,90,-10);rig(.2f,1,350,20);capture();puts("avatar: production rig builders, both wrists, left-handed attachments, scale, collision pose and capture passed");return 0;}
+static void guardSupport(void) {
+    Model m={0},gun={0}; ModelFileHeader header={0}; ChrRecord chr={0}; PropRecord prop={0},held={0};
+    WeaponObjRecord weapon={0}; ModelRenderData data={0};
+    fixture(&m,&header,&chr,&prop,&data,1);
+    prop.type=PROP_TYPE_CHR; held.weapon=&weapon; held.flags|=PROPFLAG_ONSCREEN; weapon.model=&gun; weapon.weaponnum=ITEM_AK47;
+    chr.weapons_held[GUNRIGHT]=&held; gun.attachedto=&m; gun.render_pos=dynAllocate(sizeof(*gun.render_pos));
+    matrix_4x4_set_identity(&gun.render_pos[0].pos);
+    for(int k=0;k<3;k++)gun.render_pos[0].pos.m[k][k]=.1f;
+    gun.render_pos[0].pos.m[3][0]=-6.3f;gun.render_pos[0].pos.m[3][1]=75.8f;gun.render_pos[0].pos.m[3][2]=26.2f;
+    float target[3]={-20,75,30};
+    RenderPosView *base=m.render_pos;
+    float before=length(modelFindNodeMtx(&m,&nodes[8],0)->m[3],target);
+    tacticalTestOn=1;gevrAvatarGuardForget(&chr);gevrAvatarGuardApply(&chr,&data);
+    assert(m.render_pos!=base && gevrAvatarCollisionPose(&m)==base);
+    float after=length(modelFindNodeMtx(&m,&nodes[8],0)->m[3],target);
+    assert(after<before && after<1.0f);
+    gevrAvatarGuardForget(&chr);assert(!gevrAvatarCollisionPose(&m));
+    tacticalTestOn=0;clearFrame();
+}
+static void guardedCover(void)
+{
+    Model model={0},gun={0}; ModelFileHeader header={0};
+    ChrRecord chr={0}; PropRecord prop={0},held={0};
+    WeaponObjRecord weapon={0}; ModelRenderData data={0};
+    fixture(&model,&header,&chr,&prop,&data,1);
+    prop.type=PROP_TYPE_CHR;
+    float head=model.render_pos[9].pos.m[3][0], wrist=model.render_pos[27].pos.m[3][0];
+    const Mtxf pelvis=model.render_pos[3].pos;
+    float offset[2],blend;
+    for(int side=-1;side<=1;side+=2) {
+        memset(&chr.tacticalCover,0,sizeof(chr.tacticalCover));
+        g_GlobalTimer=10;
+        int kind=side<0?GEVR_GUARD_COVER_LEAN_LEFT:GEVR_GUARD_COVER_LEAN_RIGHT;
+        gevrGuardCoverPoseSet(&chr,kind,side*56,0);
+        assert(gevrGuardCoverPoseGet(&chr,offset,&blend)==kind);
+        near(offset[0],0);near(blend,0);
+        g_GlobalTimer+=4; gevrGuardCoverPoseGet(&chr,offset,&blend);
+        near(offset[0],side*28);near(blend,.5f);
+        g_GlobalTimer+=4; gevrGuardCoverPoseGet(&chr,offset,&blend);
+        near(offset[0],side*56);near(blend,1);
+        modelUpdateMatrices(&data,&model); assert(gevrGuardCoverApply(&chr));
+        assert(!memcmp(&model.render_pos[3].pos,&pelvis,sizeof(pelvis)));
+        assert(side*(model.render_pos[9].pos.m[3][0]-head)>38.f);
+        assert(side*(model.render_pos[27].pos.m[3][0]-wrist)>32.f);
+    }
+    gevrGuardCoverPoseSet(&chr,GEVR_GUARD_COVER_BLIND_RIGHT,56,0); g_GlobalTimer+=8;
+    modelUpdateMatrices(&data,&model); assert(gevrGuardCoverApply(&chr));
+    assert(model.render_pos[9].pos.m[3][0]-head<18.f); /* head remains tucked */
+    assert(model.render_pos[27].pos.m[3][0]-wrist>32.f);
+    held.weapon=&weapon; held.flags=PROPFLAG_ONSCREEN; weapon.model=&gun; weapon.weaponnum=ITEM_AK47;
+    chr.weapons_held[GUNRIGHT]=&held; gun.render_pos=&model.render_pos[27];
+    coord3d muzzle;
+    assert(!gevrGuardCoverMuzzle(&chr,GUNRIGHT,&muzzle));
+    gevrGuardCoverCaptureMuzzles(&chr);
+    assert(gevrGuardCoverMuzzle(&chr,GUNRIGHT,&muzzle));
+    near(muzzle.x,model.render_pos[27].pos.m[3][0]);
+    assert(!gevrGuardCoverMuzzle(&chr,GUNLEFT,&muzzle));
+    g_GlobalTimer+=6;
+    assert(!gevrGuardCoverMuzzle(&chr,GUNRIGHT,&muzzle)); /* no stale render geometry */
+    gevrGuardCoverPoseSet(&chr,GEVR_GUARD_COVER_DUCK,0,0); g_GlobalTimer+=8;
+    modelUpdateMatrices(&data,&model); assert(!gevrGuardCoverApply(&chr));
+    near(model.render_pos[9].pos.m[3][0],head);
+    chr.actiontype=ACT_DIE;
+    assert(gevrGuardCoverPoseGet(&chr,offset,&blend)==GEVR_GUARD_COVER_NONE);
+    clearFrame();
+}
+int main(void) {rig(1,0,0,-10);rig(.2f,0,0,-40);rig(1,1,0,20);rig(1,0,90,-10);rig(.2f,1,350,20);capture();guardSupport();guardedCover();puts("avatar: production rig builders, tracked wrists, guard support reach and collision pose passed");return 0;}

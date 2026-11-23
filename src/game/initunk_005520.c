@@ -6,7 +6,6 @@
 #include "objecthandler.h"
 #include "memp.h"
 
-#define MODEL_SPARE_SLOTS          30
 #define ANIM_MODEL_SPARE_SLOTS     10
 
 /*
@@ -23,6 +22,7 @@ void modelmgrResetSlotCounts(void)
 {
     g_MaxAnimModelSlots = 0;
     g_MaxModelSlots = 0;
+    g_NumSetupModelSlots = 0;
 }
 
 
@@ -44,11 +44,12 @@ void modelmgrSetLevelResetting(bool resetting)
 /**
  * NTSC address 0x7F005540.
 */
-void modelmgrAllocateModelSlots(s32 numobjs)
+void modelmgrAllocateModelSlots(s32 numobjs, s32 spareSlots)
 {
     s32 i;
 
-    g_MaxModelSlots = numobjs + MODEL_SPARE_SLOTS;
+    g_NumSetupModelSlots = numobjs;
+    g_MaxModelSlots = numobjs + spareSlots;
     
     g_ModelSlots = mempAllocBytesInBank(g_MaxModelSlots * sizeof(struct ModelSlot), MEMPOOL_STAGE);
 

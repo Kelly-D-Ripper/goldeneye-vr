@@ -50,6 +50,84 @@ static inline int gevrWatchGestureTick(GevrWatchGestureState *state, uint32_t no
     return 0;
 }
 
+enum {
+    GEVR_COOP_WATCH_UNTRACKED,
+    GEVR_COOP_WATCH_NEUTRAL,
+    GEVR_COOP_WATCH_READING,
+    GEVR_COOP_WATCH_LOWERED
+};
+enum { GEVR_COOP_WATCH_NONE, GEVR_COOP_WATCH_OPEN, GEVR_COOP_WATCH_CLOSE };
+
+static inline int gevrCoopWatchPoseClassify(float distance, float height, float ahead, float facing)
+{
+    /* Height is relative to the eyes in play-space axes, even when the head turns. */
+    if (height <= -0.48f) {
+        return GEVR_COOP_WATCH_LOWERED;
+    }
+    if (height >= -0.36f && distance >= 0.08f && distance <= 0.55f
+        && ahead >= 0.60f && facing >= 0.55f) {
+        return GEVR_COOP_WATCH_READING;
+    }
+    return GEVR_COOP_WATCH_NEUTRAL;
+}
+
+typedef struct {
+    uint32_t heldSince, pressUntil;
+    int dwell, needsLower, closeArmed;
+} GevrCoopWatchGestureState;
+
+static inline int gevrCoopWatchGestureTick(GevrCoopWatchGestureState *state, uint32_t now,
+                                         int enabled, int pose, int watchOpen,
+                                         int canOpen, int canClose)
+{
+    if (!enabled) {
+        const GevrCoopWatchGestureState reset = {0, 0, 0, 0, 0};
+        *state = reset;
+        return GEVR_COOP_WATCH_NONE;
+    }
+    if (watchOpen || !canOpen || (int32_t)(state->pressUntil - now) <= 0) {
+        state->pressUntil = 0;
+    }
+    if (!watchOpen && !state->pressUntil) {
+        state->closeArmed = 0;
+    }
+    if (pose == GEVR_COOP_WATCH_LOWERED) {
+        state->needsLower = 0;
+    }
+    /* A button-opened watch stays open until the user raises their hand or
+     * closes it with a button. A gesture-opened watch is already armed. */
+    if (watchOpen && pose == GEVR_COOP_WATCH_READING) {
+        state->closeArmed = 1;
+        state->needsLower = 1;
+    }
+
+    int wanted = GEVR_COOP_WATCH_NONE;
+    if (canClose && state->closeArmed && pose == GEVR_COOP_WATCH_LOWERED) {
+        wanted = GEVR_COOP_WATCH_CLOSE;
+    } else if (canOpen && !state->needsLower && !state->pressUntil
+               && pose == GEVR_COOP_WATCH_READING) {
+        wanted = GEVR_COOP_WATCH_OPEN;
+    }
+    if (wanted != state->dwell) {
+        state->dwell = wanted;
+        state->heldSince = now;
+        return GEVR_COOP_WATCH_NONE;
+    }
+    if (!wanted || now - state->heldSince < (wanted == GEVR_COOP_WATCH_OPEN ? 350u : 220u)) {
+        return GEVR_COOP_WATCH_NONE;
+    }
+
+    state->dwell = GEVR_COOP_WATCH_NONE;
+    if (wanted == GEVR_COOP_WATCH_OPEN) {
+        state->needsLower = state->closeArmed = 1;
+        state->pressUntil = now + 100;
+        if (!state->pressUntil) state->pressUntil = 1;
+    } else {
+        state->closeArmed = 0;
+    }
+    return wanted;
+}
+
 /* Row-vector basis: clock twelve is -Z, face normal is +Y. Counter-reflect
  * the readout's X on a mirrored wrist so red stays left and radar stays readable. */
 static inline void gevrWatchStatusMatrix(const float wrist[4][4], const float pivot[3],

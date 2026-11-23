@@ -3,6 +3,7 @@
 #include <PR/os.h>
 #ifdef GEVR
 #include <bondconstants.h>
+#include "system.h"
 #endif
 
 #define JOY_CLAMP_MIN          0
@@ -83,14 +84,41 @@ u8 g_ConnectedControllers = 0;
 #define GEVR_SLOT_PADS (MAX_PLAYER_COUNT - MAXCONTROLLERS)
 static OSContPad g_GevrSlotPads[GEVR_SLOT_PADS];
 static u16 g_GevrSlotPadsPressed[GEVR_SLOT_PADS];
+static OSContPad s_tacticalCoopPad;
+static u16 s_tacticalCoopPressed;
+static s32 s_tacticalCoopSlot = -1;
+
+s32 gevrTacticalCoopPadSlot(void)
+{
+    extern int netGetLocalSlot(void);
+    extern int gevrCoopActive(void);
+    return gevrCoopActive() && sysArgCheck("--tactical-coop") ? netGetLocalSlot() : -1;
+}
 
 static void gevrReadSlotPads(void)
 {
     extern s32 netIsActive(void);   /* the game's bool */
     extern s32 inputReadController(s32 idx, OSContPad *npad);
-    s32 i;
+    const s32 slot = gevrTacticalCoopPadSlot();
 
-    for (i = 0; i < GEVR_SLOT_PADS; i++)
+    /* The emulated SI queue can go idle during a co-op stage handoff.
+     * Sample this headset alongside the other online slot pads each tick. */
+    if (slot >= 0 && slot < MAXCONTROLLERS)
+    {
+        OSContPad pad = {0};
+        if (inputReadController(slot, &pad) < 0) pad = (OSContPad){0};
+        if (pad.stick_x < -127) pad.stick_x = -127;
+        if (pad.stick_y < -127) pad.stick_y = -127;
+        s_tacticalCoopPressed = pad.button & ~(slot == s_tacticalCoopSlot ? s_tacticalCoopPad.button : 0);
+        s_tacticalCoopPad = pad;
+        s_tacticalCoopSlot = slot;
+    }
+    else
+    {
+        s_tacticalCoopSlot = -1;
+    }
+
+    for (s32 i = 0; i < GEVR_SLOT_PADS; i++)
     {
         OSContPad pad = {0};
         u16 held = g_GevrSlotPads[i].button;
@@ -120,6 +148,7 @@ static OSContPad *gevrSlotPad(s8 contpadnum)
     {
         return bot;
     }
+    if (contpadnum >= 0 && contpadnum == s_tacticalCoopSlot) return &s_tacticalCoopPad;
     return contpadnum >= MAXCONTROLLERS && contpadnum < MAX_PLAYER_COUNT ? &g_GevrSlotPads[contpadnum - MAXCONTROLLERS] : NULL;
 }
 
@@ -132,6 +161,7 @@ static u16 gevrSlotPadPressed(s8 contpadnum)
     {
         return pressed;
     }
+    if (contpadnum >= 0 && contpadnum == s_tacticalCoopSlot) return s_tacticalCoopPressed;
     return g_GevrSlotPadsPressed[contpadnum - MAXCONTROLLERS];
 }
 #endif

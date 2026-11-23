@@ -25,6 +25,12 @@
  */
 #include "net_core.h"   /* first, as in net_core.c: <stdbool.h> before the game's headers */
 #include "net_coop.h"
+#include "gevr_tactical_net.h"
+#include "gevr_tactical_loot_net.h"
+#include "gevr_tactical_mesh.h"
+#include "gevr_tactical_loadouts.h"
+#include "gevr_hollywood_fx.h"
+#include "gevr_ragdoll.h"
 #include "net_ally.h"
 #include "game/gevr_ally.h"
 #include "net_horde.h"
@@ -36,6 +42,7 @@
 #include <string.h>
 #include "system.h"
 #include "game/chr.h"
+#include "game/gun.h"
 #include "game/initanitable.h"
 #include "game/model.h"
 #include "game/objecthandler.h"
@@ -57,6 +64,8 @@ extern s32 g_GlobalTimer;
 extern enum PROP getPropForHeldItem(ITEM_IDS item);
 extern void chrUpdateAnim(ChrRecord *chr, s32 tickamount);
 extern void chrStopFiring(ChrRecord *self);
+extern s32 check_if_position_in_same_room(ChrRecord *self, coord3d *pos, StandTile *stan);
+extern void chrobjSndCreatePostEventDefault(ALSoundState *state, coord3d *pos);
 extern void chrSetFiring(ChrRecord *self, s32 hand, s32 firing);
 extern void sub_GAME_7F02BFE4(ChrRecord *self, s32 hand, s32 firing);   /* a guard's gun sound */
 extern void chrpropActivateThisFrame(PropRecord *prop);
@@ -192,6 +201,8 @@ typedef struct {
     NetChrState st;
     u64 sent_us;
     u8 firecount[2];
+    int visualBuilds[2];
+    GevrGuardEquipment gear;
     bool sent;
 } CoopSent;
 static CoopSent s_sent[COOP_MAX_SLOTS];
@@ -231,6 +242,12 @@ static void coopCollect(ChrRecord *chr, s32 slot, NetChrState *st, CoopSent *pre
     if (chr->chrflags & CHRFLAG_IGNORE_ANIM_TRANSLATION) st->flags |= NET_CHR_NO_TRANSLATE;
     if (chr->chrflags & CHRFLAG_INVINCIBLE) st->flags |= NET_CHR_INVINCIBLE;
     if (model->gunhand) st->flags |= NET_CHR_FLIP;
+    if (chr->tacticalCover.kind && chr->actiontype != ACT_DEAD && chr->actiontype != ACT_DIE
+        && netCoopSession() && sysArgCheck("--tactical-coop")) {
+        st->flags |= NET_CHR_COVER;
+        st->coverPose = chr->tacticalCover.kind;
+        memcpy(st->coverOffset, chr->tacticalCover.target, sizeof(st->coverOffset));
+    }
     /* fired since the last packet: the puppet shows it fire until the next one */
     if (chr->firecount[GUNRIGHT] != prev->firecount[GUNRIGHT]) st->flags |= NET_CHR_FIRE_RIGHT;
     if (chr->firecount[GUNLEFT] != prev->firecount[GUNLEFT]) st->flags |= NET_CHR_FIRE_LEFT;
@@ -246,7 +263,8 @@ static int coopChanged(const NetChrState *a, const NetChrState *b)
     return a->flags != b->flags || a->actiontype != b->actiontype || a->anim != b->anim ||
         dx * dx + dy * dy + dz * dz > 1.0f || dyaw > 100 || fabsf(a->frame - b->frame) > 0.5f ||
         a->speed != b->speed || memcmp(a->aim, b->aim, sizeof(a->aim)) || a->weapon[0] != b->weapon[0] ||
-        a->weapon[1] != b->weapon[1] || a->fade != b->fade || a->damage != b->damage;
+        a->weapon[1] != b->weapon[1] || a->fade != b->fade || a->damage != b->damage ||
+        a->coverPose != b->coverPose || memcmp(a->coverOffset, b->coverOffset, sizeof(a->coverOffset));
 }
 
 /* ---- The host's scripted cutscenes, on every headset ---- */
@@ -349,9 +367,41 @@ static void coopCinemaReset(void)
     s_cinema_sent_us = s_cinema_seen_us = 0;
 }
 
+typedef struct {
+    int item[2], build[2];
+    unsigned epoch, revision;
+    int body, valid;
+    GevrGuardEquipment gear;
+} CoopGuardVisual;
+
+static CoopGuardVisual s_guardVisual[COOP_MAX_SLOTS];
+
+static void coopGuardVisualSend(ChrRecord *chr, int guard, int to, const int builds[2], const GevrGuardEquipment *gear)
+{
+    unsigned char raw[72 + 4 * GEVR_GEAR_MOUNTS];
+    struct netbuf packet = {.data = raw, .size = sizeof(raw)};
+    coopHeader(&packet, NET_MSG_TACTICAL_GUARD);
+    netbufWriteU32(&packet, netGetWorldEpoch());
+    netbufWriteU16(&packet, guard);
+    netbufWriteU16(&packet, chr->bodynum);
+    netbufWriteS16(&packet, gear->vest);
+    netbufWriteS16(&packet, gear->helmet);
+    netbufWriteS8(&packet, gear->count);
+    for (int i = 0; i < gear->count; ++i) {
+        const TacticalMagazine *mag = &gear->mags[i];
+        netbufWriteU32(&packet, mag->id);
+        gevrTacticalNetWriteMagazine(&packet, mag);
+    }
+    for (int hand = GUNRIGHT; hand <= GUNLEFT; ++hand)
+        gevrTacticalWriteVisualBuild(&packet, coopWeaponOf(chr, hand), builds[hand], 0);
+    if (packet.error) return;
+    if (to >= 0) netCoopSendTo(to, raw, packet.wp);
+    else netCoopBroadcast(raw, packet.wp, 1);
+}
+
 void netCoopHostTick(void)
 {
-    u8 raw[16 + NET_CHR_STATES_PER_PACKET * NET_CHR_STATE_BYTES];
+    u8 raw[16 + NET_CHR_STATES_PER_PACKET * (NET_CHR_STATE_BYTES + NET_CHR_COVER_BYTES)];
     struct netbuf buf = { .data = raw, .size = sizeof(raw) };
     u64 now = sysGetMicroseconds();
     int count = 0;
@@ -373,6 +423,18 @@ void netCoopHostTick(void)
         CoopSent *prev = &s_sent[slot];
         NetChrState st;
         if (!coopChrLive(chr)) continue;
+        if (netCoopSession() && gevrTacticalGearEnabled()) {
+            const int builds[2] = {gevrTacticalGuardIssuedBuild(chr->weapons_held[GUNRIGHT]),
+                gevrTacticalGuardIssuedBuild(chr->weapons_held[GUNLEFT])};
+            GevrGuardEquipment gear;
+            gevrTacticalGuardEquipment(chr, &gear);
+            if (!prev->sent || prev->visualBuilds[0] != builds[0] || prev->visualBuilds[1] != builds[1]
+                || memcmp(&prev->gear, &gear, sizeof(gear))) {
+                coopGuardVisualSend(chr, slot, -1, builds, &gear);
+                prev->gear = gear;
+                memcpy(prev->visualBuilds, builds, sizeof(builds));
+            }
+        }
         coopCollect(chr, slot, &st, prev);
         if (prev->sent && !coopChanged(&st, &prev->st) && now - prev->sent_us < COOP_REFRESH_US) continue;
         if (!count) {
@@ -456,7 +518,7 @@ void gevrCoopChrRemoved(ChrRecord *chr)
 
 /* ---- Host: whom each guard acts on ---- */
 
-typedef struct { s8 player; s32 until60; } CoopTarget;
+typedef struct { s8 player; bool waitingForVisible; s32 until60; } CoopTarget;
 static CoopTarget s_target[COOP_MAX_SLOTS];
 void *g_gevrCoopGuardViewToWorld;
 
@@ -471,34 +533,66 @@ int gevrCoopGuardDamageBlocked(void)
 
 s32 g_gevrCoopGuardTick = FALSE;   /* the host is running a guard's AI or fire as its target */
 
+#include "game/gevr_tactical_guard_ai.h"
+
 static int coopPlayerTargetable(int i)
 {
     struct player *pl = i >= 0 && i < 4 ? g_playerPointers[i] : NULL;
     return pl && pl->prop && !pl->bonddead && netSlotOccupied(i) && !netSlotIsSpectator(i) && !gevrCoopDowned(i);
 }
 
+int gevrCoopPlayerTargetable(int i)
+{
+    return coopPlayerTargetable(i);
+}
+
 s32 gevrCoopGuardTarget(ChrRecord *chr)
 {
     s32 slot = coopSlotOf(chr);
-    s32 best = netGetLocalSlot();
-    f32 bestd = 3.4e38f;
+    s32 best = -1;
+    f32 bestd = 3.4e38f, visibleDist = 3.4e38f;
+    s32 visiblePlayer = -1;
     CoopTarget *t;
 
     if (slot < 0 || slot >= COOP_MAX_SLOTS || !chr->prop) return best;
     t = &s_target[slot];
-    if (coopPlayerTargetable(t->player) && g_GlobalTimer < t->until60) return t->player;
+    if (t->waitingForVisible && t->player < 0 && g_GlobalTimer < t->until60) return -1;
+    if (coopPlayerTargetable(t->player)) {
+        if (g_GlobalTimer < t->until60) return t->player;
+    } else if (t->player >= 0) {
+        if (sysArgCheck("--tactical-coop-test"))
+            COOP_LOG("guard %d released ineligible slot %d", chr->chrnum, t->player);
+        chrStopFiring(chr);
+        t->waitingForVisible = true;
+    }
     for (int i = 0; i < 4; i++) {
         if (!coopPlayerTargetable(i)) continue;
-        coord3d *p = &g_playerPointers[i]->prop->pos;
+        PropRecord *player = g_playerPointers[i]->prop;
+        coord3d *p = &player->pos;
         f32 dx = p->x - chr->prop->pos.x, dy = p->y - chr->prop->pos.y, dz = p->z - chr->prop->pos.z;
         f32 d = dx * dx + dy * dy * 4.0f + dz * dz;   /* another floor counts as farther */
         if (d < bestd) {
             bestd = d;
             best = i;
         }
+        if (d >= visibleDist) continue;
+        const int sight = gevrTacticalGuardVisiblePlayer(chr, i);
+        /* Keep the native check for actors the Tactical sight code does
+         * not handle. It must not override an explicitly blocked lane. */
+        if (sight > 0 || (sight < 0 && t->waitingForVisible && d < 4500.0f * 4500.0f
+            && chr->prop->stan && player->stan && check_if_position_in_same_room(chr, p, player->stan))) {
+            visibleDist = d;
+            visiblePlayer = i;
+        }
     }
+    if (t->waitingForVisible) {
+        if (visiblePlayer >= 0 && sysArgCheck("--tactical-coop-test"))
+            COOP_LOG("guard %d retargeted slot %d", chr->chrnum, visiblePlayer);
+        t->waitingForVisible = visiblePlayer < 0;
+    }
+    if (visiblePlayer >= 0 || t->waitingForVisible) best = visiblePlayer;
     t->player = (s8)best;
-    t->until60 = g_GlobalTimer + 60;   /* reconsidered each second */
+    t->until60 = g_GlobalTimer + (t->waitingForVisible ? 12 : 60);
     return best;
 }
 
@@ -506,8 +600,10 @@ s32 gevrCoopGuardTarget(ChrRecord *chr)
 void gevrCoopGuardProvoked(ChrRecord *chr, s32 player)
 {
     s32 slot = coopSlotOf(chr);
-    if (!netCoopActive() || !netIsHost() || slot < 0 || slot >= COOP_MAX_SLOTS || player < 0 || player >= 4) return;
+    if (!netCoopActive() || !netIsHost() || slot < 0 || slot >= COOP_MAX_SLOTS
+        || !coopPlayerTargetable(player)) return;
     s_target[slot].player = (s8)player;
+    s_target[slot].waitingForVisible = false;
     s_target[slot].until60 = g_GlobalTimer + 600;
 }
 
@@ -569,6 +665,7 @@ s32 gevrCoopGuardExplosive(ObjectRecord *obj)
  * (gevrCoopGuardForget) and its blast is the catcher's.
  */
 #define COOP_SHOT_BYTES 130   /* model 2, item 1, droptype 1, guard 2, fuse 4, flags 4, three points 36, two floats 8, two 3x3 72 */
+#define COOP_SHOT_TURRET 0xffffu   /* no model has this ID */
 #define COOP_GUARD_COPIES 32
 static ObjectRecord *s_guard_copy[COOP_GUARD_COPIES];
 static u32 s_guard_copy_next;
@@ -630,10 +727,46 @@ static void coopHostGuardShots(void)
     }
 }
 
-/* A client: the host's guard's explosive, flying here as a copy */
+void gevrCoopTurretSound(int pad, int target, const coord3d *pos)
+{
+    if (!netCoopActive() || !netIsHost()) return;
+    u8 raw[32];
+    struct netbuf buf = {.data = raw, .size = sizeof(raw)};
+    coopHeader(&buf, NET_MSG_COOP_SHOT);
+    netbufWriteU16(&buf, COOP_SHOT_TURRET);
+    netbufWriteU32(&buf, netGetWorldEpoch());
+    netbufWriteU16(&buf, (u16)pad);
+    netbufWriteCoord(&buf, pos);
+    if (buf.error) return;
+    netCoopBroadcast(buf.data, buf.wp, false);
+    if (sysArgCheck("--tactical-coop-test"))
+        sysLogPrintf(LOG_NOTE, "coop turret: host sound pad %d target %d", pad, target);
+}
+
+static void coopReceiveTurretSound(struct netbuf *b)
+{
+    const u32 epoch = netbufReadU32(b);
+    const u16 pad = netbufReadU16(b);
+    coord3d pos;
+    netbufReadCoord(b, &pos);
+    if (b->error || netbufReadLeft(b) || epoch != netGetWorldEpoch()
+        || !isfinite(pos.x) || !isfinite(pos.y) || !isfinite(pos.z)
+        || fabsf(pos.x) > 1.e6f || fabsf(pos.y) > 1.e6f || fabsf(pos.z) > 1.e6f) return;
+    ALSoundState *sound = sndPlaySfx((struct ALBankAlt_s *)g_musicSfxBufferPtr, GUN_B9_CANNON_SHORT_SFX, NULL);
+    if (!sound) return;
+    chrobjSndCreatePostEventDefault(sound, &pos);
+    if (sysArgCheck("--tactical-coop-test"))
+        sysLogPrintf(LOG_NOTE, "coop turret: guest sound pad %u", pad);
+}
+
+/* A client: a turret's sound or the host's guard's explosive in flight. */
 static void coopReceiveShot(struct netbuf *b)
 {
     u16 model = netbufReadU16(b);
+    if (!b->error && model == COOP_SHOT_TURRET) {
+        coopReceiveTurretSound(b);
+        return;
+    }
     u8 item = netbufReadU8(b);
     u8 droptype = netbufReadU8(b);
     u16 guard = netbufReadU16(b);
@@ -722,6 +855,203 @@ void gevrCoopGuardForget(struct ObjectRecord *obj)
 
 /* ---- Damage between guards and players ---- */
 
+enum { COOP_GORE_BLOOD, COOP_GORE_CORPSE, COOP_GORE_CUTS, COOP_GORE_POSE };
+enum { COOP_CORPSE_JOINTS = 16, COOP_CORPSE_JOINT_BYTES = 9 * 2 + 3 * 4 };
+#define COOP_CORPSE_POSE_WAIT_US 5000000ull
+typedef struct {
+    u64 received;
+    u32 epoch, id, sequence;
+    u8 count, final;
+    float joints[COOP_CORPSE_JOINTS][16];
+} CoopCorpsePose;
+/* Death and removal travel on the reliable channel. A newer pose may reach
+ * the guest first, or collect while the guest's guard builds its ragdoll. */
+static CoopCorpsePose s_pendingCorpsePose[24];
+
+static struct {
+    const ChrRecord *chr;
+    coord3d at;
+    int matrix, stabbed;
+} s_impact;
+
+int gevrCoopGuardGore(const ChrRecord *chr)
+{
+    return chr && chr->prop && chr->prop->type == PROP_TYPE_CHR && gevrTacticalLootEnabled();
+}
+
+void gevrCoopGuardImpactPoint(const ChrRecord *chr, const coord3d *at, int matrix, int stabbed)
+{
+    s_impact.chr = at ? chr : NULL;
+    if (!at) return;
+    s_impact.at = *at;
+    s_impact.matrix = matrix;
+    s_impact.stabbed = stabbed;
+}
+
+static int coopFinitePoint(const coord3d *point)
+{
+    return isfinite(point->x) && isfinite(point->y) && isfinite(point->z);
+}
+
+static void coopGoreHeader(struct netbuf *packet, int type)
+{
+    coopHeader(packet, NET_MSG_TACTICAL_GORE);
+    netbufWriteU32(packet, netGetWorldEpoch());
+    netbufWriteU8(packet, type);
+}
+
+static int coopShowBlood(ChrRecord *chr, int weapon, int matrix, int fatal,
+    const coord3d *at, const coord3d *direction)
+{
+    const int room = chr->prop->stan ? getTileRoom(chr->prop->stan) : -1;
+    if (!gevrBloodyCombatImpact(weapon, room, at->f, direction->f)) return 0;
+    if (fatal) gevrBloodyCombatFatalHit(chr->model, matrix, at->f, direction->f);
+    return 1;
+}
+
+void gevrCoopGuardBlood(ChrRecord *chr, int weapon, int matrix, int fatal,
+    const coord3d *at, const coord3d *direction)
+{
+    const int slot = coopSlotOf(chr);
+    if (!netIsHost() || !gevrCoopGuardGore(chr) || slot < 0 || slot >= COOP_MAX_SLOTS ||
+        !coopFinitePoint(at) || !coopFinitePoint(direction)) return;
+    if (!coopShowBlood(chr, weapon, matrix, fatal, at, direction)) return;
+    u8 raw[64];
+    struct netbuf packet = {.data = raw, .size = sizeof(raw)};
+    coopGoreHeader(&packet, COOP_GORE_BLOOD);
+    netbufWriteU16(&packet, slot);
+    netbufWriteS16(&packet, chr->chrnum);
+    netbufWriteU8(&packet, weapon);
+    netbufWriteS16(&packet, matrix);
+    netbufWriteU8(&packet, !!fatal);
+    netbufWriteCoord(&packet, at);
+    netbufWriteCoord(&packet, direction);
+    if (!packet.error) netCoopBroadcast(packet.data, packet.wp, fatal);
+}
+
+void gevrCoopSendCorpse(ChrRecord *chr, const GevrCoopCorpse *corpse)
+{
+    const int slot = coopSlotOf(chr);
+    if (!netIsHost() || !gevrCoopGuardGore(chr) || slot < 0 || slot >= COOP_MAX_SLOTS) return;
+    u8 raw[112];
+    struct netbuf packet = {.data = raw, .size = sizeof(raw)};
+    NetChrState pose;
+    coopCollect(chr, slot, &pose, &s_sent[slot]);
+    pose.fade = 255;
+    pose.speed = 0.f;
+    coopGoreHeader(&packet, COOP_GORE_CORPSE);
+    netbufWriteS16(&packet, chr->chrnum);
+    netbufWriteChrState(&packet, &pose);
+    netbufWriteU32(&packet, corpse->id);
+    netbufWriteU16(&packet, corpse->cuts);
+    netbufWriteU8(&packet, corpse->immediate | (corpse->headBurst << 1) | (corpse->stabbed << 2));
+    netbufWriteU8(&packet, corpse->part);
+    netbufWriteU8(&packet, corpse->weapon);
+    const coord3d direction = {.f = {corpse->direction[0], corpse->direction[1], corpse->direction[2]}};
+    netbufWriteCoord(&packet, &direction);
+    if (!packet.error) netCoopBroadcast(packet.data, packet.wp, true);
+}
+
+void gevrCoopSendCorpseCuts(unsigned id, unsigned cuts)
+{
+    if (!id || !netIsHost() || !gevrTacticalLootEnabled()) return;
+    u8 raw[24];
+    struct netbuf packet = {.data = raw, .size = sizeof(raw)};
+    coopGoreHeader(&packet, COOP_GORE_CUTS);
+    netbufWriteU32(&packet, id);
+    netbufWriteU16(&packet, cuts);
+    if (!packet.error) netCoopBroadcast(packet.data, packet.wp, true);
+}
+
+void netCoopSendCorpsePose(unsigned id, unsigned sequence, int count, const float (*joints)[16], int final)
+{
+    if (!id || !joints || count < 1 || count > COOP_CORPSE_JOINTS ||
+        !netIsHost() || !gevrTacticalLootEnabled()) return;
+
+    u8 raw[32 + COOP_CORPSE_JOINTS * COOP_CORPSE_JOINT_BYTES];
+    struct netbuf packet = {.data = raw, .size = sizeof(raw)};
+    coopGoreHeader(&packet, COOP_GORE_POSE);
+    netbufWriteU32(&packet, id);
+    netbufWriteU32(&packet, sequence);
+    netbufWriteU8(&packet, count);
+    netbufWriteU8(&packet, !!final);
+    /* Physics returns a rigid affine frame. Omit the fixed last column and
+     * quantise its basis so every pose fits in one datagram. */
+    for (int i = 0; i < count; ++i) {
+        for (int axis = 0; axis < 3; ++axis) {
+            for (int k = 0; k < 3; ++k) {
+                const float component = joints[i][4 * axis + k];
+                if (!isfinite(component) || fabsf(component) > 1.01f) return;
+                netbufWriteS16(&packet, (s16)lroundf(fminf(1.f, fmaxf(-1.f, component)) * 32767.f));
+            }
+        }
+        for (int k = 12; k < 15; ++k) {
+            if (!isfinite(joints[i][k]) || fabsf(joints[i][k]) >= 1.e6f) return;
+            netbufWriteF32(&packet, joints[i][k]);
+        }
+    }
+    /* Anchor the first and resting poses. Intermediate motion can be skipped. */
+    if (!packet.error) netCoopBroadcast(packet.data, packet.wp, sequence == 1 || final);
+}
+
+static void coopReceiveCorpsePose(struct netbuf *b, u32 epoch)
+{
+    CoopCorpsePose pose = {.epoch = epoch};
+    pose.id = netbufReadU32(b);
+    pose.sequence = netbufReadU32(b);
+    pose.count = netbufReadU8(b);
+    pose.final = netbufReadU8(b);
+    if (b->error || !pose.id || !pose.count || pose.count > COOP_CORPSE_JOINTS || pose.final > 1 ||
+        netbufReadLeft(b) != (u32)pose.count * COOP_CORPSE_JOINT_BYTES) return;
+    for (int i = 0; i < pose.count; ++i) {
+        float *joint = pose.joints[i];
+        for (int axis = 0; axis < 3; ++axis) {
+            float norm = 0.f;
+            for (int k = 0; k < 3; ++k) {
+                const float component = (float)netbufReadS16(b) / 32767.f;
+                joint[4 * axis + k] = component;
+                norm += component * component;
+            }
+            if (norm < .95f || norm > 1.05f) return;
+        }
+        for (int k = 12; k < 15; ++k) {
+            joint[k] = netbufReadF32(b);
+            if (!isfinite(joint[k]) || fabsf(joint[k]) >= 1.e6f) return;
+        }
+        joint[15] = 1.f;
+    }
+    if (b->error || gevrRagdollReceiveCoopPose(pose.id, pose.sequence, pose.count, pose.joints, pose.final)) return;
+
+    pose.received = sysGetMicroseconds();
+    CoopCorpsePose *slot = NULL;
+    for (int i = 0; i < ARRAYCOUNT(s_pendingCorpsePose); ++i) {
+        CoopCorpsePose *pending = &s_pendingCorpsePose[i];
+        if (pending->id == pose.id && pending->epoch == epoch) {
+            if ((s32)(pose.sequence - pending->sequence) <= 0) return;
+            slot = pending;
+            break;
+        }
+        if (!slot || pending->received < slot->received) slot = pending;
+    }
+    *slot = pose;
+}
+
+void netCoopApplyPendingCorpsePose(unsigned id)
+{
+    if (!id) return;
+    const u32 epoch = netGetWorldEpoch();
+    const u64 now = sysGetMicroseconds();
+    for (int i = 0; i < ARRAYCOUNT(s_pendingCorpsePose); ++i) {
+        CoopCorpsePose *pose = &s_pendingCorpsePose[i];
+        if (pose->id != id || pose->epoch != epoch) continue;
+        if (now - pose->received <= COOP_CORPSE_POSE_WAIT_US)
+            gevrRagdollReceiveCoopPose(id, pose->sequence, pose->count, pose->joints, pose->final);
+        pose->id = 0;
+        pose->received = 0;
+        return;
+    }
+}
+
 static void coopSendGuardDamage(s32 target, f32 damage, f32 vx, f32 vz)
 {
     u8 raw[32];
@@ -747,7 +1077,7 @@ s32 gevrCoopForwardGuardDamage(f32 damage, f32 vx, f32 vz)
 {
     s32 cur = get_cur_playernum();
     if (!g_gevrCoopGuardTick || !netCoopActive() || !netIsHost() || cur == netGetLocalSlot()) return FALSE;
-    if (cur >= 0 && cur < 4 && netSlotOccupied(cur) && isfinite(damage) && damage > 0.0f)
+    if (coopPlayerTargetable(cur) && isfinite(damage) && damage > 0.0f)
         coopSendGuardDamage(cur, damage, vx, vz);
     return TRUE;
 }
@@ -768,7 +1098,7 @@ s32 gevrCoopGuardHitElsewhere(ChrRecord *chr, s32 hitpart, coord3d *vector, s32 
     if (netIsHost()) return shooter != netGetLocalSlot() && !g_gevrCoopApplyingHit;
     if (s_await_remap) return 1;   /* this headset's slots are not the new host's yet */
     if (shooter == netGetLocalSlot() && vector) {
-        u8 raw[40];
+        u8 raw[56];
         struct netbuf buf = { .data = raw, .size = sizeof(raw) };
         netbufStartWrite(&buf);
         netbufWriteU32(&buf, GEVR_NET_MAGIC);
@@ -780,6 +1110,16 @@ s32 gevrCoopGuardHitElsewhere(ChrRecord *chr, s32 hitpart, coord3d *vector, s32 
         netbufWriteU8(&buf, (u8)hitpart);
         netbufWriteU8(&buf, (u8)weaponid);
         netbufWriteCoord(&buf, vector);
+        if (gevrCoopGuardGore(chr)) {
+            const int exact = s_impact.chr == chr;
+            netbufWriteU32(&buf, netGetWorldEpoch());
+            netbufWriteS16(&buf, chr->chrnum);
+            netbufWriteU8(&buf, exact ? 1 | (!!s_impact.stabbed << 1) : 0);
+            if (exact) {
+                netbufWriteS16(&buf, s_impact.matrix);
+                netbufWriteCoord(&buf, &s_impact.at);
+            }
+        }
         netCoopBroadcast(buf.data, buf.wp, true);
         return 2;
     }
@@ -809,16 +1149,45 @@ static void coopApplyHit(int shooter, struct netbuf *b)
     u8 weapon = netbufReadU8(b);
     coord3d vector;
     netbufReadCoord(b, &vector);
-    if (b->error || netbufReadLeft(b) || shooter < 0 || shooter >= 4 || !g_playerPointers[shooter] ||
-        slot >= g_NumChrSlots || weapon >= ITEM_IDS_MAX || !isfinite(vector.x) || !isfinite(vector.y) || !isfinite(vector.z)) return;
+    if (b->error || shooter < 0 || shooter >= 4 || !g_playerPointers[shooter] ||
+        slot >= g_NumChrSlots || weapon >= ITEM_IDS_MAX || !coopFinitePoint(&vector)) return;
     ChrRecord *chr = &g_ChrSlots[slot];
     if (!coopChrLive(chr) || generation != gevrHordeGuardToken(chr)) return;
+    int matrix = -1, exact = 0, stabbed = 0;
+    const int tactical = gevrCoopGuardGore(chr);
+    coord3d at = chr->prop->pos;
+    if (tactical) {
+        const u32 epoch = netbufReadU32(b);
+        const s16 identity = netbufReadS16(b);
+        const u8 flags = netbufReadU8(b);
+        if (epoch != netGetWorldEpoch() || identity != chr->chrnum || (flags != 0 && flags != 1 && flags != 3)) return;
+        exact = !!(flags & 1);
+        stabbed = (flags & 2) && (weapon == ITEM_TACTICAL_KATANA || weapon == ITEM_KNIFE);
+        if (exact) {
+            matrix = netbufReadS16(b);
+            netbufReadCoord(b, &at);
+            const float dx = at.x - chr->prop->pos.x, dy = at.y - chr->prop->pos.y, dz = at.z - chr->prop->pos.z;
+            if (!coopFinitePoint(&at) || dx*dx + dy*dy + dz*dz > 260.f*260.f) return;
+        }
+    }
+    if (b->error || netbufReadLeft(b)) return;
+    const int wasDead = chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD;
+    const float before = chr->damage;
     s32 prev = get_cur_playernum();
     set_cur_player(shooter);
     g_gevrCoopApplyingHit = TRUE;
-    handles_shot_actors(chr, hitpart, &vector, weapon, TRUE);
+    const int applied = handles_shot_actors(chr, hitpart, &vector, weapon, TRUE);
     g_gevrCoopApplyingHit = FALSE;
     set_cur_player(prev);
+    if (tactical && applied && !wasDead && chr->damage > before) {
+        const int fatal = chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD;
+        if (fatal && stabbed)
+            gevrRagdollNoteRemoteStab(chr, weapon, hitpart, vector.f);
+        else if (fatal && weapon == ITEM_TACTICAL_KATANA)
+            gevrRagdollNoteKatanaDeath(chr, hitpart, vector.f);
+        if (exact)
+            gevrCoopGuardBlood(chr, weapon, matrix, fatal, &at, &vector);
+    }
     gevrCoopGuardProvoked(chr, shooter);
 }
 
@@ -828,7 +1197,7 @@ static void coopApplyDamage(struct netbuf *b)
     u8 target = netbufReadU8(b);
     f32 damage = netbufReadF32(b);
     f32 vx = netbufReadF32(b), vz = netbufReadF32(b);
-    if (b->error || netbufReadLeft(b) || target != netGetLocalSlot() || !g_playerPointers[target] ||
+    if (b->error || netbufReadLeft(b) || target != netGetLocalSlot() || !coopPlayerTargetable(target) ||
         !isfinite(damage) || damage <= 0.0f || damage > 100.0f || !isfinite(vx) || !isfinite(vz)) return;
     s32 prev = get_cur_playernum();
     set_cur_player(target);
@@ -840,10 +1209,12 @@ static void coopApplyDamage(struct netbuf *b)
 
 typedef struct {
     NetChrState st;
+    GevrCoopCorpse corpse;
     u32 seq;
     bool valid;
     bool fresh;          /* not applied yet */
     bool firing[2];
+    int retireTicks;
 } CoopPuppet;
 static CoopPuppet s_puppet[COOP_MAX_SLOTS];   /* by the host's slot */
 static s16 s_local_of[COOP_MAX_SLOTS];        /* host slot -> this headset's slot, -1 none */
@@ -854,11 +1225,24 @@ int netCoopHostSlotOf(int localslot)
     return localslot >= 0 && localslot < COOP_MAX_SLOTS ? s_host_of[localslot] : -1;
 }
 
+int netCoopGuardIdle(const ChrRecord *chr)
+{
+    const int slot = netCoopHostSlotOf(coopSlotOf(chr));
+    if (s_await_remap || slot < 0 || slot >= COOP_MAX_SLOTS || !s_puppet[slot].valid) return FALSE;
+    const NetChrState *st = &s_puppet[slot].st;
+    return st->actiontype == ACT_STAND && !(st->flags & (NET_CHR_FIRE_RIGHT | NET_CHR_FIRE_LEFT | NET_CHR_HIDDEN));
+}
+
 void netCoopStageLoaded(void)
 {
     netAllyReset();
+    gevrTacticalLootStageReset();
+    gevrTacticalGearResetRemoteBuilds();
     memset(s_puppet, 0, sizeof(s_puppet));
+    memset(s_pendingCorpsePose, 0, sizeof(s_pendingCorpsePose));
+    s_impact.chr = NULL;
     memset(s_sent, 0, sizeof(s_sent));
+    memset(s_guardVisual, 0, sizeof(s_guardVisual));
     memset(s_target, 0, sizeof(s_target));
     for (int i = 0; i < COOP_MAX_SLOTS; i++) {
         /* the setup's guards: the same slots on every headset */
@@ -906,19 +1290,90 @@ struct ChrRecord *netCoopGuardOfHostSlot(int hostslot)
     return coopChrLive(chr) ? chr : NULL;
 }
 
+static void coopReceiveGore(struct netbuf *b)
+{
+    const u32 epoch = netbufReadU32(b);
+    const u8 type = netbufReadU8(b);
+    if (b->error || !gevrTacticalLootEnabled() || epoch != netGetWorldEpoch() || s_await_remap) return;
+
+    if (type == COOP_GORE_POSE) {
+        coopReceiveCorpsePose(b, epoch);
+        return;
+    }
+    if (type == COOP_GORE_BLOOD) {
+        const u16 slot = netbufReadU16(b);
+        const s16 identity = netbufReadS16(b);
+        const u8 weapon = netbufReadU8(b);
+        const s16 matrix = netbufReadS16(b);
+        const u8 fatal = netbufReadU8(b);
+        coord3d at, direction;
+        netbufReadCoord(b, &at);
+        netbufReadCoord(b, &direction);
+        if (b->error || netbufReadLeft(b) || slot >= COOP_MAX_SLOTS || weapon >= ITEM_IDS_MAX || fatal > 1
+            || !coopFinitePoint(&at) || !coopFinitePoint(&direction)) return;
+        ChrRecord *chr = coopLocalChr(slot);
+        if (coopChrLive(chr) && chr->chrnum == identity)
+            coopShowBlood(chr, weapon, matrix, fatal, &at, &direction);
+        return;
+    }
+    if (type == COOP_GORE_CUTS) {
+        const u32 id = netbufReadU32(b);
+        const u16 cuts = netbufReadU16(b);
+        if (b->error || netbufReadLeft(b) || !id || gevrRagdollApplyCoopCuts(id, cuts)) return;
+        for (int i = 0; i < COOP_MAX_SLOTS; ++i)
+            if (s_puppet[i].corpse.id == id) { s_puppet[i].corpse.cuts |= cuts; break; }
+        return;
+    }
+    if (type != COOP_GORE_CORPSE) return;
+
+    const s16 identity = netbufReadS16(b);
+    NetChrState pose;
+    if (!netbufReadChrState(b, &pose) || pose.slot >= COOP_MAX_SLOTS
+        || (pose.actiontype != ACT_DIE && pose.actiontype != ACT_DEAD)) return;
+    GevrCoopCorpse corpse = {0};
+    corpse.id = netbufReadU32(b);
+    corpse.cuts = netbufReadU16(b);
+    const u8 flags = netbufReadU8(b);
+    corpse.immediate = !!(flags & 1);
+    corpse.headBurst = !!(flags & 2);
+    corpse.stabbed = !!(flags & 4);
+    corpse.part = netbufReadU8(b);
+    corpse.weapon = netbufReadU8(b);
+    coord3d direction;
+    netbufReadCoord(b, &direction);
+    if (b->error || netbufReadLeft(b) || !corpse.id || (flags & ~7)
+        || corpse.weapon >= ITEM_IDS_MAX || !coopFinitePoint(&direction)) return;
+    ChrRecord *chr = coopLocalChr(pose.slot);
+    if (!coopChrLive(chr) || chr->chrnum != identity || pose.generation != gevrHordeGuardToken(chr)) return;
+    memcpy(corpse.direction, direction.f, sizeof(corpse.direction));
+    CoopPuppet *p = &s_puppet[pose.slot];
+    if (p->corpse.id == corpse.id) return;
+    p->st = pose;
+    p->corpse = corpse;
+    p->valid = p->fresh = true;
+}
+
 static void coopReceiveStates(struct netbuf *b)
 {
     u32 seq = netbufReadU32(b);
     u8 count = netbufReadU8(b);
     if (s_await_remap) return;   /* the new host's slots, not yet known */
-    if (b->error || count == 0 || count > NET_CHR_STATES_PER_PACKET || netbufReadLeft(b) != count * NET_CHR_STATE_BYTES) return;
+    if (b->error || count == 0 || count > NET_CHR_STATES_PER_PACKET
+        || netbufReadLeft(b) < count * NET_CHR_STATE_BYTES
+        || netbufReadLeft(b) > count * (NET_CHR_STATE_BYTES + NET_CHR_COVER_BYTES)) return;
+    const bool cover = netCoopSession() && sysArgCheck("--tactical-coop");
+    NetChrState states[NET_CHR_STATES_PER_PACKET];
     for (int i = 0; i < count; i++) {
-        NetChrState st;
-        if (!netbufReadChrState(b, &st)) return;
+        if (!netbufReadChrState(b, &states[i]) || (!cover && (states[i].flags & NET_CHR_COVER))) return;
+    }
+    if (netbufReadLeft(b)) return;
+    for (int i = 0; i < count; i++) {
+        const NetChrState st = states[i];
         if (st.slot >= COOP_MAX_SLOTS) continue;
         if (netHordeActive() && (!gevrHordeTokenCurrent(st.generation)
             || st.generation != gevrHordeGuardToken(coopLocalChr(st.slot)))) continue;
         CoopPuppet *p = &s_puppet[st.slot];
+        if (p->corpse.id) continue;   /* the reliable final pose owns this guard now */
         if (p->valid && (int32_t)(seq - p->seq) < 0) continue;   /* an older packet */
         p->st = st;
         p->seq = seq;
@@ -949,6 +1404,7 @@ static int s_pending_spawns;
 static int coopMakeSpawn(const CoopSpawn *sp)
 {
     u16 hostslot = sp->hostslot;
+    if (s_puppet[hostslot].retireTicks) return 0; /* the final corpse pose gets a tick first */
     ChrRecord *existing = coopLocalChr(hostslot);
     if (existing && coopChrLive(existing) && !(existing->hidden & CHRHIDDEN_REMOVE) &&
         existing->bodynum == sp->body && existing->headnum == sp->head
@@ -1057,6 +1513,17 @@ static void coopReceiveSpawn(struct netbuf *b)
  * on the host: only while this headset's slot still holds that setup guard,
  * so a second roster, or one after a remap, takes no guard it has made since.
  */
+static void coopRemoveLocal(int hostslot, ChrRecord *chr)
+{
+    const int local = s_local_of[hostslot];
+    if (coopChrLive(chr)) chr->hidden |= CHRHIDDEN_REMOVE;
+    memset(&s_puppet[hostslot], 0, sizeof(s_puppet[hostslot]));
+    s_guardVisual[hostslot].valid = 0;
+    s_ai[hostslot].valid = false;
+    s_local_of[hostslot] = -1;
+    if (local >= 0 && local < COOP_MAX_SLOTS && s_host_of[local] == hostslot) s_host_of[local] = -1;
+}
+
 static void coopReceiveRemove(struct netbuf *b)
 {
     u16 hostslot = netbufReadU16(b);
@@ -1076,12 +1543,87 @@ static void coopReceiveRemove(struct netbuf *b)
         }
         if (chr && generation!=gevrHordeGuardToken(chr)) return;
     } else coopForgetPendingSpawn(hostslot);
-    if (chr && coopChrLive(chr)) chr->hidden |= CHRHIDDEN_REMOVE;   /* freed at its next chrTick */
-    s_puppet[hostslot].valid = false;
-    s_ai[hostslot].valid = false;
-    /* the host may fill its slot again before then: a spawn there is a new guard */
-    s_local_of[hostslot] = -1;
-    if (local >= 0 && local < COOP_MAX_SLOTS && s_host_of[local] == hostslot) s_host_of[local] = -1;
+    if (chr && s_puppet[hostslot].corpse.id && !gevrRagdollSuppress(chr)) {
+        s_puppet[hostslot].retireTicks = 2;
+        return;
+    }
+    coopRemoveLocal(hostslot, chr);
+}
+
+extern void gevrTacticalGuardIssueBuild(PropRecord *prop, int build);
+extern void gevrTacticalForgetIssuedGear(const PropRecord *prop);
+
+const GevrGuardEquipment *gevrTacticalRemoteGuardGear(const ChrRecord *chr)
+{
+    if (!chr || !gevrTacticalLootEnabled() || netIsHost()) return NULL;
+    const int local = coopSlotOf(chr);
+    const int host = netCoopHostSlotOf(local);
+    if (host < 0 || host >= COOP_MAX_SLOTS) return NULL;
+    const CoopGuardVisual *visual = &s_guardVisual[host];
+    return visual->valid && visual->epoch == netGetWorldEpoch() && visual->body == chr->bodynum
+        ? &visual->gear : NULL;
+}
+
+static void coopApplyGuardVisual(ChrRecord *chr, const CoopGuardVisual *visual)
+{
+    if (!visual->valid || visual->epoch != netGetWorldEpoch() || visual->body != chr->bodynum) return;
+    gevrTacticalApplyGuardRig(chr, &visual->gear, visual->revision);
+    const int helmet = visual->gear.helmet;
+    PropRecord *hat = chr->handle_positiondata_hat;
+    if (helmet == GEVR_LOADOUT_NO_HELMET && hat && hat->obj) {
+        objFreePermanently(hat->obj, TRUE);
+        chr->handle_positiondata_hat = NULL;
+    } else if (helmet >= 0) {
+        if (!hat) {
+            hatCreateForChr(chr, PROP_HATHELMET, 0);
+        } else if (hat->obj && hat->obj->model && gevrTacticalHelmetKind(hat->obj->model) != helmet) {
+            gevrTacticalHelmetAttach(hat->obj->model, hat->obj, helmet);
+        }
+    }
+
+    for (int hand = GUNRIGHT; hand <= GUNLEFT; ++hand) {
+        PropRecord *weapon = chr->weapons_held[hand];
+        if (!weapon || !weapon->weapon || coopWeaponOf(chr, hand) != visual->item[hand]) continue;
+        if (gevrTacticalGuardIssuedBuild(weapon) == visual->build[hand]) continue;
+        if (visual->build[hand] >= 0) gevrTacticalGuardIssueBuild(weapon, visual->build[hand]);
+        else gevrTacticalForgetIssuedGear(weapon);
+    }
+}
+
+static void coopReceiveGuardVisual(struct netbuf *packet)
+{
+    if (!netCoopSession() || !gevrTacticalGearEnabled()) return;
+    const unsigned epoch = netbufReadU32(packet);
+    const int guard = netbufReadU16(packet);
+    if (epoch != netGetWorldEpoch() || guard >= COOP_MAX_SLOTS || packet->error) return;
+    static unsigned revision;
+    CoopGuardVisual visual = {.epoch = epoch, .valid = 1};
+    visual.body = netbufReadU16(packet);
+    visual.gear.vest = netbufReadS16(packet);
+    visual.gear.helmet = netbufReadS16(packet);
+    visual.gear.count = netbufReadS8(packet);
+    if (packet->error || visual.body >= BODIES_MAX || visual.gear.vest < GEVR_VEST_NONE
+        || visual.gear.vest >= GEVR_VEST_COUNT || visual.gear.helmet < GEVR_LOADOUT_DEFAULT_HELMET
+        || visual.gear.helmet >= GEVR_HELMET_COUNT || visual.gear.count < -1 || visual.gear.count > 3) return;
+    for (int i = 0; i < visual.gear.count; ++i) {
+        const uint32_t id = netbufReadU32(packet);
+        TacticalMagazine *mag = &visual.gear.mags[i];
+        if (!gevrTacticalNetReadMagazine(packet, mag)
+            || (mag->id && !(id & GEVR_RIG_LOOT_ID)) || (!mag->id && id)) return;
+        mag->id = id;
+    }
+    for (int hand = GUNRIGHT; hand <= GUNLEFT; ++hand) {
+        GevrVisualWeapon gun = {0};
+        if (!gevrTacticalReadVisualBuild(packet, &gun)) return;
+        visual.item[hand] = gun.item;
+        visual.build[hand] = gun.build;
+    }
+    if (netbufReadLeft(packet)) return;
+    visual.revision = ++revision;
+    s_guardVisual[guard] = visual;
+    if (sysArgCheck("--tactical-coop-test") && (visual.gear.vest || visual.gear.helmet >= 0))
+        COOP_LOG("guard gear %d body %d vest %d helmet %d rig %d", guard, visual.body,
+            visual.gear.vest, visual.gear.helmet, visual.gear.count);
 }
 
 static void coopSyncHand(ChrRecord *chr, s32 hand, u8 want, bool dying)
@@ -1090,7 +1632,9 @@ static void coopSyncHand(ChrRecord *chr, s32 hand, u8 want, bool dying)
     if (have == want) return;
     if (!want) {
         /* gone on the host: dropped as the guard fell, or put away */
-        if (dying && !netHordeActive()) {
+        const int shared = gevrTacticalLootEnabled()
+            && (gevrTacticalItem(have) >= 0 || gevrTacticalNativeRifle(have));
+        if (dying && !netHordeActive() && !shared) {
             /* chrTick's objDrop needs a projectile before it can detach the gun (#114). */
             propobjSetDropped(chr->weapons_held[hand], DROPTYPE_DEFAULT);
             chr->hidden |= CHRHIDDEN_DROP_HELD_ITEMS;
@@ -1100,7 +1644,13 @@ static void coopSyncHand(ChrRecord *chr, s32 hand, u8 want, bool dying)
     }
     if (chr->weapons_held[hand] && chr->weapons_held[hand]->obj) objFreePermanently(chr->weapons_held[hand]->obj, 1);
     s32 model = (s32)getPropForHeldItem((ITEM_IDS)want);
-    if (model >= 0) chrGiveWeapon(chr, model, (ITEM_IDS)want, (hand == GUNLEFT ? PROPFLAG_WEAPON_LEFTHANDED : 0) | (netHordeActive() ? PROPFLAG_AIUNDROPPABLE : 0));
+    if (model >= 0) {
+        const s32 flags = (hand == GUNLEFT ? PROPFLAG_WEAPON_LEFTHANDED : 0)
+            | (netHordeActive() ? PROPFLAG_AIUNDROPPABLE : 0);
+        if (sysArgCheck("--tactical-coop") && netCoopSession())
+            gevrGiveReplicatedGuardWeapon(chr, model, (ITEM_IDS)want, flags);
+        else chrGiveWeapon(chr, model, (ITEM_IDS)want, flags);
+    }
 }
 
 /*
@@ -1124,6 +1674,10 @@ void netCoopPuppetTick(ChrRecord *chr, s32 tickamount)
         chr->sleep = 0;
     }
     if (!p || !p->valid) return;   /* nothing from the host yet: it stands */
+    if (p->retireTicks && --p->retireTicks == 0) {
+        coopRemoveLocal(hostslot, chr);
+        return;
+    }
 
     NetChrState *st = &p->st;
     bool dying = st->actiontype == ACT_DIE || st->actiontype == ACT_DEAD;
@@ -1147,7 +1701,7 @@ void netCoopPuppetTick(ChrRecord *chr, s32 tickamount)
         } else if (!dying && (chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD)) {
             chr->actiontype = ACT_STAND;   /* up on the host (a late dying state for a slot used again) */
         }
-        if (anim && (model->anim != anim || model->gunhand != flip)) {
+        if (anim && (p->corpse.id || model->anim != anim || model->gunhand != flip)) {
             modelSetAnimation(model, anim, flip, st->frame, st->speed, dying ? 0.0f : 8.0f);
         } else if (anim) {
             f32 diff = model->animframe1 - st->frame;
@@ -1164,6 +1718,7 @@ void netCoopPuppetTick(ChrRecord *chr, s32 tickamount)
             f32 yaw = st->yaw * (M_TAU_F / 65536.0f);
             setsubroty(model, yaw);
         }
+        gevrGuardCoverPoseSet(chr, dying ? GEVR_GUARD_COVER_NONE : st->coverPose, st->coverOffset[0], st->coverOffset[1]);
         chr->aimendlshoulder = st->aim[0] / 10000.0f;
         chr->aimendrshoulder = st->aim[1] / 10000.0f;
         chr->aimendback = st->aim[2] / 10000.0f;
@@ -1172,6 +1727,9 @@ void netCoopPuppetTick(ChrRecord *chr, s32 tickamount)
         coopSyncHand(chr, GUNRIGHT, st->weapon[0], dying);
         coopSyncHand(chr, GUNLEFT, st->weapon[1], dying);
     }
+
+    coopApplyGuardVisual(chr, &s_guardVisual[st->slot]);
+    if (p->corpse.id) gevrRagdollPrepareCoopCorpse(chr, &p->corpse);
 
     /* the host's fire: the flash and the gun's sound while it lasts */
     for (s32 hand = 0; hand < 2; hand++) {
@@ -1195,10 +1753,10 @@ void netCoopPuppetTick(ChrRecord *chr, s32 tickamount)
         getsuboffset(model, &cur);
         f32 dx = st->pos.x - cur.x, dy = st->pos.y - cur.y, dz = st->pos.z - cur.z;
         f32 d2 = dx * dx + dz * dz;
-        if (d2 > 0.25f || dy * dy > 400.0f) {
+        if (p->corpse.id || d2 > 0.25f || dy * dy > 400.0f) {
             coord3d next = cur;
             StandTile *tile = chr->prop->stan;
-            bool snap = d2 > 200.0f * 200.0f || dy * dy > 150.0f * 150.0f;
+            bool snap = p->corpse.id || d2 > 200.0f * 200.0f || dy * dy > 150.0f * 150.0f;
             f32 k = snap ? 1.0f : 0.25f;
             next.x += dx * k;
             next.z += dz * k;
@@ -1830,7 +2388,7 @@ s32 gevrCoopNearestPlayer(const coord3d *pos)
     for (int i = 0; i < 4; i++) {
         coord3d *p;
         f32 dx, dy, dz, d;
-        if (!coopPlayerTargetable(i) || !g_playerPointers[i]->prop) continue;
+        if (!coopPlayerTargetable(i)) continue;
         p = &g_playerPointers[i]->prop->pos;
         dx = p->x - pos->x;
         dy = p->y - pos->y;
@@ -2605,6 +3163,13 @@ static void coopSendRoster(int slot)
             if (!buf.error) netCoopSendTo(slot, buf.data, buf.wp);
             spawns++;
         }
+        if (live && netCoopSession() && gevrTacticalGearEnabled()) {
+            const int builds[2] = {gevrTacticalGuardIssuedBuild(chr->weapons_held[GUNRIGHT]),
+                gevrTacticalGuardIssuedBuild(chr->weapons_held[GUNLEFT])};
+            GevrGuardEquipment gear;
+            gevrTacticalGuardEquipment(chr, &gear);
+            coopGuardVisualSend(chr, s, slot, builds, &gear);
+        }
     }
     if (s_roster_join[slot] && !netSlotIsSpectator(slot) && sysGetMicroseconds() - s_stage_loaded_us > COOP_PLACE_AFTER_US) {
         int beside = coopBesideWhom(slot);
@@ -2744,6 +3309,7 @@ void netCoopHostLost(int oldhost, int elected)
 {
     if (!netCoopActive()) return;
     netCoopSlotLeft(oldhost);
+    memset(s_pendingCorpsePose, 0, sizeof(s_pendingCorpsePose));
     if (!elected) {
         s_await_remap = true;   /* the new host's slots, from its remap */
         s_await_since_us = sysGetMicroseconds();
@@ -2793,8 +3359,7 @@ void netCoopBecameHost(void)
     }
     for (int i = 0; i < COOP_MAX_SLOTS; i++) {
         s_sent[i].sent = false;
-        s_target[i].player = -1;
-        s_target[i].until60 = 0;
+        s_target[i] = (CoopTarget){ .player = -1 };
     }
     gevrAllyBecameHost();
     s_mission_check_us = s_mission_sent_us = 0;
@@ -2887,6 +3452,8 @@ void netCoopReceive(int type, int slot, int from_host, struct netbuf *b)
         case NET_MSG_COOP_CLOCK: if (from_host && !netIsHost()) coopReceiveClock(b); break;
         case NET_MSG_COOP_SCRIPT: if (from_host && !netIsHost()) coopReceiveScript(b); break;
         case NET_MSG_COOP_POKES: if (from_host && !netIsHost()) coopReceivePokes(b); break;
+        case NET_MSG_TACTICAL_GUARD: if (from_host && !netIsHost()) coopReceiveGuardVisual(b); break;
+        case NET_MSG_TACTICAL_GORE: if (from_host && !netIsHost()) coopReceiveGore(b); break;
         case NET_MSG_COOP_SHOT: if (from_host && !netIsHost()) coopReceiveShot(b); break;
         case NET_MSG_COOP_TEXT: if (from_host && !netIsHost()) coopReceiveText(b); break;
         case NET_MSG_COOP_GRANT: if (from_host && !netIsHost()) coopReceiveGrant(b); break;

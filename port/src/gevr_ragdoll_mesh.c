@@ -85,7 +85,7 @@ int rdCut(RdBody *rd,int part)
     rd->cuts|=1u<<part;
     for(int i=0;i<rd->nmeshes;i++)rdPatch(rd,&rd->meshes[i]);
     rdBuildCaps(rd);
-    pdphysRagdollDetach(rd->handle,part);
+    if (rd->handle >= 0) pdphysRagdollDetach(rd->handle,part);
     return 1;
 }
 
@@ -370,10 +370,14 @@ Gfx *rdDrawCaps(RdBody *rd,Gfx *gdl)
     gSPSetGeometryMode(gdl++,G_ZBUFFER|G_SHADE|G_SHADING_SMOOTH);
     if(rd->alpha<255) { gDPSetRenderMode(gdl++,G_RM_AA_ZB_XLU_SURF,G_RM_AA_ZB_XLU_SURF2); }
     else { gDPSetRenderMode(gdl++,G_RM_AA_ZB_OPA_SURF,G_RM_AA_ZB_OPA_SURF2); }
-    for(int i=0;i<rd->ncaps;i++)
-        if(!rd->nbean || !rdBeanCovers(rd,&rd->caps[i]))gdl=rdFan(rd,&rd->caps[i],gdl);
+    for (int i = 0; i < rd->ncaps; ++i) {
+        const RdCap *cap = &rd->caps[i];
+        if (rd->hiddenHead && cap->childside && cap->cut == rd->body[2]) continue;
+        if (!rd->nbean || !rdBeanCovers(rd, cap)) gdl = rdFan(rd, cap, gdl);
+    }
     /* Bean's rims: a fan from their centre, in the skin's anchor space */
     for(int i=0;i<rd->nbean;i++) {
+        if (rd->hiddenHead && rd->bean[i].piece == rd->body[2] + 1) continue;
         RdCap cap={0};
         cap.matrix=rd->bean[i].matrix; cap.numedges=rd->bean[i].nedges;
         cap.edges=dynAllocate((size_t)cap.numedges*sizeof(*cap.edges));

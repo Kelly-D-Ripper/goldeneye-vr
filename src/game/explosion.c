@@ -872,17 +872,21 @@ void explosionInflictDamage(PropRecord *arg0, f32 horiz_range, f32 vert_range)
 
                         minfrac *= minfrac;
                         minfrac = minfrac * EXPLOSION_DAMAGE_SCALER * temp_s6->damage;
-#ifdef GEVR
-                        gevrRagdollExplosionChr(temp_s0->chr, &arg0->pos, temp_s6->dmg_range, temp_s6->damage);
-#endif
-
                         if (temp_s0->type == PROP_TYPE_CHR)
                         {
+#ifdef GEVR
+                            if (chrlvExplosionDamage(temp_s0->chr, &arg0->pos, minfrac, 1))
+                                gevrRagdollExplosionChr(temp_s0->chr, &arg0->pos, temp_s6->dmg_range, temp_s6->damage);
+#else
                             chrlvExplosionDamage(temp_s0->chr, &arg0->pos, minfrac, 1);
+#endif
                         }
                         else
                         {
                             s32 sp90;
+#ifdef GEVR
+                            gevrRagdollExplosionChr(temp_s0->chr, &arg0->pos, temp_s6->dmg_range, temp_s6->damage);
+#endif
 
                             if ((xdist != 0.0f) || (zdist != 0.0f))
                             {

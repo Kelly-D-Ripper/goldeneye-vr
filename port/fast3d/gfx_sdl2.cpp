@@ -59,6 +59,7 @@ int mirror_height = 960;
 
 static int  mirror_eye_index   = 0;
 static bool mirror_sbs = false;  // false = one eye, true = side by side
+static bool mirror_fullscreen_requested = false;
 static bool imgui_initialized  = false;
 #ifndef ANDROID
 // The mirror window's toolbar has its own ImGui context. The in-VR launcher and
@@ -82,6 +83,7 @@ static int  mirror_saved_w     = 916;
 static int  mirror_saved_h     = 960;
 
 extern "C" void  gfx_opengl_load_mirror_logo(const char* path);
+extern "C" void  mirror_apply_size(bool enabled);
 extern "C" unsigned int gfx_opengl_get_logo_tex();
 extern int logo_w;
 extern int logo_h;
@@ -461,6 +463,7 @@ static void gfx_sdl_init(const struct GfxWindowInitSettings *set) {
         mirror_enabled = true;
         mirror_sbs = true;
     }
+    mirror_fullscreen_requested = sysArgCheck("--mirror-fullscreen");
 
     mirror_wnd = SDL_CreateWindow(
             "GoldenEye VR - Mirror",
@@ -619,7 +622,10 @@ static void gfx_sdl_handle_events(void) {
         switch (event.type) {
             case SDL_KEYDOWN:
                 if (event.key.keysym.sym == SDLK_RETURN && (event.key.keysym.mod & KMOD_ALT)) {
-                    set_fullscreen(!fullscreen_state, true);
+                    if (mirror_wnd && event.key.windowID == SDL_GetWindowID(mirror_wnd) && mirror_enabled) {
+                        mirror_fullscreen_requested = !mirror_fullscreen_requested;
+                        mirror_apply_size(true);
+                    } else set_fullscreen(!fullscreen_state, true);
                 }
                 break;
             case SDL_WINDOWEVENT:
@@ -651,7 +657,8 @@ static void gfx_sdl_handle_events(void) {
                     } else {
                         corrected_h = (int) (new_w / target_ratio);
                     }
-                    if (corrected_w != new_w || corrected_h != new_h) {
+                    if (!(SDL_GetWindowFlags(mirror_wnd) & SDL_WINDOW_FULLSCREEN) &&
+                        (corrected_w != new_w || corrected_h != new_h)) {
                         SDL_SetWindowSize(mirror_wnd, corrected_w, corrected_h);
                     }
 
@@ -736,16 +743,32 @@ extern "C" bool gfx_sdl_is_mirror_sbs() {
     return mirror_sbs;
 }
 
+extern "C" bool gfx_sdl_is_mirror_fullscreen() {
+    return mirror_wnd && (SDL_GetWindowFlags(mirror_wnd) & SDL_WINDOW_FULLSCREEN) != 0;
+}
+
 extern "C" void mirror_apply_size(bool enabled) {
     if (enabled) {
-  // Restore the saved size
-        SDL_SetWindowSize(mirror_wnd, mirror_saved_w, mirror_saved_h);
+        if (!mirror_wnd) return;
+        if (!mirror_fullscreen_requested) {
+            SDL_SetWindowFullscreen(mirror_wnd, 0);
+            SDL_SetWindowSize(mirror_wnd, mirror_saved_w, mirror_saved_h);
+        }
         SDL_SetWindowResizable(mirror_wnd, SDL_TRUE);
         SDL_ShowWindow(mirror_wnd);   // started enabled (--mirror-sbs): the branch below never ran
+        if (mirror_fullscreen_requested && SDL_SetWindowFullscreen(mirror_wnd, SDL_WINDOW_FULLSCREEN_DESKTOP) != 0)
+            sysLogPrintf(LOG_WARNING, "SDL: mirror fullscreen failed: %s", SDL_GetError());
+        SDL_GL_GetDrawableSize(mirror_wnd, &mirror_width, &mirror_height);
+        sysLogPrintf(LOG_NOTE, "SDL: mirror %s drawable %dx%d", gfx_sdl_is_mirror_fullscreen() ? "fullscreen" : "windowed", mirror_width, mirror_height);
     } else {
+        if (!mirror_wnd) return;
+        const bool was_fullscreen = gfx_sdl_is_mirror_fullscreen();
+        if (was_fullscreen) SDL_SetWindowFullscreen(mirror_wnd, 0);
 // Save the current size then collapse
-        mirror_saved_w = mirror_width;
-        mirror_saved_h = mirror_height;
+        if (!was_fullscreen) {
+            mirror_saved_w = mirror_width;
+            mirror_saved_h = mirror_height;
+        }
         SDL_SetWindowResizable(mirror_wnd, SDL_FALSE); // Prevent resizing in collapsed mode
         gfx_opengl_load_mirror_logo("logo.bmp");
         SDL_SetWindowSize(mirror_wnd, (float)logo_w, (float)logo_h + 36); // 36 is toolbar height

@@ -60,8 +60,17 @@ typedef struct RdCap {
 
 typedef struct RdBody {
     int handle, count, matrices, root, used;
-    unsigned serial, cuts;
-    float age, alpha;
+    int guardActor;
+    int rig, rigMatrix, woundMatrix, hiddenHead, bladeHeld;
+    unsigned serial, cuts, coopId;
+    unsigned coopSequence;
+    int coopReplica, coopSettled, coopReactionAnchored;
+    float coopPoseTime;
+    Mtxf coopFrom[RD_PARTS], coopTo[RD_PARTS];
+    float age, alpha, fadeEnd;
+    struct {
+        int active, started, hit, limb, hand, nextPulse, pulses, contacted;
+    } reaction;
     Model model;
     RdMemory *memory;
     RdMesh meshes[64];

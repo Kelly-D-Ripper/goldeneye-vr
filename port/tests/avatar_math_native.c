@@ -93,4 +93,29 @@ static void history(void) {
     p=identity();p.body_yaw=90;gevrPosePush(&fresh,&p,anchor,3,1,2040000);
     assert(gevrPoseSample(&fresh,2070000,&out,w));near(out.body_yaw,90);
 }
-int main(void) {arms();rotations();protocol();history();puts("avatar: solver, rotations, protocol, interpolation/reset checks passed");return 0;}
+static void guardCoverProtocol(void)
+{
+    uint8_t raw[NET_CHR_STATE_BYTES * 2 + NET_CHR_COVER_BYTES];
+    struct netbuf b={.data=raw,.size=sizeof(raw)};
+    NetChrState party={0}, peek={0}, result;
+    party.slot=5;
+    peek.slot=6; peek.flags=NET_CHR_COVER; peek.coverPose=GEVR_GUARD_COVER_LEAN_LEFT;
+    peek.coverOffset[0]=-56; peek.coverOffset[1]=25;
+    netbufStartWrite(&b); netbufWriteChrState(&b,&party);
+    assert(b.wp==NET_CHR_STATE_BYTES);
+    netbufWriteChrState(&b,&peek); assert(!b.error && b.wp==sizeof(raw));
+    netbufStartReadData(&b,raw,sizeof(raw));
+    assert(netbufReadChrState(&b,&result) && result.slot==5 && result.coverPose==GEVR_GUARD_COVER_NONE);
+    assert(netbufReadChrState(&b,&result) && result.slot==6 && result.coverPose==peek.coverPose);
+    assert(result.coverOffset[0]==-56 && result.coverOffset[1]==25 && !netbufReadLeft(&b));
+    netbufStartReadData(&b,raw+NET_CHR_STATE_BYTES,NET_CHR_STATE_BYTES+NET_CHR_COVER_BYTES-1);
+    assert(!netbufReadChrState(&b,&result));
+    raw[sizeof(raw)-NET_CHR_COVER_BYTES]=GEVR_GUARD_COVER_DUCK;
+    netbufStartReadData(&b,raw+NET_CHR_STATE_BYTES,NET_CHR_STATE_BYTES+NET_CHR_COVER_BYTES);
+    assert(!netbufReadChrState(&b,&result));
+    raw[sizeof(raw)-NET_CHR_COVER_BYTES]=GEVR_GUARD_COVER_BLIND_RIGHT;
+    raw[sizeof(raw)-1]=127;
+    netbufStartReadData(&b,raw+NET_CHR_STATE_BYTES,NET_CHR_STATE_BYTES+NET_CHR_COVER_BYTES);
+    assert(!netbufReadChrState(&b,&result));
+}
+int main(void) {arms();rotations();protocol();history();guardCoverProtocol();puts("avatar: solver, rotations, protocol, interpolation/reset checks passed");return 0;}

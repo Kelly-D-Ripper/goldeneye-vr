@@ -8,7 +8,8 @@
 #include "game/chr.h"
 #include "game/chraction.h"
 #include "game/player.h"
-#include "aicommands2.h"
+#include "bondaicommands.h"
+#include "system.h"
 
 #define SLOTS 64
 static ChrRecord slots[SLOTS];
@@ -22,7 +23,18 @@ static bool network;
 static bool host, coop, host_fast;
 static s32 players = 1, free_slots = 64, next_slot = 1;
 static ChrRecord *physicsBody;
+static bool tactical, rejectWeapon;
+static f32 stageTime;
+static const void *cloneCheckList;
+static PropRecord weapons[SLOTS][2];
+static WeaponObjRecord weaponsData[SLOTS][2];
+s32 sysArgCheck(const char *key) { return tactical && (!strcmp(key, "--tactical-physical") || !strcmp(key, "--tactical-guards")); }
+void sysLogPrintf(int level, const char *format, ...) {}
+f32 lvlGetStageTimeSec(void) { return stageTime; }
+int gevrCampaignGunIsFirearm(int item) { return item == ITEM_TT33 || item == ITEM_AK47; }
+void gevrCampaignFinishGuard(ChrRecord *chr, int equipUnarmed) {}
 s32 gevrRagdollSuppress(ChrRecord *chr) { return chr == physicsBody; }
+void gevrEnemyRigRetireChr(ChrRecord *chr) { (void)chr; }
 
 bool netIsActive(void) { return network; }
 s32 gevrCoopHostGuards(void) { return network && host && coop; }
@@ -30,9 +42,28 @@ s32 gevrCoopFastReinforcements(void) { return network && coop && host_fast; }
 void gevrCoopChrIdentityChanged(ChrRecord *chr) { (void)chr; }
 s32 getPlayerCount(void) { return players; }
 s32 chrGetNumFree(void) { return free_slots; }
-AIRecord *ailistFindById(s32 id) { (void)id; return NULL; }
-PropRecord *chrGetEquippedWeaponProp(ChrRecord *chr, GUNHAND hand) { return NULL; }
-PropRecord *chrGiveWeapon(ChrRecord *chr, s32 model, ITEM_IDS item, s32 flags) { return NULL; }
+AIRecord *ailistFindById(s32 id)
+{
+    return id == GAILIST_TRY_CLONE_SEND_OR_RUN_TO_BOND ? (AIRecord *)cloneCheckList : NULL;
+}
+PropRecord *chrGetEquippedWeaponProp(ChrRecord *chr, GUNHAND hand) { return chr->weapons_held[hand]; }
+PropRecord *chrGiveWeapon(ChrRecord *chr, s32 model, ITEM_IDS item, s32 flags)
+{
+    if (rejectWeapon) return NULL;
+    const int slot = (int)(chr - slots);
+    const int hand = flags & PROPFLAG_WEAPON_LEFTHANDED ? GUNLEFT : GUNRIGHT;
+    PropRecord *prop = &weapons[slot][hand];
+    prop->type = PROP_TYPE_WEAPON;
+    prop->weapon = &weaponsData[slot][hand];
+    prop->weapon->weaponnum = item;
+    prop->weapon->obj = model;
+    prop->weapon->model = &models[slot];
+    return chr->weapons_held[hand] = prop;
+}
+PropRecord *gevrCloneGuardWeapon(ChrRecord *chr, const PropRecord *source, s32 flags)
+{
+    return chrGiveWeapon(chr, source->weapon->obj, source->weapon->weaponnum, flags);
+}
 void propweaponSetDual(WeaponObjRecord *left, WeaponObjRecord *right) {}
 PropRecord *hatCreateForChr(ChrRecord *chr, s32 model, u32 flags) { return NULL; }
 static s32 chraiGoToLabel(void *list, s32 offset, u8 label) { return 1000 + label; }
@@ -60,6 +91,7 @@ PropRecord *chrSpawnAtChr(ChrRecord *self, s32 body, s32 head, s32 id, AIRecord 
 
 /* INSERT_BODIES */
 /* INSERT_LOOKUPS */
+/* INSERT_REINFORCEMENTS */
 
 static s32 run_ai(ChrRecord *ChrEntityp, void *AiListp)
 {
@@ -92,6 +124,9 @@ static ChrRecord *reset(int bodies, int fast)
     VrBodiesStay = bodies;
     VrFastReinforcements = fast;
     physicsBody = NULL;
+    tactical = rejectWeapon = FALSE;
+    cloneCheckList = NULL;
+    stageTime = 0.f;
     network = FALSE; players = 1; free_slots = 63; next_slot = 1; g_ClockTimer = 0;
     host = coop = host_fast = FALSE;
     ChrRecord *parent = make_chr(0, 5);
@@ -228,11 +263,93 @@ static void coop_mode(void)
     host_fast=TRUE;coop=FALSE;assert(!gone(parent,(u8)CHR_CLONE)); /* deathmatch */
 }
 
+#ifdef TEST_TACTICAL_REINFORCEMENTS
+static bool mayReinforce(ChrRecord *parent, bool standardList)
+{
+    AiIFChrDoesNotExistRecord ai = { .cmd = AI_IFChrDoesNotExist, .CHR_NUM = (u8)CHR_CLONE, .GOTOLABEL = 7 };
+    cloneCheckList = standardList ? &ai : NULL;
+    const bool result = run_ai(parent, &ai) == 1007;
+    cloneCheckList = NULL;
+    return result;
+}
+
+static bool sendReinforcement(ChrRecord *parent)
+{
+    AiTRYCloningChrRecord ai = { .cmd = AI_TRYCloningChr, .CHR_NUM = (u8)CHR_SELF,
+        .AI_LIST_ID = htons(GAILIST_STANDARD_CLONE), .GOTOLABEL = 7 };
+    return run_ai(parent, &ai) == 1007;
+}
+
+static void tactical_pacing(void)
+{
+    ChrRecord *parent = reset(48, 1);
+    tactical = TRUE;
+    gevrTacticalReinforcementsReset(LEVELID_ARCHIVES);
+    for (int i = 0; i < 12; ++i) {
+        const int at = next_slot;
+        assert(mayReinforce(parent, TRUE) && sendReinforcement(parent));
+        assert(slots[at].tacticalReinforcement && slots[at].weapons_held[GUNRIGHT]);
+        assert(!mayReinforce(parent, TRUE) && !sendReinforcement(parent)); /* cooldown applies to both opcodes */
+        assert(!mayReinforce(parent, FALSE)); /* custom scripts still see the living clone */
+        stageTime += 2.5f;
+        if (i >= 3) {
+            assert(!mayReinforce(parent, TRUE)); /* four living clones, including old IDs */
+            slots[at - 3].actiontype = ACT_DIE;
+        }
+    }
+    for (int i = 1; i < next_slot; ++i) slots[i].actiontype = ACT_DEAD;
+    assert(!mayReinforce(parent, TRUE) && !sendReinforcement(parent)); /* mission budget spent */
+    gevrTacticalReinforcementsReset(LEVELID_SURFACE);
+    for (int i = 0; i < 6; ++i) {
+        assert(sendReinforcement(parent));
+        stageTime += 2.f;
+    }
+    assert(!sendReinforcement(parent)); /* wider maps allow six living */
+}
+
+static void tactical_arming(void)
+{
+    ChrRecord *parent = reset(48, 1);
+    tactical = TRUE;
+    gevrTacticalReinforcementsReset(LEVELID_ARCHIVES);
+    chrGiveWeapon(parent, PROP_CHRTT33, ITEM_TT33, 0);
+    assert(sendReinforcement(parent));
+    ChrRecord *first = chrFindById(parent, (u8)CHR_CLONE);
+    assert(first && first->weapons_held[GUNRIGHT]->weapon->weaponnum == ITEM_TT33);
+
+    stageTime = 2.5f;
+    rejectWeapon = TRUE;
+    const int rejected = next_slot;
+    assert(!sendReinforcement(parent));
+    assert(slots[rejected].hidden & CHRHIDDEN_REMOVE);
+    assert(!slots[rejected].tacticalReinforcement && s_reinforcementCount == 1);
+    assert(chrFindById(parent, (u8)CHR_CLONE) == first);
+
+    rejectWeapon = FALSE;
+    parent->weapons_held[GUNRIGHT] = NULL;
+    assert(sendReinforcement(parent));
+    ChrRecord *second = chrFindById(parent, (u8)CHR_CLONE);
+    assert(second != first && second->weapons_held[GUNRIGHT]->weapon->weaponnum == ITEM_AK47);
+
+    parent = reset(48, 0);
+    tactical = TRUE;
+    gevrTacticalReinforcementsReset(LEVELID_ARCHIVES);
+    assert(sendReinforcement(parent));
+    assert(!mayReinforce(parent, TRUE)); /* Fast off uses the retail clone check */
+    ChrRecord *clone = chrFindById(parent, (u8)CHR_CLONE);
+    clone->model = NULL;
+    assert(mayReinforce(parent, TRUE) && sendReinforcement(parent));
+}
+#endif
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "timing")) { timing(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "tracking")) { tracking(); return 0; }
     timing(); tracking(); retention_changes(); physics_handoff(); fast_mode(); coop_mode();
+#ifdef TEST_TACTICAL_REINFORCEMENTS
+    tactical_pacing(); tactical_arming();
+#endif
     printf("PASS: %d-tick fade parity, all body counts, replacement IDs, optional swarm and host-controlled co-op\n",
            CHRLV_TICK_DEAD_CHECK);
     return 0;

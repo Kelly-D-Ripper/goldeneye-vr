@@ -1,3 +1,4 @@
+#include "gevr_android_paths.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -301,7 +302,7 @@ static void gevrPollInjectedInput(void)
 #ifdef GEVR_IOS
 	const char *path = "gevr_input.txt";   /* Apple: the app's Documents (its working folder) */
 #else
-	const char *path = "/sdcard/Android/data/com.gevr.port/files/gevr_input.txt";
+	const char *path = GEVR_ANDROID_EXTERNAL_FILES "/gevr_input.txt";
 #endif
 	if (gevrInjectUntilUs) {
 		if (sysGetMicroseconds() >= gevrInjectUntilUs) gevrInjectEnd();
@@ -342,6 +343,8 @@ static void gevrPollInjectedInput(void)
 
 void osContGetReadData(OSContPad *pad)
 {
+	extern s32 gevrTacticalCoopPadSlot(void);
+	const s32 coopSlot = gevrTacticalCoopPadSlot();
 	gevrPollInjectedInput();
 	// game always passes in an array of 4 OSContPads
 	for (s32 i = 0; i < MAXCONTROLLERS; ++i, ++pad) {
@@ -350,7 +353,8 @@ void osContGetReadData(OSContPad *pad)
 		pad->stick_y = 0;
 		pad->rstick_x = 0;
 		pad->rstick_y = 0;
-		if (inputReadController(i, pad) < 0) {
+		/* The co-op owner's pad is polled once in joyConsumeSamplesWrapper. */
+		if (i != coopSlot && inputReadController(i, pad) < 0) {
 			pad->errnum = CONT_NO_RESPONSE_ERROR;
 		} else {
 			pad->errnum = 0;

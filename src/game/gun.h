@@ -350,6 +350,18 @@ void gunFireTankShell(s32 hand);
 void generate_player_thrown_grenade(s32 hand);
 void generate_player_thrown_knife(s32 hand);
 void generate_player_thrown_object(s32 hand);
+#ifdef GEVR
+u16 gevrTacticalShotSound(ITEM_IDS item, s32 suppressed);
+s32 gevrTacticalGadgetsEnabled(void);
+s32 gevrTacticalGuidedThrow(s32 item);
+void gevrTacticalThrowVelocity(s32 hand, coord3d *velocity);
+void gevrTacticalReleaseGadget(GUNHAND hand);
+s32 gevrPlayerHasLiveRemoteMines(void);
+s32 gevrTacticalHandheldDetonator(s32 item);
+s32 gevrTacticalPrimeGadget(GUNHAND hand);
+void gevrTacticalGadgetInput(s32 triggerOn[2]);
+void gevrTacticalDecoderTick(GUNHAND hand);
+#endif
 
 #ifdef GEVR
 extern s32 g_gevrMotionThrowActive[2];

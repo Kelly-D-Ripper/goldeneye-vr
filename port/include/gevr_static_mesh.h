@@ -29,6 +29,7 @@ typedef struct GevrWorldVertex {
 typedef struct GevrStaticMeshRun {
     const void *start, *end;   /* the run's first command and the one after it */
     uint32_t firstIndex, indexCount;
+    uint32_t firstLowIndex, lowIndexCount;
     float lo[3], hi[3];
     int hasBounds; // static room chunks; skinned runs use their pose, not this box
 } GevrStaticMeshRun;
@@ -41,7 +42,9 @@ typedef struct GevrStaticMesh {
     uint32_t numIndices;
     const GevrStaticMeshRun *runs;
     uint32_t numRuns;
-    void *gpu;                 /* the renderer's buffers, made when first drawn */
+    void *gpu;                 /* retained in the renderer's current context */
+    uint32_t numIndicesWithLod;
+    int tacticalGear;          /* rigid gear lives independently of the Bean texture pack */
     /* Optional, for the buffers only: each distinct vertex once and indices
      * into them (numIndices of them). A Bean skin repeats every shared corner
      * per triangle, the layout its CPU pose and the list's loads keep. */
@@ -58,6 +61,8 @@ extern "C" {
  * gevrBeanEmitList); NULL when it has none, or a triangle uses a vertex an
  * earlier run loaded. */
 GevrStaticMesh *gevrStaticMeshBuild(const void *gdl);
+GevrStaticMesh *gevrStaticMeshBuildGear(const void *gdl, int makeLod);
+void gfx_static_mesh_prepare(GevrStaticMesh *mesh);
 /* Gives its GPU buffers back (gfx_pc.cpp) and frees it. */
 void gevrStaticMeshFree(GevrStaticMesh *mesh);
 /* gfx_pc.cpp: the renderer forgets a mesh's buffers before the mesh goes. */

@@ -30,6 +30,7 @@
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
 #include <Jolt/Physics/Constraints/SwingTwistConstraint.h>
 #include <Jolt/Physics/Constraints/HingeConstraint.h>
+#include <Jolt/Physics/Constraints/SixDOFConstraint.h>
 #include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
 #include <Jolt/Physics/Collision/Shape/StaticCompoundShape.h>
@@ -655,6 +656,8 @@ struct Ragdoll {
 	BodyID bodies[PDPHYS_MAX_RAGDOLL_PARTS];
 	Mat44 bodyToJoint[PDPHYS_MAX_RAGDOLL_PARTS]; // joint frame relative to body frame (metres)
 	std::vector<Ref<Constraint>> constraints;
+	Ref<SixDOFConstraint> pointAttachment;
+	int attachmentPart = -1;
 	Ref<GroupFilterTable> filter;
 	Constraint *partConstraint[PDPHYS_MAX_RAGDOLL_PARTS]; // constraint to the parent (owned by 'constraints'), or null
 	int partJoint[PDPHYS_MAX_RAGDOLL_PARTS];              // PDPHYS_JOINT_*
@@ -1584,6 +1587,9 @@ void destroyRagdoll(Ragdoll &rd)
 	}
 
 	if (g_World) {
+		if (rd.pointAttachment != nullptr) {
+			g_World->system.RemoveConstraint(rd.pointAttachment);
+		}
 		for (Ref<Constraint> &c : rd.constraints) {
 			g_World->system.RemoveConstraint(c);
 		}
@@ -1606,6 +1612,8 @@ void destroyRagdoll(Ragdoll &rd)
 	}
 
 	rd.constraints.clear();
+	rd.pointAttachment = nullptr;
+	rd.attachmentPart = -1;
 	rd.filter = nullptr;
 	rd.numparts = 0;
 	rd.used = false;
@@ -1930,6 +1938,54 @@ extern "C" void pdphysRagdollDestroy(int handle)
 	}
 }
 
+extern "C" int pdphysRagdollAttachPoint(int handle, int part, const float point[3])
+{
+	if (!g_World || !ragdollLive(handle)) return 0;
+	Ragdoll &rd = g_Ragdolls[handle];
+	if (part < 0 || part >= rd.numparts || rd.pointAttachment != nullptr) return 0;
+
+	// Position motors give the contact a little compliance so walls and the
+	// floor can resist it. No rotation axis is driven.
+	SixDOFConstraintSettings settings;
+	settings.mPosition2 = RVec3(vecFromUnits(point));
+	for (int axis = 0; axis < SixDOFConstraintSettings::NumTranslation; axis++) {
+		settings.mMotorSettings[axis] = MotorSettings(12.0f, 1.0f, 1900.0f, 0.0f);
+	}
+	BodyInterface &bi = g_World->system.GetBodyInterface();
+	const BodyID body = rd.bodies[part];
+	auto *attachment = static_cast<SixDOFConstraint *>(bi.CreateConstraint(&settings, BodyID(), body));
+	if (!attachment) return 0;
+	for (int axis = 0; axis < SixDOFConstraintSettings::NumTranslation; axis++) {
+		attachment->SetMotorState(static_cast<SixDOFConstraintSettings::EAxis>(axis), EMotorState::PositionAndVelocity);
+	}
+	attachment->SetTargetPositionCS(vecFromUnits(point));
+	g_World->system.AddConstraint(attachment);
+	rd.pointAttachment = attachment;
+	rd.attachmentPart = part;
+	bi.ActivateBody(body);
+	return 1;
+}
+
+extern "C" void pdphysRagdollMovePoint(int handle, const float point[3], const float velocity[3])
+{
+	if (!g_World || !ragdollLive(handle)) return;
+	Ragdoll &rd = g_Ragdolls[handle];
+	if (rd.pointAttachment == nullptr) return;
+	rd.pointAttachment->SetTargetPositionCS(vecFromUnits(point));
+	rd.pointAttachment->SetTargetVelocityCS(vecFromUnits(velocity));
+	g_World->system.GetBodyInterface().ActivateBody(rd.bodies[rd.attachmentPart]);
+}
+
+extern "C" void pdphysRagdollReleasePoint(int handle)
+{
+	if (!g_World || !ragdollLive(handle)) return;
+	Ragdoll &rd = g_Ragdolls[handle];
+	if (rd.pointAttachment == nullptr) return;
+	g_World->system.RemoveConstraint(rd.pointAttachment);
+	rd.pointAttachment = nullptr;
+	rd.attachmentPart = -1;
+}
+
 extern "C" void pdphysRagdollAddVelocity(int handle, int part, const float vel[3])
 {
 	if (!g_World || !ragdollLive(handle)) {
@@ -2038,6 +2094,31 @@ extern "C" void pdphysRagdollPull(int handle, int part, const float target[3], f
 	if (v.Length() > 12.0f) {
 		bi.SetLinearVelocity(id, v * (12.0f / v.Length()));
 	}
+}
+
+extern "C" void pdphysRagdollGuidePoint(int handle, int part, const float point[3],
+        const float target[3], float maxforce, float frequency)
+{
+    if (!g_World || !ragdollLive(handle) || maxforce <= 0.0f) {
+        return;
+    }
+
+    Ragdoll &rd = g_Ragdolls[handle];
+    if (part < 0 || part >= rd.numparts) {
+        return;
+    }
+
+    BodyInterface &bi = g_World->system.GetBodyInterface();
+    const BodyID id = rd.bodies[part];
+    const Vec3 p = vecFromUnits(point), t = vecFromUnits(target);
+    const Vec3 velocity = bi.GetPointVelocity(id, RVec3(p));
+    const float rate = 2.f * 3.14159265f * frequency;
+    Vec3 force = (t - p) * (rate * rate) - velocity * (2.f * rate);
+    const float magnitude = force.Length();
+    if (magnitude > maxforce) {
+        force *= maxforce / magnitude;
+    }
+    bi.AddForce(id, force, RVec3(p));
 }
 
 extern "C" void pdphysRagdollGetPartPos(int handle, int part, float outpos[3])

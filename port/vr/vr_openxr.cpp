@@ -1,4 +1,5 @@
 #if defined(ANDROID) || defined(GEVR_PCVR)
+#include "gevr_android_paths.h"
 #include "gevr_pause_menu.h"
 #endif
 // ============================================================================
@@ -731,9 +732,21 @@ static std::vector<const char*> vr_enumerate_extensions()
                 LOGI("Extension enabled: %s", required);
             }
         }
+        /* OpenXR 1.0 needs the HP profile extension explicitly enabled. Without
+         * it SteamVR rejects our G2 bindings and emulates Oculus controllers. */
+        if (std::strcmp(ext.extensionName, XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME) == 0) {
+            enabledExts.push_back(XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME);
+            LOGI("Extension enabled: %s", XR_EXT_HP_MIXED_REALITY_CONTROLLER_EXTENSION_NAME);
+        }
         if (std::strcmp(ext.extensionName, "XR_EXT_local_floor") == 0) {
             enabledExts.push_back("XR_EXT_local_floor");
         }
+#ifdef GEVR_TACTICAL_QUEST
+        if (std::strcmp(ext.extensionName, "XR_META_touch_controller_plus") == 0)
+            enabledExts.push_back("XR_META_touch_controller_plus");
+        if (std::strcmp(ext.extensionName, "XR_FB_touch_controller_pro") == 0)
+            enabledExts.push_back("XR_FB_touch_controller_pro");
+#endif
         if (std::strcmp(ext.extensionName, XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME) == 0) {
             enabledExts.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
             g_refreshRateSupported = true;
@@ -2846,7 +2859,7 @@ static bool vr_pointer_grid_probe(void)
     static unsigned n;
     static bool on;
     if ((n++ % 72) == 0) {
-        FILE *f = fopen("/sdcard/Android/data/com.gevr.port/files/gevr_ptrgrid", "r");
+        FILE *f = fopen(GEVR_ANDROID_EXTERNAL_FILES "/gevr_ptrgrid", "r");
         on = f != nullptr;
         if (f) fclose(f);
     }
@@ -6459,7 +6472,7 @@ extern "C" bool vr_begin_frame_and_update_poses()
     }
 
 #ifdef ANDROID
-    gevrFrameTimingTracePoll("/sdcard/Android/data/com.gevr.port/files/gevr_profile.txt");
+    gevrFrameTimingTracePoll(GEVR_ANDROID_EXTERNAL_FILES "/gevr_profile.txt");
 #endif
     gevrFrameTimingEnable(VrShowStats || gevrFrameTimingTracing());
     uint64_t timingStart = gevrFrameTimingNow();

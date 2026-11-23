@@ -33,7 +33,7 @@ if __name__ == "__main__":
     model = (ROOT / "src/game/model.c").read_text()
     fixture = (ROOT / "port/tests/ragdoll_native.c").read_text()
     lookups = "\n".join(function(model, name) for name in
-                         ("modelGetNodeRwData", "modelApplyHeadRelations", "modelFindNodeMtxIndex"))
+                         ("modelGetNodeRwData", "modelApplyHeadRelations", "modelFindNodeMtxIndex", "modelFindNodeMtx"))
     maths = (ROOT / "src/game/matrixmath.c").read_text()
     lookups += "\n" + "\n".join(function(maths, name) for name in
         ("matrix_4x4_copy", "matrix_4x4_multiply", "matrix_4x4_multiply_in_place",

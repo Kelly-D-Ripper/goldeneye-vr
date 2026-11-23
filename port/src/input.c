@@ -44,6 +44,9 @@
 #endif
 
 extern void gevrPlayerLayout(u32 *size, u32 *pausestate); // bondview2.c
+#ifdef GEVR
+extern int gevrTacticalMagReleaseController(void);
+#endif
 
 /* Crouch toggle for the left stick click; bondview2.c applies it. */
 static s32 gevrCrouchToggle = 0;
@@ -71,6 +74,8 @@ extern int flatTouchTakeLookDeg(float *yaw, float *pitch);
 extern s32 g_gevrStereo;          /* bondview2.c: this frame is stereo */
 extern s32 gevrScopeZoomStick(void);  /* bondview2.c: aiming the sniper, this stick zooms */
 extern s32 gevrTeleportTakesStick(void);   /* gevr_teleport.c: the move stick aims a jump */
+extern int gevrTacticalOpticInput(int enabled, int click, float y);
+extern int gevrTacticalFireSelectorPressed(void);
 extern s32 gevrStereoWatchItem(s32 item);  /* bondview2.c: the watch laser, the detonator, the watch gadgets (#31) */
 extern int gevrVrScreenMode;      /* gfx_pc.cpp: this frame is on the virtual screen */
 extern int VrPlayMode;            /* vr_settings: 1 = stereo gameplay */
@@ -78,6 +83,7 @@ extern void vrSettingsSave(void);
 extern void gevrBeanToggle(void);
 extern int gevrBeanIsEnabled(void);
 extern int gevrVrWatchGesture(void); /* vr_input.cpp */
+extern int gevrVrCoopWatchPose(void); /* vr_input.cpp */
 extern s32 g_gevrWatchGesturePending; /* bondview2.c */
 extern s32 gevrStereoWatchGrip(void);    /* bondview2.c: the gun hand holds the watch (#31) */
 extern s32 gevrStereoTwoHandGun(void);
@@ -325,6 +331,8 @@ extern s32 gevrDualWielding(void);
 extern int VrMotionThrowing;
 extern int VrPerWeaponRecoil;   /* launcher "Per-gun recoil" */
 #include "gevr_recoil.h"
+#include "gevr_tactical_stats.h"
+#include "gevr_tactical_mesh.h"
 #ifdef GEVR_PC
 #include "../pc/pc_testinput.h"
 #endif
@@ -2130,7 +2138,21 @@ s32 inputReadController(s32 idx, OSContPad *npad)
         return 0;
     }
 
-    if (!slotPad) {
+    extern int netGetLocalSlot(void);
+    extern int bossGetStageNum(void);
+    extern int gevrCoopMenuFollowing(void);
+    /*
+     * Co-op (#94): the party's menus are the title stage, which has no player
+     * slots and reads the first controller: this headset's, wherever its slot.
+     * A headset following the host's menus takes no input of its own there.
+     */
+    const int inMenus = bossGetStageNum() == 90; /* LEVELID_TITLE */
+    const int localSlot = netIsActive() && !inMenus ? netGetLocalSlot() : 0;
+    bool reloadGameplay = false;
+
+    /* The local headset always owns physical port zero, even as a guest. */
+    const s32 port = idx == localSlot ? 0 : idx;
+    if (!slotPad || idx == localSlot) {
 #ifdef GEVR_FLAT
         /*
          * Online, this machine's player is its slot in the match (the host's
@@ -2145,18 +2167,14 @@ s32 inputReadController(s32 idx, OSContPad *npad)
         const s32 bindIdx = netIsActive() && bossGetStageNum() != LEVELID_TITLE && idx == netGetLocalSlot() ? 0 : idx;
         const s32 slots = inputSoloSlots(bindIdx);
 #else
-        const s32 slots = 1 << idx;
+        const s32 slots = 1 << port;
 #endif
         s32 xdiff = 0, ydiff = 0;
         u8 prevWeapDown = 0;
         for (s32 k = 0; k < INPUT_MAX_CONTROLLERS; ++k) {
-            if (!(slots & (1 << k))) {
-                continue;
-            }
+            if (!(slots & (1 << k))) continue;
             for (u32 i = 0; i < CONT_NUM_BUTTONS; ++i) {
-                if (inputBindPressed(k, i)) {
-                    npad->button |= 1U << i;
-                }
+                if (inputBindPressed(k, i)) npad->button |= 1U << i;
             }
             if (inputBindPressed(k, CK_PREV_WEAPON)) {
                 prevWeapDown = 1;
@@ -2184,21 +2202,8 @@ s32 inputReadController(s32 idx, OSContPad *npad)
         npad->stick_y = ydiff < 0 ? -0x80 : (ydiff > 0 ? 0x7F : 0);
     }
 
-    /* the first port's settings for the headset's own slot when it has no port */
-    const struct controllercfg *cfg = &padsCfg[slotPad ? 0 : idx];
+    const struct controllercfg *cfg = &padsCfg[slotPad ? 0 : port];
 
-
-    extern int netGetLocalSlot(void);
-    extern int bossGetStageNum(void);
-    extern int gevrCoopMenuFollowing(void);
-    /*
-     * Co-op (#94): the party's menus are the title stage, which has no player
-     * slots and reads the first controller: this headset's, wherever its slot.
-     * A headset following the host's menus takes no input of its own there.
-     */
-    const int inMenus = bossGetStageNum() == 90; /* LEVELID_TITLE */
-    const int localSlot = netIsActive() && !inMenus ? netGetLocalSlot() : 0;
-    bool reloadGameplay = false;
 
     if (inMenus && netIsActive() && gevrCoopMenuFollowing()) {
         s_gevrReloadInput.context = s_gevrReloadInput.pending = 0;
@@ -2248,6 +2253,17 @@ s32 inputReadController(s32 idx, OSContPad *npad)
         const bool paused = me && me->pause_state != 0;
         const bool menu = bossGetStageNum() == LEVELID_TITLE || paused ||
                           (netIsActive() && g_CurrentPlayer && g_CurrentPlayer->mpmenuon);
+#ifdef GEVR_PC
+        {
+            static bool selectorWas;
+            const Uint8 *keys = SDL_GetKeyboardState(NULL);
+            const bool select = pcTestInputActive() ? pcTestInputKey(SDL_SCANCODE_V) != 0
+                                                   : keys && keys[SDL_SCANCODE_V];
+            if (select && !selectorWas && !menu && !gevrNativePauseOpen())
+                gevrTacticalFireSelectorPressed();
+            selectorWas = select;
+        }
+#endif
         SDL_GameController *pad = pads[0];
         if (pad) {
             const struct controllercfg *pcfg = &padsCfg[0];
@@ -2399,6 +2415,8 @@ s32 inputReadController(s32 idx, OSContPad *npad)
             }
             if (t < s_gevrStartUntil) npad->button |= START_BUTTON;
         }
+        gevrVrTriggerDown[0] = !menu && (npad->button & Z_TRIG) != 0;
+        gevrVrTriggerDown[1] = 0;
     } else if (!netIsActive() && idx < INPUT_MAX_CONTROLLERS && pads[idx]) {
         /*
          * A local split screen (GoldenEye's own, 2 to 4 players, offline):
@@ -2456,9 +2474,11 @@ s32 inputReadController(s32 idx, OSContPad *npad)
 #else
         const bool nativePause=false;
 #endif
-        const bool paused = g_CurrentPlayer && g_CurrentPlayer->pause_state != 0;
-        const bool menu = nativePause || bossGetStageNum() == LEVELID_TITLE || paused ||
-                          (netIsActive() && g_CurrentPlayer && g_CurrentPlayer->mpmenuon);
+        const struct player *localPlayer = inMenus ? g_CurrentPlayer : g_playerPointers[localSlot];
+        const bool paused = localPlayer && localPlayer->pause_state != 0;
+        const bool watchOpen = localPlayer && localPlayer->watch_animation_state != 0;
+        const bool menu = nativePause || bossGetStageNum() == LEVELID_TITLE || paused || watchOpen ||
+                          (netIsActive() && localPlayer && localPlayer->mpmenuon);
         XrVector2f left = {0}, right = {0};
         get_2d_input(0, "thumbstick", &left);
         get_2d_input(1, "thumbstick", &right);
@@ -2925,6 +2945,20 @@ s32 inputReadController(s32 idx, OSContPad *npad)
         // gives each gun its own trigger (gevrVrTriggerDown).
         gevrVrTriggerDown[0] = get_button_state(1, "trigger");   /* GUNRIGHT */
         gevrVrTriggerDown[1] = get_button_state(0, "trigger");   /* GUNLEFT */
+        {
+            extern int gevrTacticalSupportHolding(void);
+            extern int gevrTacticalMode(void);
+            if (stereoplay && gevrTacticalSupportHolding())
+                gevrVrTriggerDown[gevrStereoTwoHandGun()] = 0;
+            if (stereoplay && gevrTacticalMode() && sysArgCheck("--tactical-physical")) {
+                /* Empty hands use the trigger to take a magazine. Physical
+                 * melee still comes from moving the controller. */
+                for (int hand = 0; hand < 2; ++hand) {
+                    const int item = getCurrentPlayerWeaponId(hand);
+                    if (item == ITEM_FIST || item == ITEM_UNARMED) gevrVrTriggerDown[hand] = 0;
+                }
+            }
+        }
         if (s_gunFitGrab) {
             /* Gun fit's grab holds the off hand's trigger: neither gun fires */
             gevrVrTriggerDown[gevrStereoTwoHandGrip() && gevrStereoTwoHandSupportCtrl() == 1 ? 0 : 1] = 0;
@@ -2942,7 +2976,10 @@ s32 inputReadController(s32 idx, OSContPad *npad)
         if (stereoplay && gevrDualWielding()) {
             if (gevrVrTriggerDown[0] || gevrVrTriggerDown[1]) npad->button |= Z_TRIG;
         } else if (stereoplay) {
-            if (get_button_state(1, "trigger") && gevrVrTriggerDown[0]) npad->button |= Z_TRIG;
+            extern s32 gevrReloadSupportGun(void);
+            extern int gevrTacticalMode(void);
+            if ((gevrTacticalMode() && sysArgCheck("--tactical-physical"))
+                    ? gevrVrTriggerDown[gevrReloadSupportGun()] : gevrVrTriggerDown[0]) npad->button |= Z_TRIG;
         } else if (get_button_state(1, "trigger") || (get_button_state(0, "trigger") && !gevrGexMineDetonates())) {
             npad->button |= Z_TRIG;
         }
@@ -2960,6 +2997,22 @@ s32 inputReadController(s32 idx, OSContPad *npad)
             static int panelWas = 0;
             const u32 t = SDL_GetTicks();
             const bool held = get_button_state(0, "menu");
+            static bool menuLogWas = false;
+            if (held != menuLogWas) {
+                LOGI("input: left menu %s (paused=%d panel=%d)\n", held ? "down" : "up", paused, s_gevrPanel);
+                menuLogWas = held;
+            }
+            /* Optional local binding for controllers that need a Menu fallback. */
+            static bool fallbackWas = false;
+            const bool fallback = sysArgCheck("--tactical-pause-shortcut") && get_button_state(0, "x");
+            if (sysArgCheck("--tactical-physical") && gevrTacticalCampaignRules() && fallback && !fallbackWas
+                && bossGetStageNum() != LEVELID_TITLE && (paused || s_gevrPanel || !lvlGetControlsLockedFlag())) {
+                if (s_gevrPanel) s_gevrPanel = 0;
+                else s_gevrStartUntil = t + 100;
+                gevrSwallowX = true; /* never also select a watch menu item */
+                LOGI("input: left X pause toggle (paused=%d panel=%d)\n", paused, s_gevrPanel);
+            }
+            fallbackWas = fallback;
             s_menuHeld = held;
             if (panelWas && !s_gevrPanel && s_gevrPanelPaused) {
                 s_gevrPanelPaused = 0;
@@ -3017,6 +3070,11 @@ s32 inputReadController(s32 idx, OSContPad *npad)
                     }
                     fitChordWas = fitChord;
                 }
+                if (!consumed && !watchOpen && gevrCoopActive() && gevrTacticalCampaignRules() && t - downat >= 1500) {
+                    s_gevrPanel = 1;
+                    consumed = true;
+                    LOGI("input: hold Menu -> co-op session panel\n");
+                }
             } else {
                 if (downat && !consumed) s_gevrStartUntil = t + 100;
                 downat = 0;
@@ -3036,11 +3094,16 @@ s32 inputReadController(s32 idx, OSContPad *npad)
         {
             static bool gripWas[2];
             const bool grips[2] = { leftGrip, rightGrip };
+            const bool tacticalGrip = sysArgCheck("--tactical-physical") && sysArgCheck("--tactical-interactions");
             for (int c = 0; c < 2; c++) {
-                const bool on = stereoplay && !fitting
-                    && gevrBodyGripHeld(gripWas[c], grips[c], get_analog_value(c, "grip"));
-                gevrGripGestureInput(c, on && !gripWas[c], on);
-                gripWas[c] = on;
+                const bool toggleHand = tacticalGrip && c == (VrLeftHandedMode != 0);
+                const bool available = !toggleHand || gevrVrGripInputAvailable(c);
+                const bool squeezed = gevrBodyGripHeld(gripWas[c], grips[c], get_analog_value(c, "grip"));
+                const bool on = stereoplay && !fitting && squeezed;
+                const bool pressed = available && on && !gripWas[c];
+                /* Only a real release rearms a left weapon grip press. */
+                if (available) gripWas[c] = toggleHand ? squeezed : on;
+                gevrGripGestureInput(c, pressed, on);
                 gripTaken[c] = on && gevrGripGestureTaken(c);
             }
         }
@@ -3076,7 +3139,7 @@ s32 inputReadController(s32 idx, OSContPad *npad)
         {
             static bool slotA, slotX;
             const bool a = get_button_state(1, "a"), x = get_button_state(0, "x");
-            if (stereoplay && !fitting && !gevrWeaponPanelOpen) {
+            if (stereoplay && !fitting && !gevrWeaponPanelOpen && !sysArgCheck("--tactical-physical")) {
                 if (a && !slotA && !gevrSwallowA && gevrBodySlotButton(1)) gevrSwallowA = true;
                 if (x && !slotX && !gevrSwallowX && gevrBodySlotButton(0)) gevrSwallowX = true;
             }
@@ -3100,7 +3163,8 @@ s32 inputReadController(s32 idx, OSContPad *npad)
             static bool aback = false, xback = false;
             const u32 t = SDL_GetTicks();
             if (gevrSwallowA && !get_button_state(1, "a")) gevrSwallowA = false;
-            if (stereoplay && !fitting && !gevrSpectating()) {
+            if (stereoplay && !fitting && !gevrSpectating()
+                && !(sysArgCheck("--tactical-physical") && gevrTacticalCampaignRules())) {
                 const bool a = !gevrSwallowA && get_button_state(1, "a");
                 const bool x = !gevrSwallowX && get_button_state(0, "x");
                 if (x && !xdown) {
@@ -3179,13 +3243,31 @@ s32 inputReadController(s32 idx, OSContPad *npad)
             } else {
                 adown = xdown = 0;
                 gevrWeaponPanelOpen = 0;
+                if (stereoplay && !fitting && sysArgCheck("--tactical-physical") && gevrTacticalCampaignRules())
+                    npad->button &= ~A_BUTTON;
             }
         }
         if (fitting) npad->button &= ~(A_BUTTON | B_BUTTON | R_TRIG);   /* gun fit keeps them (the right grip rolls the grip hand) */
         reloadGameplay = !menu && !fitting && !gevrWeaponPanelOpen
             && !lvlGetControlsLockedFlag();
+#ifdef GEVR
+        if (reloadGameplay) {
+            int releaseCtrl = gevrTacticalMagReleaseController();
+            if (releaseCtrl >= 0 && get_button_state(releaseCtrl, releaseCtrl ? "b" : "y"))
+                npad->button &= ~B_BUTTON; /* reserved for physical magazine release */
+        }
+        {
+            static bool selectorWas;
+            const bool select = get_button_state(1, "a"); /* A, or X in left-handed mode */
+            if (select && !selectorWas && stereoplay && reloadGameplay && !s_menuHeld && !gevrSwallowA)
+                gevrTacticalFireSelectorPressed();
+            selectorWas = select;
+        }
+#endif
         const bool lclick = get_button_state(0, "thumbstick_click");
         const bool rclick = get_button_state(1, "thumbstick_click");
+        const bool opticControl = gevrTacticalOpticInput(!menu && !fitting && !lclick, rclick, right.y);
+        const bool rclickGame = rclick && !opticControl;
         const u32 now = SDL_GetTicks();
         // Left stick click toggles crouch (bondview2.c reads gevrCrouchToggled). It acts on
         // release so that a click of both sticks (recentre) or a long hold (bring the
@@ -3219,29 +3301,54 @@ s32 inputReadController(s32 idx, OSContPad *npad)
             }
             both = lclick && rclick;
         }
-        // Raise the left wrist to your face like reading a watch: open the watch.
-        // The pose must hold briefly, presses START once, and re-arms only after
-        // the arm comes down again (vr_input.cpp gevrVrWatchGesture).
+        // Tactical co-op uses the tracked wrist to open and close the local watch.
+        // The stock gesture keeps its original behavior outside Tactical co-op.
         {
             static GevrWatchGestureState gesture = {0, 0, 1};
-            // Issue #31 (user): not while the gun hand holds the watch for the
-            // watch laser or the detonator - aiming them raises the wrist too.
-            // It re-arms only once the arm comes down, as after a press.
-            const bool reading = gevrVrWatchGesture() != 0;
-            const bool blocked = menu || !g_gevrStereo || gevrStereoWatchGrip() || gevrStereoTwoHandGrip();
+            static GevrCoopWatchGestureState coopGesture;
             if (!VrWatchGesturePause) g_gevrWatchGesturePending = 0;
-            if (gevrWatchGestureTick(&gesture, now, VrWatchGesturePause, reading, blocked)) {
-                LOGI("input: watch gesture -> pause\n");
-                g_gevrWatchGesturePending = 1; /* bondview2.c: skip the raise on screen */
+            if (gevrCoopActive() && gevrTacticalCampaignRules()) {
+                gevrWatchGestureTick(&gesture, now, 0, 0, 0);
+                const bool eligible = VrWatchGesturePause && !inMenus && localPlayer
+                    && !localPlayer->bonddead && !netLocalIsSpectator() && !gevrCoopDowned(localSlot);
+                const bool unobstructed = eligible && !nativePause && !s_gevrPanel && !localPlayer->mpmenuon
+                    && !s_menuHeld && !(npad->button & START_BUTTON);
+                const int pose = unobstructed ? gevrVrCoopWatchPose() : GEVR_COOP_WATCH_UNTRACKED;
+                const bool canOpen = unobstructed && !menu && !fitting && !gevrWeaponPanelOpen
+                    && localPlayer->cameramode == CAMERAMODE_FP && !lvlGetControlsLockedFlag()
+                    && !gevrStereoWatchGrip() && !gevrStereoTwoHandGrip();
+                const bool canClose = unobstructed && localPlayer->watch_animation_state == WATCH_ANIMATION_0x5;
+                const int action = gevrCoopWatchGestureTick(&coopGesture, now, eligible, pose,
+                                                           watchOpen, canOpen, canClose);
+                if (action == GEVR_COOP_WATCH_OPEN) {
+                    LOGI("input: raised wrist -> private watch\n");
+                    g_gevrWatchGesturePending = 1;
+                } else if (action == GEVR_COOP_WATCH_CLOSE) {
+                    /* Close directly so START cannot equip a highlighted item. */
+                    g_playerPointers[localSlot]->open_close_solo_watch_menu = TRUE;
+                    LOGI("input: lowered wrist -> close private watch\n");
+                }
+                if (coopGesture.pressUntil && (s32)(coopGesture.pressUntil - now) > 0) {
+                    npad->button |= START_BUTTON;
+                }
+            } else {
+                gevrCoopWatchGestureTick(&coopGesture, now, 0, 0, 0, 0, 0);
+                const bool reading = gevrVrWatchGesture() != 0;
+                const bool blocked = menu || !g_gevrStereo || gevrStereoWatchGrip()
+                    || gevrStereoTwoHandGrip();
+                if (gevrWatchGestureTick(&gesture, now, VrWatchGesturePause, reading, blocked)) {
+                    LOGI("input: watch gesture -> pause\n");
+                    g_gevrWatchGesturePending = 1; /* bondview2.c: skip the raise on screen */
+                }
+                if (gesture.pressUntil && (s32)(gesture.pressUntil - now) > 0) npad->button |= START_BUTTON;
             }
-            if (gesture.pressUntil && (s32)(gesture.pressUntil - now) > 0) npad->button |= START_BUTTON;
         }
         // Hold the right stick click for a second: switch stereo gameplay and the
         // virtual screen, and remember the choice in goldeneye-vr.ini.
         {
             static u32 downat = 0;
             static bool fired = false, spoilt = false;
-            if (rclick) {
+            if (rclickGame) {
                 if (!downat) {
                     downat = now ? now : 1;
                     fired = spoilt = false;
@@ -3266,7 +3373,7 @@ s32 inputReadController(s32 idx, OSContPad *npad)
             static bool fired = false;
             const bool grip0 = get_button_state(0, "grip");
             const bool grip1 = get_button_state(1, "grip");
-            if (rclick && (grip0 != grip1)) {
+            if (rclickGame && (grip0 != grip1)) {
                 if (!downat) {
                     downat = now ? now : 1;
                     fired = false;
@@ -3389,7 +3496,7 @@ s32 inputReadController(s32 idx, OSContPad *npad)
         }
         gevrWeaponPanelStickX = panelOnMoveStick ? left.x : panelOnTurnStick ? right.x : 0.0f;
         gevrWeaponPanelStickY = panelOnMoveStick ? left.y : panelOnTurnStick ? right.y : 0.0f;
-        if (g_gevrStereo && !menu && !adjusting && !panelOnTurnStick) {
+        if (g_gevrStereo && !menu && !adjusting && !panelOnTurnStick && !opticControl) {
             const float dz = 0.15f;
             float x = right.x;
             if (fabsf(x) < dz) x = 0.0f;
@@ -3414,30 +3521,41 @@ s32 inputReadController(s32 idx, OSContPad *npad)
     }
 
 #if (defined(ANDROID) && !defined(GEVR_MOBILE)) || defined(GEVR_PCVR)   /* the headset build: the Quest, PC VR */
-    /* Menu owns A/B, triggers and sticks. Co-op uses this panel without
-     * entering the campaign watch or pausing the other three headsets. */
+    /* A Tactical co-op tap reaches the local campaign watch. The session
+     * panel stays available through a hold, and for spectators and downed players. */
     {
-        static int startHeld;
+        static int startHeld, sessionStart;
         static GevrPauseInputState pauseInput;
-        if(netIsActive() && !inMenus && idx==localSlot) {
-            const int start=(npad->button & START_BUTTON)!=0;
-            if(start && !startHeld && g_playerPointers[localSlot]) {
-                g_playerPointers[localSlot]->mpmenuon=!g_playerPointers[localSlot]->mpmenuon;
-                g_gevrWatchGesturePending=0;
+        const struct player *me = idx == localSlot ? g_playerPointers[localSlot] : NULL;
+        const int watchOpen = me && me->watch_animation_state != 0;
+        if (netIsActive() && !inMenus && idx == localSlot) {
+            const int start = (npad->button & START_BUTTON) != 0;
+            const int privateWatch = gevrCoopActive() && gevrTacticalCampaignRules() && me && !me->mpmenuon
+                && (watchOpen || (!me->bonddead && !netLocalIsSpectator() && !gevrCoopDowned(localSlot)));
+            if (!start) {
+                sessionStart = 0;
+            } else if (!startHeld) {
+                sessionStart = !privateWatch || s_gevrPanel;
+                if (sessionStart && !s_gevrPanel && me) {
+                    g_playerPointers[localSlot]->mpmenuon = !me->mpmenuon;
+                    g_gevrWatchGesturePending = 0;
+                }
             }
-            startHeld=start;
-            /* Own the whole synthesized pulse, including after closing. A
-             * later poll must not send its remaining START to the old menu. */
-            npad->button&=~START_BUTTON;
-        } else startHeld=0;
-        const int open=gevrNativePauseOpen();
-        const int fire=get_button_state(0,"trigger") || get_button_state(1,"trigger");
-        const int blockFire=gevrPauseBlocksFire(&pauseInput,open,fire);
-        if(open) {
-            npad->button&=START_BUTTON;
-            npad->stick_x=npad->stick_y=npad->rstick_x=npad->rstick_y=0;
-            gevrTurnAxis=0;gevrVrTriggerDown[0]=gevrVrTriggerDown[1]=0;
-        } else if(blockFire) {npad->button&=~(Z_TRIG|R_TRIG);gevrVrTriggerDown[0]=gevrVrTriggerDown[1]=0;}
+            /* Do not forward the remainder of START after it closes the session panel. */
+            if (sessionStart || s_gevrPanel) npad->button &= ~START_BUTTON;
+            startHeld = start;
+        } else startHeld = sessionStart = 0;
+        const int open = gevrNativePauseOpen();
+        const int fire = get_button_state(0, "trigger") || get_button_state(1, "trigger");
+        const int blockFire = gevrPauseBlocksFire(&pauseInput, open || watchOpen, fire);
+        if (open) {
+            npad->button &= START_BUTTON;
+            npad->stick_x = npad->stick_y = npad->rstick_x = npad->rstick_y = 0;
+            gevrTurnAxis = 0;
+        } else if (!watchOpen && blockFire) {
+            npad->button &= ~(Z_TRIG | R_TRIG);
+        }
+        if (blockFire) gevrVrTriggerDown[0] = gevrVrTriggerDown[1] = 0;
     }
 #endif
     /* a spectator, or (co-op, #94) a downed player waiting for a teammate: looks, no more */
@@ -3461,6 +3579,12 @@ s32 inputReadController(s32 idx, OSContPad *npad)
 #endif
         /* Menu + physical B belongs to the microphone, in either handedness. */
         if (s_menuHeld) allowed &= ~(VrLeftHandedMode ? 2u : 1u);
+#ifdef GEVR
+        {
+            int releaseCtrl = gevrTacticalMagReleaseController();
+            if (releaseCtrl >= 0) allowed &= ~(releaseCtrl ? 1u : 2u);
+        }
+#endif
         const unsigned context = 1u + (unsigned)bossGetStageNum() * 32u
             + (unsigned)localSlot * 4u + (VrLeftHandedMode ? 2u : 0u) + (VrPlayMode ? 1u : 0u)
             + ((VrManualReloading && (VrGexGuns || gevrBeanIsEnabled())) ? 0x10000u : 0u);
@@ -4200,9 +4324,13 @@ void gevrRumbleGunfire(s32 hand, s32 item_id) {
     }
     /* per-gun recoil: the shot kicks this hand's grip pose (vr_input.cpp vrRecoilKick) */
     if (g_gevrStereo && VrPerWeaponRecoil) {
-        f32 strength;
-        const int cls = gevrRecoilFor(item_id, &strength);
-        vrRecoilKick(hand, cls, strength);
+        const GevrWeaponStats *stats = gevrTacticalHeldStats(hand, item_id);
+        if (stats) vrTacticalRecoilKick(hand, stats->recoil, stats->ergo);
+        else {
+            f32 strength;
+            const int cls = gevrRecoilFor(item_id, &strength);
+            vrRecoilKick(hand, cls, strength);
+        }
     }
     struct WeaponRumbleProfile p = getWeaponRumbleProfile(item_id);
     f32 amp = p.amplitude;

@@ -297,6 +297,14 @@ s32         sub_GAME_7F01FC10(Model *, coord3d *, coord3d *, f32 *);
 void        chrCreateBloodStain(Model *arg0, s32 arg1, ModelNode *arg2, struct coord3d *arg3);
 void        chrpropAddBulletHit(struct ShotData *shotdata, PropRecord *prop, f32 dist, s32 hitpart, ModelNode *node, struct HitThing *hitthing, s32 room, s32 unk44, Model *model, bool countsAsPenetration, s32 blocksFurtherHits);
 void        chrTestHit(PropRecord *prop, ShotData *shotdata);
+#ifdef GEVR
+enum { GEVR_HIT_KLMK_VEST = 0x100, GEVR_HIT_TACTICAL_HELMET };
+static inline bool gevrChrArmorHitPart(s32 part)
+{
+    return part == GEVR_HIT_KLMK_VEST || part == GEVR_HIT_TACTICAL_HELMET;
+}
+f32         gevrChrBulletSurfaceDepth(ShotData *shot, Model *model, ModelNode *node, f32 fallback);
+#endif
 void        sub_GAME_7F03E134(PropRecord* p);
 
 #ifdef BUGFIX_R1

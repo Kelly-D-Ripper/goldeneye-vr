@@ -15,7 +15,7 @@ extern int VrGexGuns;
 /* GE-X's remote mines detonate themselves (gun.c gevrGexMineDetonates): the
  * Detonator leaves the cycle, ammo required or not */
 #define GEVR_CYCLE_OK(requireammo, item) \
-    (((requireammo) == FALSE && !(VrGexGuns && (item) == ITEM_TRIGGER)) || bondwalkItemHasAmmo(item))
+    (((requireammo) == FALSE && !(VrGexGuns && (item) == ITEM_TRIGGER && !gevrTacticalHandheldDetonator(item))) || bondwalkItemHasAmmo(item))
 #else
 #define GEVR_CYCLE_OK(requireammo, item) ((requireammo) == FALSE || bondwalkItemHasAmmo(item))
 #endif
@@ -962,7 +962,8 @@ static s32 bondinvGetTextbyInvIndexRaw(s32 index);
 
 static s32 gevrInvHides(s32 raw)
 {
-    return VrGexGuns && bondinvGetTextbyInvIndexRaw(raw) == ITEM_TRIGGER;
+    return VrGexGuns && !gevrTacticalHandheldDetonator(ITEM_TRIGGER)
+        && bondinvGetTextbyInvIndexRaw(raw) == ITEM_TRIGGER;
 }
 
 static s32 gevrInvRaw(s32 index)
@@ -1215,6 +1216,10 @@ s32 bondinvGetTextbyInvIndex(s32 index)
             {
                 return override->weapon;
             }
+#ifdef GEVR
+            if (prop->obj->type == PROPDEF_KEY && prop->obj->obj == PROP_SWIPE_CARD2)
+                return ITEM_KEYCARD;
+#endif
         }
         else if (inv_item->type == INV_ITEM_WEAPON)
         {

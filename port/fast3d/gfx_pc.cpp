@@ -1,3 +1,4 @@
+#include "gevr_android_paths.h"
 #if (defined(ANDROID) && !defined(GEVR_MOBILE)) || defined(GEVR_PCVR)   /* the headset build: the Quest, PC VR */
 #include "../vr/gevr_pause_menu.h"
 #endif
@@ -92,6 +93,9 @@ extern "C" int gevrStatsPicture(const void *addr, const uint8_t **rgba, int *w, 
 #include "gevr_bean.h"
 #include "gevr_romlayout.h"
 #include "gevr_oddjobhat.h"
+#include "gevr_tactical_mesh.h"
+#include "gevr_hollywood_fx.h"
+#include "gevr_tactical_optics.h"
 extern "C" int VrCampaign; /* vr_settings: the launcher's campaign */
 
 #include "../vr/vr_hub.h"
@@ -201,6 +205,10 @@ extern "C" float gevrTeleportBlink(void);           // gevr_teleport.c: the tele
 void gfx_vr_scope_record(bool on, bool invert_y);   // gfx_opengl.cpp (issue #40)
 void gfx_vr_scope_only(int hand);                   // GUNRIGHT 0 / GUNLEFT 1, -1 ends
 void gfx_vr_scope_render(void);
+void gfx_tactical_scope_record(const float *projection, bool invert_y);
+bool gfx_tactical_scope_heat_active(void);
+void gfx_tactical_scope_heat(bool warm);
+void gfx_tactical_optic_surface(const GevrOpticSurface *surface, const float projection[16], bool invert_y);
 void gfx_vr_eye_record(bool on, const float* proj, bool invert_y, const float* presentation);
 void gfx_vr_eye_hand(int ctrl);
 bool gfx_vr_eye_replay_ready(void);
@@ -1039,6 +1047,23 @@ extern "C" int gfx_prewarm_bean_textures(void) {
 }
 #endif
 
+#ifdef GEVR
+extern "C" int gfx_tactical_texture_prepare(const void* address) {
+    if (!gfx_rapi || !gfx_rapi->upload_texture_hd) return 0;
+    const uint8_t* rgba = nullptr;
+    int width = 0, height = 0;
+    if (!gevrTacticalMeshTexture(address, &rgba, &width, &height) || !rgba || width <= 0 || height <= 0)
+        return 0;
+    TextureCacheKey key = {(const uint8_t*)address, {}, G_IM_FMT_RGBA, G_IM_SIZ_32b, 0, 0, 0};
+    key.width = (uint32_t)width;
+    key.height = (uint32_t)height;
+    if (gfx_texture_cache_lookup(0, key)) return 0;
+    gfx_rapi->upload_texture_hd(rgba, key.width, key.height);
+    rdp.textures_changed[0] = rdp.textures_changed[1] = true;
+    return 1;
+}
+#endif
+
 void gfx_texture_cache_delete(const uint8_t* orig_addr) {
     gfx_flush();
 
@@ -1133,9 +1158,9 @@ static void gevr_upload_native(uint32_t width, uint32_t height) {
     /* re-check the trigger now and then, so it can be switched on mid-level */
     if (!enabled && (checks++ % 64) == 0) {
         struct stat st;
-        enabled = stat("/sdcard/Android/data/com.gevr.port/files/gevr_texdump", &st) == 0;
+        enabled = stat(GEVR_ANDROID_EXTERNAL_FILES "/gevr_texdump", &st) == 0;
         if (enabled) {
-            mkdir("/sdcard/Android/data/com.gevr.port/files/texdump", 0777);
+            mkdir(GEVR_ANDROID_EXTERNAL_FILES "/texdump", 0777);
             sysLogPrintf(LOG_NOTE, "texdump: enabled");
         }
     }
@@ -1150,7 +1175,7 @@ static void gevr_upload_native(uint32_t width, uint32_t height) {
             seen[count].addr = s_dumpAddr; seen[count].fmt = s_dumpFmt; seen[count].siz = s_dumpSiz;
             seen[count].w = width; seen[count].h = height;
             snprintf(path, sizeof(path),
-                "/sdcard/Android/data/com.gevr.port/files/texdump/%03u_f%u_s%u_%ux%u_t%d_%p.pam",
+                GEVR_ANDROID_EXTERNAL_FILES "/texdump/%03u_f%u_s%u_%ux%u_t%d_%p.pam",
                 count, (unsigned)s_dumpFmt, (unsigned)s_dumpSiz, (unsigned)width, (unsigned)height,
                 s_dumpTile, (const void *)s_dumpAddr);
             count++;
@@ -2065,7 +2090,9 @@ static void import_texture(int i, int tile, bool is_rect) {
         int beanW = 0, beanH = 0;
         const void *frameAddr = gevrBeanTextureFrame(loaded_texture.addr, g_GlobalTimer / 60.0f);
         /* Mods: Oddjob's hat loads its pictures the same way (gevr_oddjobhat.c) */
-        if ((gevrBeanTexture(frameAddr, &beanRgba, &beanW, &beanH) || gevrHatTexture(frameAddr, &beanRgba, &beanW, &beanH))
+        if ((gevrBeanTexture(frameAddr, &beanRgba, &beanW, &beanH) || gevrHatTexture(frameAddr, &beanRgba, &beanW, &beanH)
+             || gevrTacticalMeshTexture(frameAddr, &beanRgba, &beanW, &beanH)
+             || gevrHollywoodTexture(frameAddr, &beanRgba, &beanW, &beanH))
             && beanRgba && beanW > 0 && beanH > 0) {
             /* UV normalization below uses the logical tile, not the 16x16
              * stand-in's byte count. Keep both axes in those same units. */
@@ -2461,6 +2488,8 @@ static bool gevrMenuTrace;
 static uint32_t gevrMenuSeen;
 static unsigned gevrMenuVertices, gevrMenuTriangles, gevrMenuClipped, gevrMenuCulled;
 
+#include "gevr_tactical_editor_capture.inc.h"
+
 static void gfx_sp_matrix(uint8_t parameters, const int32_t* addr) {
     float matrix[4][4];
 
@@ -2492,6 +2521,11 @@ static void gfx_sp_matrix(uint8_t parameters, const int32_t* addr) {
             gfx_matrix_mul(rsp.P_matrix, matrix, rsp.P_matrix);
         }
     } else { // G_MTX_MODELVIEW
+        if (s_editorCapture) {
+            const uintptr_t offset = (uintptr_t)addr - s_editorBoneAddress;
+            s_editorBone = offset < (size_t)s_editorBoneCount * sizeof(s_editorBones[0])
+                ? (int)(offset / sizeof(s_editorBones[0])) : -1;
+        }
         if ((parameters & G_MTX_PUSH) && rsp.modelview_matrix_stack_size < 11) {
             ++rsp.modelview_matrix_stack_size;
             memcpy(rsp.modelview_matrix_stack[rsp.modelview_matrix_stack_size - 1],
@@ -2738,6 +2772,7 @@ static void gfx_sp_vertex(size_t n_vertices, size_t dest_index, const Vtx* verti
                                   world ? world[i].p[1] : (float)v->v[1],
                                   world ? world[i].p[2] : (float)v->v[2]};
         struct LoadedVertex* d = &rsp.loaded_vertices[dest_index];
+        if (s_editorCapture) gevrEditorCapturePosition(dest_index, position);
 
         float x = position[0] * rsp.MP_matrix[0][0] + position[1] * rsp.MP_matrix[1][0] + position[2] * rsp.MP_matrix[2][0] + rsp.MP_matrix[3][0];
         float y = position[0] * rsp.MP_matrix[0][1] + position[1] * rsp.MP_matrix[1][1] + position[2] * rsp.MP_matrix[2][1] + rsp.MP_matrix[3][1];
@@ -3224,13 +3259,13 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bo
     }
 
     // --- CUSTOM VR HIDE: SMART REMOVAL ---
-    if ((v1->clip_rej & 64) && (v2->clip_rej & 64) && (v3->clip_rej & 64)) {
+    if (!s_editorCapture && (v1->clip_rej & 64) && (v2->clip_rej & 64) && (v3->clip_rej & 64)) {
         if (gevrMenuTrace) ++gevrMenuClipped;
         return;
     }
     // -------------------------------------------------
 
-    if ((rsp.extra_geometry_mode & G_NO_CLIPPING_EXT) == 0) {
+    if (!s_editorCapture && (rsp.extra_geometry_mode & G_NO_CLIPPING_EXT) == 0) {
         /*
          * gepc-ref D233: the outcodes set in gfx_sp_vertex are half-space
          * tests that only hold for w > 0. A vertex behind the camera flips
@@ -3282,7 +3317,7 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bo
         }
     }
     bool gevrBackFace = false;
-    if ((rsp.geometry_mode & G_CULL_BOTH) != 0 && !(gevrCullOff && (rsp.geometry_mode & G_CULL_BOTH) == G_CULL_BOTH)) {
+    if (!s_editorCapture && (rsp.geometry_mode & G_CULL_BOTH) != 0 && !(gevrCullOff && (rsp.geometry_mode & G_CULL_BOTH) == G_CULL_BOTH)) {
         if ((rsp.geometry_mode & G_CULL_BOTH) == G_CULL_BOTH) {
             if (gevrMenuTrace) ++gevrMenuCulled;
             // Why is this even an option?
@@ -3586,6 +3621,13 @@ static void gfx_sp_tri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx, bo
         uvTile[t].size[1] = (float)((is_rect || tex_from_block[t]) ? tex_height[t] : tex_height2[t]);
     }
     const float fogRgb[3] = { rdp.fog_color.r / 255.0f, rdp.fog_color.g / 255.0f, rdp.fog_color.b / 255.0f };
+    if (s_editorCapture && !is_rect) {
+        const uint8_t indices[] = {vtx1_idx, vtx2_idx, vtx3_idx};
+        const uint32_t id = used_textures[0] && rendering_state.textures[0]
+            ? rendering_state.textures[0]->second.texture_id : 0;
+        gevrEditorCaptureTriangle(indices, id, uvTile[0].scale, uvTile[0].origin, uvTile[0].size,
+            uvHalf, uvCentre, use_alpha);
+    }
     uint8_t inputKind[GFX_MESH_MAX_INPUTS][2];
     float inputValue[GFX_MESH_MAX_INPUTS][2][3];
     bool inputsFast = num_inputs <= GFX_MESH_MAX_INPUTS;
@@ -4865,6 +4907,7 @@ static uint32_t s_gevrMeshCulled, s_gevrMeshCulledTris;
 static std::vector<GevrStaticMesh*> s_gevrMeshLive;
 static std::vector<void*> s_gevrMeshDead;
 static uint32_t s_gevrMeshDraws, s_gevrMeshTris, s_gevrMeshFallbacks;   // logged with the gfx: line
+static uint32_t s_tacticalMeshDraws, s_tacticalMeshTris, s_tacticalMeshFallbacks, s_tacticalMeshLodSaved;
 extern "C" void gfx_static_mesh_release(GevrStaticMesh* m) {
     if (m == nullptr) {
         return;
@@ -4879,11 +4922,18 @@ extern "C" void gfx_static_mesh_release(GevrStaticMesh* m) {
     }
 }
 
+extern "C" void gfx_static_mesh_prepare(GevrStaticMesh* mesh) {
+    if (!mesh || mesh->gpu || !s_gevrMeshOn || !gfx_rapi || !gfx_rapi->prepare_mesh) return;
+    const uint32_t numIndices = mesh->numIndicesWithLod ? mesh->numIndicesWithLod : mesh->numIndices;
+    gfx_rapi->prepare_mesh(&mesh->gpu, mesh->vertices, mesh->numVertices, mesh->indices, numIndices);
+    if (mesh->gpu) s_gevrMeshLive.push_back(mesh);
+}
+
 static void gevr_mesh_frame(void) {
     static unsigned n;
     if ((n++ % 240) == 0) {
 #ifdef ANDROID
-        FILE* f = fopen("/sdcard/Android/data/com.gevr.port/files/gevr_nomesh.txt", "r");
+        FILE* f = fopen(GEVR_ANDROID_EXTERNAL_FILES "/gevr_nomesh.txt", "r");
 #else
         FILE* f = fopen("gevr_nomesh.txt", "r");   // the PC and Apple games' own folder
 #endif
@@ -4892,7 +4942,7 @@ static void gevr_mesh_frame(void) {
             fclose(f);
         }
 #ifdef ANDROID
-        FILE* skin = fopen("/sdcard/Android/data/com.gevr.port/files/gevr_noskin.txt", "r");
+        FILE* skin = fopen(GEVR_ANDROID_EXTERNAL_FILES "/gevr_noskin.txt", "r");
 #else
         FILE* skin = fopen("gevr_noskin.txt", "r");
 #endif
@@ -4907,14 +4957,16 @@ static void gevr_mesh_frame(void) {
             sysLogPrintf(LOG_NOTE, "mesh: static meshes %s", on ? "on" : "off (gevr_nomesh.txt)");
         }
     }
-    if (!s_gevrMeshLive.empty() && (!s_gevrMeshOn || !gevrBeanIsEnabled())) {
-        for (GevrStaticMesh* m : s_gevrMeshLive) {
-            if (m->gpu != nullptr) {
-                s_gevrMeshDead.push_back(m->gpu);
-                m->gpu = nullptr;
+    if (!s_gevrMeshOn || !gevrBeanIsEnabled()) {
+        auto retired = std::remove_if(s_gevrMeshLive.begin(), s_gevrMeshLive.end(), [](GevrStaticMesh* mesh) {
+            if (s_gevrMeshOn && mesh->tacticalGear) return false;
+            if (mesh->gpu) {
+                s_gevrMeshDead.push_back(mesh->gpu);
+                mesh->gpu = nullptr;
             }
-        }
-        s_gevrMeshLive.clear();
+            return true;
+        });
+        s_gevrMeshLive.erase(retired, s_gevrMeshLive.end());
     }
     if (gfx_rapi->delete_mesh != nullptr) {
         for (void* gpu : s_gevrMeshDead) {
@@ -5109,7 +5161,8 @@ static bool gevr_mesh_draw_run(GevrStaticMesh* m, const GevrStaticMeshRun* run, 
         s_gevrMeshCulledTris += run->indexCount / 3;
         return true;
     }
-    if (!s_gevrMeshOn || (skin && !s_gevrSkinOn) || gfx_rapi->draw_mesh == nullptr || run->indexCount == 0 ||
+    if (s_editorCapture || !s_gevrMeshOn || (skin && !s_gevrSkinOn) ||
+        gfx_rapi->draw_mesh == nullptr || run->indexCount == 0 ||
         s_beanFadeAlpha < 255) {   // a fading body's few draws take the CPU path, which fades
         return false;
     }
@@ -5127,7 +5180,7 @@ static bool gevr_mesh_draw_run(GevrStaticMesh* m, const GevrStaticMeshRun* run, 
         (rsp.geometry_mode & G_CULL_BOTH) == G_CULL_BOTH || rsp.vertex_colors != nullptr ||
         rsp.modelview_hidden_stack[rsp.modelview_matrix_stack_size - 1] ||
         ((gevrCullOff || (!skin && gevrCullMirror)) && (rsp.geometry_mode & G_CULL_BOTH)) ||
-        !(fbActive || vr_is_initialized())) {
+        !(m->tacticalGear || fbActive || vr_is_initialized())) {
         s_gevrMeshFallbacks++;
         return false;
     }
@@ -5154,6 +5207,7 @@ static bool gevr_mesh_draw_run(GevrStaticMesh* m, const GevrStaticMeshRun* run, 
         return false;
     }
     params.world_vertices = m->worldVertices != 0;
+    params.tactical_gear = m->tacticalGear != 0;
     if (skin) {
         params.skinned = true;
         params.palette = skin->palette;
@@ -5202,9 +5256,10 @@ static bool gevr_mesh_draw_run(GevrStaticMesh* m, const GevrStaticMeshRun* run, 
     gfx_flush();   // what came before draws first
     const bool made = m->gpu == nullptr;
     const bool shared = m->gpuVertices != nullptr;   // each distinct vertex once (Bean skins)
+    const uint32_t numIndices = m->numIndicesWithLod ? m->numIndicesWithLod : m->numIndices;
     if (!gfx_rapi->draw_mesh(&m->gpu, shared ? m->gpuVertices : m->vertices,
                              shared ? m->numGpuVertices : m->numVertices,
-                             shared ? m->gpuIndices : m->indices, m->numIndices,
+                             shared ? m->gpuIndices : m->indices, numIndices,
                              run->firstIndex, run->indexCount, &params)) {
         s_gevrMeshFallbacks++;
         return false;
@@ -5379,7 +5434,7 @@ static void gevrMaybeCrashTest(void) {
     if (checked) return;
     checked = true;
 #ifdef ANDROID
-    const char* marker = "/sdcard/Android/data/com.gevr.port/files/gevr_crashtest.txt";
+    const char* marker = GEVR_ANDROID_EXTERNAL_FILES "/gevr_crashtest.txt";
 #else
     const char* marker = "gevr_crashtest.txt";
 #endif
@@ -5406,6 +5461,7 @@ static void gfx_run_dl(Gfx* cmd) {
     uint64_t ourHash = -1;
     GevrStaticMesh* mesh = nullptr;   // G_GEVR_MESH: the runs this list draws from buffers
     uint32_t meshRun = 0;
+    bool meshLowDetail = false;
     GevrSkinDraw* skin = nullptr;
     GevrDlTrack track(cmd);   // crash context (gevrGfxCrashContext)
     if (track.depth == 0) {   // a frame's list: whose thread, and the crash test's marker
@@ -5422,6 +5478,8 @@ static void gfx_run_dl(Gfx* cmd) {
             // RSP commands:
             case G_NOOP: {
                 uint32_t tag_w1 = cmd->words.w1;
+                if (tag_w1 == GEVR_EDITOR_CAPTURE_BEGIN) { gevrEditorCaptureStart(); break; }
+                if (tag_w1 == GEVR_EDITOR_CAPTURE_END) { gevrEditorCaptureEnd(); break; }
                 if ((tag_w1 & 0xffff0000) == 0x47450000) {
                     if (tag_w1 == 0x4745ffff) {
                         if (gevrMenuTrace) {
@@ -5567,6 +5625,19 @@ static void gfx_run_dl(Gfx* cmd) {
                         gfx_vr_scope_record(true, gfx_rapi->get_clip_parameters().invert_y);
                         break;
 
+                    case GEVR_OPTIC_SCOPE_RECORD:
+                        gfx_flush();
+                        gfx_tactical_scope_record(rsp.P_matrix[0], gfx_rapi->get_clip_parameters().invert_y);
+                        break;
+
+                    case GEVR_OPTIC_SCOPE_WARM:
+                    case GEVR_OPTIC_SCOPE_COLD:
+                        if (gfx_tactical_scope_heat_active()) {
+                            gfx_flush();
+                            gfx_tactical_scope_heat(tag_w1 == GEVR_OPTIC_SCOPE_WARM);
+                        }
+                        break;
+
                     case VR_SCOPE_REC_END:
                         gfx_flush();
                         gfx_vr_scope_record(false, false);
@@ -5611,6 +5682,12 @@ static void gfx_run_dl(Gfx* cmd) {
             case (uint8_t)G_TEXTURE:
                 gfx_sp_texture(C1(16, 16), C1(0, 16), C0(11, 3), C0(8, 3), C0(0, 8));
                 break;
+            case G_GEVR_OPTIC_SURFACE:
+                gfx_flush();
+                gfx_tactical_optic_surface((const GevrOpticSurface *)seg_addr(cmd->words.w1),
+                    rsp.P_matrix[0], gfx_rapi->get_clip_parameters().invert_y);
+                break;
+
             case G_GEVR_SKY_VTX:
                 memset(s_gevrPresentedFresh, 0, sizeof(s_gevrPresentedFresh));   // pre-projected: none presented
                 gfx_sp_sky_vertex(C0(0, 8), (const GevrSkyVertex*)seg_addr(cmd->words.w1));
@@ -5680,6 +5757,7 @@ static void gfx_run_dl(Gfx* cmd) {
             case G_GEVR_MESH:
                 skin = nullptr;
                 mesh = (GevrStaticMesh*)cmd->words.w1;
+                meshLowDetail = (cmd->words.w0 & 1) != 0;
                 meshRun = 0;
                 break;
             case G_GEVR_WORLD_VTX:
@@ -5693,10 +5771,25 @@ static void gfx_run_dl(Gfx* cmd) {
                 if (mesh != nullptr && meshRun < mesh->numRuns && mesh->runs[meshRun].start == (const void*)cmd) {
                     const GevrStaticMeshRun* run = &mesh->runs[meshRun++];
                     fallbackRun = run;
+                    GevrStaticMeshRun low;
+                    const uint32_t fullCount = run->indexCount;
+                    if (mesh->tacticalGear && meshLowDetail && run->lowIndexCount) {
+                        low = *run;
+                        low.firstIndex = run->firstLowIndex;
+                        low.indexCount = run->lowIndexCount;
+                        run = &low;
+                    }
+                    const uint32_t drawsBefore = s_gevrMeshDraws;
                     if (gevr_mesh_draw_run(mesh, run, skin)) {
+                        if (mesh->tacticalGear && s_gevrMeshDraws != drawsBefore) {
+                            ++s_tacticalMeshDraws;
+                            s_tacticalMeshTris += run->indexCount / 3;
+                            s_tacticalMeshLodSaved += (fullCount - run->indexCount) / 3;
+                        }
                         cmd = (Gfx*)run->end - 1;   // past the run (++cmd below)
                         break;
                     }
+                    if (mesh->tacticalGear) ++s_tacticalMeshFallbacks;
                 }
                 uintptr_t vtxp = (uintptr_t)seg_addr(cmd->words.w1);
                 if (skin) {
@@ -6137,6 +6230,17 @@ extern "C" void gfx_pc_mirror_frame(void)
     }
     gfx_sdl_mirror_present();
 }
+
+/* Called only while the current eye image is still acquired from OpenXR.
+ * The game's ordinary frame swap presents this mirror afterward. */
+static void gevrMirrorAcquiredEyeFrame(void)
+{
+    int mw = 0, mh = 0;
+    gfx_sdl_get_mirror_dimensions(&mw, &mh);
+    if (gfx_rapi && mw > 0 && mh > 0)
+        gfx_rapi->mirror_to_desktop((uint32_t)vr_get_internal_render_width(),
+            (uint32_t)vr_get_internal_render_height(), (uint32_t)mw, (uint32_t)mh);
+}
 #endif
 
 
@@ -6166,7 +6270,7 @@ static void gevrDumpDl(const Gfx* cmd, int depth, int* budget) {
 static void gevrMaybeDumpDl(const Gfx* commands) {
     static uint32_t sTick;
     if ((++sTick % 30) != 0) return;
-    const char* marker = "/sdcard/Android/data/com.gevr.port/files/gevr_dumpdl.txt";
+    const char* marker = GEVR_ANDROID_EXTERNAL_FILES "/gevr_dumpdl.txt";
     if (access(marker, F_OK) != 0) return;
     unlink(marker);
     int budget = 900;
@@ -6454,12 +6558,16 @@ extern "C" void gfx_run(Gfx* commands) {
                     vr_log("gfx: %u frames, %u tris, %u flushes, cimg %p", sFrames, sTris, sFlushes, rdp.color_image_address);
                     vr_log("mesh: %u draws, %u tris, %u runs on the CPU, %u meshes in buffers%s", s_gevrMeshDraws,
                            s_gevrMeshTris, s_gevrMeshFallbacks, (unsigned)s_gevrMeshLive.size(), s_gevrMeshOn ? "" : " (off)");
+                    if (s_tacticalMeshDraws || s_tacticalMeshFallbacks)
+                        vr_log("tactical mesh cache: %u GPU draws, %u GPU tris, %u CPU runs, %u triangles saved at distance",
+                               s_tacticalMeshDraws, s_tacticalMeshTris, s_tacticalMeshFallbacks, s_tacticalMeshLodSaved);
                     unsigned repaint[3]; gevrBeanRepaintStats(repaint);
                     vr_log("bean-paint: folder %u font %u images %u bound, %u renderer hits %u uploads", repaint[0], repaint[1], repaint[2], s_beanPaintHits, s_beanPaintUploads);
                     vr_log("skin: %u draws, %u tris on GPU, %u CPU poses%s", s_gevrSkinDraws,
                            s_gevrSkinTris, s_gevrSkinPoses, s_gevrSkinOn ? "" : " (gevr_noskin.txt)");
                     vr_log("mesh-cull: %u chunks, %u tris rejected", s_gevrMeshCulled, s_gevrMeshCulledTris);
                     }
+                    s_tacticalMeshDraws = s_tacticalMeshTris = s_tacticalMeshFallbacks = s_tacticalMeshLodSaved = 0;
                     s_beanPaintHits = s_beanPaintUploads = 0;
                     s_gevrSkinDraws = s_gevrSkinTris = s_gevrSkinPoses = 0;
                     s_gevrMeshCulled = s_gevrMeshCulledTris = 0;
@@ -6554,6 +6662,9 @@ extern "C" void gfx_run(Gfx* commands) {
                 // whatever the runtime handed back.
                 gfx_vr_gpu_begin(0);
                 gfx_vr_gpu_end();
+#ifdef GEVR_PCVR
+                gevrMirrorAcquiredEyeFrame();
+#endif
                 vr_end_eye_render();
             }
             // The scopes' images (their own targets, submitted with this frame):
@@ -6628,17 +6739,9 @@ extern "C" void gfx_run(Gfx* commands) {
             // Sampling it from our mirror context after the release is a read-write hazard.
             // ─────────────────────────────────────────────────────
 #ifndef ANDROID // if PC
-            int mw = 0, mh = 0;
-            gfx_sdl_get_mirror_dimensions(&mw, &mh);
-
-            if (mw > 0 && mh > 0) {
-                gfx_rapi->mirror_to_desktop(
-                        (uint32_t)vr_get_internal_render_width(),   // src_w : résolution VR fixe
-                        (uint32_t)vr_get_internal_render_height(),  // src_h : résolution VR fixe
-                        (uint32_t)mw,                               // dst_w : taille miroir dynamique
-                        (uint32_t)mh                                // dst_h : taille miroir dynamique
-                );
-            }
+#ifdef GEVR_PCVR
+            gevrMirrorAcquiredEyeFrame();
+#endif
 #endif
 
             // 5) Release + submit
@@ -6820,6 +6923,16 @@ static int gevr_vr_replay_frame(bool fresh) {
     const bool haveBody = recorded && gevrVrRedrawBodyDelta(body) != 0;
     gfx_vr_eye_replay(delta, have0 ? hand[0] : nullptr, have1 ? hand[1] : nullptr, haveBody ? body : nullptr);
     gfx_opengl_draw_vignette(s_gevrLastVignette, gevrTeleportBlink());
+#ifdef GEVR_PCVR
+    if (fresh) {
+        static bool loggedMirrorReplay = false;
+        if (!loggedMirrorReplay) {
+            sysLogPrintf(LOG_NOTE, "vr mirror: updating from replayed gameplay frames");
+            loggedMirrorReplay = true;
+        }
+        gevrMirrorAcquiredEyeFrame();
+    }
+#endif
     gfx_vr_gpu_end();
     vr_end_eye_render();
     // SpaceWarp: this game frame's motion vectors and depth, from the same moves

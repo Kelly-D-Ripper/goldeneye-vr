@@ -11,6 +11,7 @@
  * gevrAudioFrame each retrace because OS threads are stubs.
  */
 
+#include "gevr_android_paths.h"
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
@@ -324,7 +325,7 @@ static void *gevrWatchdog(void *arg)
 			}
 #ifndef _WIN32
 			/* A stack costs the process; only take one when asked for by a marker file. */
-			if (stalled >= 5 && access("/sdcard/Android/data/com.gevr.port/files/gevr_watchdog_kill.txt", F_OK) == 0) {
+			if (stalled >= 5 && access(GEVR_ANDROID_EXTERNAL_FILES "/gevr_watchdog_kill.txt", F_OK) == 0) {
 				sysLogPrintf(LOG_ERROR, "watchdog: marker present, signalling the game thread for a stack");
 				pthread_kill(gevrGameThread, SIGSEGV);
 				return NULL;

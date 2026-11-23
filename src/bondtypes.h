@@ -2570,6 +2570,16 @@ typedef union
         BeamRecord beams[2];
 
         PropRecord    *handle_positiondata_hat;
+#ifdef GEVR
+        bool           tacticalReinforcement;
+        struct {
+            f32 from[2], blindFrom;
+            s32 started, muzzleTick;
+            coord3d muzzle[2];
+            s8 target[2];
+            u8 kind, muzzleMask;
+        } tacticalCover;
+#endif
     } ChrRecord;
     // ChrRecord *pChrData; //not Global, local to Object or function
 

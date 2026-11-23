@@ -67,8 +67,9 @@ extern s32 gevrPullInPlay(void);
 extern s32 gevrPullHandFree(s32 ctrl);
 extern s32 gevrPullHandRay(s32 ctrl, f32 p[3], f32 f[3]);
 extern void gevrDisarmedMark(ChrRecord *chr);   /* gevr_disarmed.c */
-extern s32 gevrPullCollect(PropRecord *prop);
+extern s32 gevrPullCollect(PropRecord *prop, s32 ctrl);
 extern s32 gevrPullEquip(s32 ctrl, s32 item);
+extern int gevrTacticalMode(void);
 extern s32 gevrWeaponOwned(s32 item);
 extern s32 g_gevrExtraPass;            /* lv.c: an extra view pass (gevrViewPass) */
 /* online (net_core.c, net_coop.c, gevr_avatar.c) */
@@ -1044,6 +1045,21 @@ static void gevrPullFling(PropRecord *prop, const f32 vel[3], PropRecord *owner)
     }
 }
 
+/* The tactical rifle is spawned at the hand, then uses the same projectile
+ * collision and tracked velocity as the existing physical grab/throw path. */
+void gevrPullFlingFromHand(PropRecord *prop, s32 ctrl)
+{
+    const f32 zero[3] = {0, 0, 0};
+    if (prop && ctrl >= 0 && ctrl < 2)
+        gevrPullFling(prop, s_handWorldValid[ctrl] ? s_handVel[ctrl] : zero, getCurrentPlayerProp());
+}
+
+void gevrPullHandVelocity(s32 ctrl, f32 out[3])
+{
+    for (int i = 0; i < 3; i++)
+        out[i] = ctrl >= 0 && ctrl < 2 && s_handWorldValid[ctrl] ? s_handVel[ctrl][i] : 0;
+}
+
 /* a grenade is now this slot's: its blast is sent by that slot's headset (explosion.c) */
 static void gevrPullOwnGrenade(ObjectRecord *obj, s32 slot)
 {
@@ -1120,7 +1136,7 @@ static void gevrPullArrive(s32 ctrl)
     at[1] = prop->pos.y;
     at[2] = prop->pos.z;
     objtype = pl->obj->type;
-    if (gevrPullCollect(prop))
+    if (gevrPullCollect(prop, ctrl))
     {
         if (gun && !pl->released)
         {
@@ -1135,7 +1151,8 @@ static void gevrPullArrive(s32 ctrl)
         /* after the pickup's own message (gevrHandPickup): a dropped gun's copies go too */
         gevrPullSend(GEVR_PULL_NET_DONE, ctrl, pl->obj, objtype, item, 0, -1, at, NULL, 0.0f, -1);
     }
-    else if (gun && gevrWeaponOwned(item))
+    else if (gun && gevrWeaponOwned(item)
+        && !(item != ITEM_KNIFE && sysArgCheck("--tactical-physical") && gevrTacticalMode()))
     {
         /* full ammo or the pair carried: absorbed, the hand takes the copy carried */
         if (pl->obj->state & PROPSTATE_RESPAWN)

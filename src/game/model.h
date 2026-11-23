@@ -7,6 +7,7 @@
 
 
 extern s32 g_MaxModelSlots;
+extern s32 g_NumSetupModelSlots;
 extern s32 g_MaxAnimModelSlots;
 extern s32 g_ModelIsLvResetting;
 

@@ -39,6 +39,7 @@
 #include "gevr_bodyslot.h"
 #include "gevr_bodyslots.h"
 #include "gevr_hand_reload.h"
+#include "gevr_tactical_mesh.h"
 
 extern int VrBodySlots, VrBodySlotShow, VrBodySlotSize, VrLeftHandedMode;
 extern float VrBodySlotFit[GEVR_BODY_SLOTS][3];
@@ -266,7 +267,7 @@ static void gevrBodyPickName(s32 hand, s32 pick, char *out, s32 size)
 /* live this tick: the option, stereo first-person play, none of the menus */
 static s32 gevrBodyInPlay(void)
 {
-    return VrBodySlots && g_gevrStereo && g_CurrentPlayer != NULL && !g_CurrentPlayer->bonddead
+    return VrBodySlots && !(sysArgCheck("--tactical-physical") && gevrTacticalCampaignRules()) && g_gevrStereo && g_CurrentPlayer != NULL && !g_CurrentPlayer->bonddead
         && g_CurrentPlayer->watch_animation_state == 0 && !g_CurrentPlayer->mpmenuon
         && g_PlayerIsInTank != 1 && !gevrSpectating() && !gevrCoopLocalDowned()
         && !gevrWeaponPanelOpen && (gevrGunFitActive != 1 || gevrBodySlotFitting) && D_800364CC > 1e-6f;
@@ -371,7 +372,18 @@ static s32 gevrBodyFrameUpdate(void)
             if (gevrReloadBeltAtHand(ctrl)) freeze = TRUE;
         }
     }
-    if (gevrBodyTorsoUpdate(&s_bodyTorso, hp, follow, (f32) g_ClockTimer, freeze, s_bodyTune[BT_TWIST], 45.0f))
+    /* Use elapsed time for the tactical body's smoothing instead of whole
+     * 60 Hz game ticks, which alternate between zero and one on a 90 Hz G2. */
+    f32 followTicks = (f32)g_ClockTimer;
+    if (sysArgCheck("--tactical-physical")) {
+        static u64 lastBodyUs;
+        u64 now = sysGetMicroseconds();
+        if (s_bodyFrameValid && lastBodyUs && now >= lastBodyUs && now-lastBodyUs < 250000)
+            followTicks = (f32)(now-lastBodyUs) * (60.0f/1000000.0f);
+        else followTicks = 0;
+        lastBodyUs = now;
+    }
+    if (gevrBodyTorsoUpdate(&s_bodyTorso, hp, follow, followTicks, freeze, s_bodyTune[BT_TWIST], 45.0f))
     {
         sysLogPrintf(LOG_NOTE, "bodyslot: torso starts at the head (%s)", s_bodyFrameValid ? "it jumped" : "first frame");
     }
@@ -548,7 +560,8 @@ void gevrBodySlotsTick(void)
         }
         /* Hand reload still needs the same torso with holsters disabled,
          * while choosing a weapon, and while calibrating its belt. */
-        if (gevrHandReloadActive() && !g_CurrentPlayer->bonddead && !g_CurrentPlayer->watch_animation_state
+        extern int gevrTacticalMode(void);
+        if ((gevrHandReloadActive() || gevrTacticalMode()) && !g_CurrentPlayer->bonddead && !g_CurrentPlayer->watch_animation_state
             && !g_CurrentPlayer->mpmenuon && g_PlayerIsInTank != 1 && !gevrSpectating()
             && !gevrCoopLocalDowned() && D_800364CC > 1e-6f)
             s_bodyFrameValid = gevrBodyFrameUpdate();

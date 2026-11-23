@@ -626,7 +626,7 @@ static const Row s_rows[] = {
     CHOICE_VR(GEVR_SEC_CONTROLS, "Controllers", VrTouchModel, s_touch, s_touchNames, "Which Touch controllers the watch's Controls page shows."),
 
     /* Gestures */
-    TOGGLE(GEVR_SEC_GESTURES, "Watch gesture", VrWatchGesturePause, "Raise your watch to open it."),
+    TOGGLE(GEVR_SEC_GESTURES, "Watch gesture", VrWatchGesturePause, "Raise your wrist to open the watch. Lower it in Tactical co-op to close."),
     TOGGLE(GEVR_SEC_GESTURES, "Body slots WIP", VrBodySlots, "Holsters on your body: reach and grip to draw or put away."),
     { .label = "Slot size", .headset = 1, .tooltip = "How far from a slot your hand still reaches it.", .kind = GEVR_SET_CHOICE,
       .section = GEVR_SEC_GESTURES, .where = GEVR_SET_BOTH, .ivar = &VrBodySlotSize, .ivalues = s_three,

@@ -439,11 +439,24 @@ void gevrAudioMarkReady(void)
 	gevrAudioRetraces = 0;
 }
 
-void gevrAudioFrame(void)
+static void gevrMixAudioFrame(void)
 {
-	AudioInfo *info;
+	AudioInfo *info = g_AudioManager.audioInfo[g_AudioFrameCount % 3];
 	AudioInfo *done = NULL;
 
+	amHandleFrameMessage(info, NULL);
+
+	if (osRecvMesg(&g_AudioManager.replyMessageQueue, (OSMesg *)&done, OS_MESG_NOBLOCK) == 0 && done) {
+		amHandleDoneMessage(done);
+        /* Soft execution is complete; do not hold PCM for another retrace pair. */
+        osAiSetNextBuffer(done->data, done->frameSamples * 4);
+	}
+
+	audioEndFrame();
+}
+
+void gevrAudioFrame(void)
+{
 	if (!gevrAudioPumpArmed || !g_AudioManager.audioInfo[0]) {
 		return;
 	}
@@ -459,16 +472,14 @@ void gevrAudioFrame(void)
     if (gevrAudioRetraces++ & ((1u << FRAMES_PER_FIELD_AS_POW2) - 1)) {
         return;
     }
-	info = g_AudioManager.audioInfo[g_AudioFrameCount % 3];
-	amHandleFrameMessage(info, NULL);
 
-	if (osRecvMesg(&g_AudioManager.replyMessageQueue, (OSMesg *)&done, OS_MESG_NOBLOCK) == 0 && done) {
-		amHandleDoneMessage(done);
-        /* Soft execution is complete; do not hold PCM for another retrace pair. */
-        osAiSetNextBuffer(done->data, done->frameSamples * 4);
-	}
-
-	audioEndFrame();
+    gevrMixAudioFrame();
+    /* A long retrace may drain SDL while the game skips catch-up retraces.
+     * Rebuild the reserve one extra block at a time instead of waiting for
+     * the few extra samples normally generated in each block. */
+    if (audioRequestQueueRefill(2 * g_FrameSize)) {
+        gevrMixAudioFrame();
+    }
 }
 #endif
 

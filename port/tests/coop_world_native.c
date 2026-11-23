@@ -4,7 +4,7 @@
 #include "net_coop.h"
 #include "aicommands2.h"
 #include "game/explosion.h"
-#define MAX_WEAPON_SLOTS 30
+#define MAX_WEAPON_SLOTS 256
 #define MAX_AMMO_CRATES 20
 #include <assert.h>
 #include <stdio.h>
@@ -113,6 +113,8 @@ void monitorSetImageByNum(MonitorRecord *mon, s32 bank) { mon->offset = bank; mo
 void fogSwitchToSolosky2(f32 fraction) { fog = fraction; }
 /* Mario Characters' changed AI commands (gevr_footsteps.c): off, as in GoldenEye */
 int gevrRomFootsteps(void) { return 0; }
+s32 gevrFootstepsPlayerList(const u8 *list) { (void)list; return 0; }
+void gevrFootstepsRunningLocal(s32 on) { (void)on; }
 void gevrFootstepsSoundAt(s32 sound, struct coord3d *pos) { (void)sound;(void)pos; assert(0); }
 void gevrFootstepsSwapSkies(void) { assert(0); }
 s32 gevrFootstepsTakeWrites(u32 *start, u32 *len, s32 cap) { (void)start;(void)len;(void)cap; return 0; }
@@ -257,6 +259,19 @@ static void test_glass(void)
     assert((setup.tinted.runtime_bitflags & RUNTIMEBITFLAG_REMOVE) && (setup.tinted.state & PROPSTATE_DESTROYED));
     assert(shards==0);
 }
+static void test_local_pool_is_not_a_wire_identity(void)
+{
+    init_objects(); host = 1; local = s_local_slot = 2;
+    ObjectRecord *last = (ObjectRecord *)&g_WeaponSlots[MAX_WEAPON_SLOTS - 1];
+    last->type = PROPDEF_COLLECTABLE;
+    assert(netObjectIndex(last) == -1);
+    assert(netObjectByIndex(0x80ff, PROPDEF_COLLECTABLE) == NULL);
+    unsigned before = sends;
+    netSendObjectEvent(s_local_slot, last, NET_OBJECT_PICKUP, 0);
+    assert(sends == before);
+    netSendWorldSnapshot(NULL);
+    assert(sends == before + 1 && packet[6] == NET_MSG_WORLD_SNAPSHOT && packet[8] == 3);
+}
 static u8 mission[] = {
     AI_SetObjectFlags2,7,0,0,0,4,
     AI_UnsetObjectFlags2,7,0,0,0,4,
@@ -339,7 +354,7 @@ static void test_blasts(void)
 }
 int main(void)
 {
-    test_clock(); test_glass(); test_scripts(); test_blasts();
+    test_clock(); test_glass(); test_local_pool_is_not_a_wire_identity(); test_scripts(); test_blasts();
     puts("PASS: countdown/gas, script validation and drop-in replay, glass events/snapshots, world blast ownership and deduplication");
     return 0;
 }

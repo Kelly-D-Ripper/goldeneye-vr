@@ -1,6 +1,7 @@
 """Native regression checks for the original right watch hand and separate left arm."""
 from pathlib import Path
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -53,6 +54,7 @@ production = "\n".join((
     function(state, "f32 get_value_if_watch_is_on_hand_or_not("),
     function(state, "void sub_GAME_7F05E6B4("),
     function(gun, "static void gevrWatchHandTickHiddenFinger("),
+    function(view, "static s32 gevrTacticalWatchFrame("),
     function(view, "static s32 gevrWatchFaceFrame("),
     function(view, "s32 gevrStereoWatchHandMatrix("),
     function(gun, "static s32 gevrWatchHandKeepPressingHand("),
@@ -84,6 +86,7 @@ fixture = r'''
 #include <string.h>
 #include <assert.h>
 #include "game/matrixmath.h"
+#include "gevr_tactical_mesh.h"
 #define sysLogPrintf(...) ((void)0)
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
@@ -95,6 +98,18 @@ static float VrGunOffX = 2.74f, VrGunOffY = 1.94f, VrGunOffZ = -12.35f;
 static int s_gevrWatchFaceKnown = 1;
 static float s_gevrWatchFaceCm[3] = {1.5f, 0.7f, -0.2f};
 static Mtxf poses[2];
+static Mtxf fittedGlove;
+static int fittedWatch;
+static const GevrTacticalWatchMount fittedMount = {
+    .centre = {14, 16, -33}, .along = {0, 0, 1}, .normal = {0.34202f, 0.93969f, 0},
+};
+static int gevrTacticalTrackedWatch(Mtxf *glove, GevrTacticalWatchMount *mount)
+{
+    if (!fittedWatch) return 0;
+    *glove = fittedGlove;
+    *mount = fittedMount;
+    return 1;
+}
 static struct player player;
 struct player *g_CurrentPlayer = &player;
 static int g_GlobalTimerDelta = 1;
@@ -141,6 +156,46 @@ static Mtxf snap(void)
     Mtxf m;
     assert(gevrStereoWatchHandMatrix(&m));
     return m;
+}
+static void checkFittedWatch(void)
+{
+    const float levels[] = {0.2f, 1};
+    const int gadgets[] = {ITEM_WATCHMAGNETATTRACT, ITEM_TRIGGER};
+    const coord3d tilt = {.x = .4f, .y = -.9f, .z = 1.1f};
+    fittedWatch = 1;
+    size = 1;
+    memcpy(s_gevrWatchHandTrim, (float[]){0, 0, 0, 0, 0, 0, 1}, sizeof(s_gevrWatchHandTrim));
+    for (int item = 0; item < 2; ++item)
+    for (int level = 0; level < 2; ++level)
+    for (int mirror = 0; mirror < 2; ++mirror) {
+        player.hands[GUNRIGHT].weaponnum = gadgets[item];
+        D_800364CC = levels[level];
+        VrLeftHandedMode = mirror;
+        matrix_4x4_set_rotation_around_xyz((coord3d *)&tilt, &fittedGlove);
+        for (int axis = 0; axis < 3; ++axis)
+        for (int i = 0; i < 3; ++i)
+            fittedGlove.m[axis][i] *= levels[level] * (axis == 0 && mirror ? -1 : 1);
+        fittedGlove.m[3][0] = -14;
+        fittedGlove.m[3][1] = 35;
+        fittedGlove.m[3][2] = -85;
+        float face[3], along[3], normal[3], side[3];
+        assert(gevrWatchFaceFrame(face, along, normal, side));
+        closeEnough(dot(along, normal), 0);
+        closeEnough(dot(normal, normal), 1);
+        closeEnough(dot(side, side), 1);
+        Mtxf hand = snap();
+        assert(determinant(&hand) > 0);
+        for (int i = 0; i < 3; ++i) {
+            float shown = fittedGlove.m[3][i], fingertip = hand.m[3][i];
+            for (int axis = 0; axis < 3; ++axis) {
+                shown += fittedMount.centre[axis] * fittedGlove.m[axis][i];
+                fingertip += s_gevrLaserFace[axis] * hand.m[axis][i];
+            }
+            closeEnough(face[i], shown);
+            closeEnough(fingertip, shown);
+        }
+    }
+    fittedWatch = 0;
 }
 static void checkFinger(const Mtxf *base)
 {
@@ -392,7 +447,8 @@ int main(void)
     }
     checkWatchFaces();
     checkSnapReach();
-    puts("watch grip: palm/finger retained, old hand/sleeves hidden, wrist poses, animation, watch filtering and snap hysteresis passed");
+    checkFittedWatch();
+    puts("watch grip: wrist poses, fitted watch contact, finger animation, watch filtering and snap hysteresis passed");
     return 0;
 }
 '''
@@ -401,7 +457,7 @@ with tempfile.TemporaryDirectory(prefix="gevr-watch-grip-") as temp:
     source = Path(temp) / "watch_grip.c"
     exe = Path(temp) / "watch_grip.exe"
     source.write_text(fixture, encoding="utf-8")
-    args = [shutil.which("gcc") or "gcc", "-std=gnu11", "-O2", "-D_LANGUAGE_C=1",
+    args = [os.environ.get("CC") or shutil.which("gcc") or "gcc", "-std=gnu11", "-O2", "-D_LANGUAGE_C=1",
             "-Wno-builtin-declaration-mismatch"]
     args += ["-I" + str(ROOT / folder) for folder in (".", "include", "src", "port/include")]
     subprocess.run(args + [str(source), "-o", str(exe), "-lm"], check=True)

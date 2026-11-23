@@ -11,6 +11,10 @@
 #include "cheat.h"
 #include "chr.h"
 #include "chrai.h"
+#ifdef GEVR
+#include "gevr_tactical_optics.h"
+#include <music.h>
+#endif
 #include "chraction.h"
 #include "chrobjdata.h"
 #include "debugmenu_handler.h"
@@ -34,6 +38,9 @@
 #include "gevr_romlayout.h"
 #include "gevr_ragdoll.h"
 #include "gevr_avatar.h"
+#include "gevr_guard_cigarettes.h"
+#include "gevr_guard_cover.h"
+#include "gevr_hollywood_fx.h"
 #endif
 #include "propobj.h"
 #include "stan.h"
@@ -44,6 +51,17 @@
 #include "vtxstore.h"
 #include "bgfog.h"
 #include "tex.h"
+
+#ifdef GEVR
+#include "boss.h"
+#include "system.h"
+#include "gevr_enemy_rig.inc.h"
+#ifdef _WIN32
+#include "gevr_tactical_editor_capture.inc.h"
+#else
+static PropRecord *const g_gevrEditorPreviewActor = NULL;
+#endif
+#endif
 
 #ifdef VERSION_EU
 #define GROUND_SMOOTH_FACTOR 0.118799984f /* 0x3DF34D68 (PAL-scaled 0.1) */
@@ -1733,6 +1751,10 @@ PropRecord *init_GUARDdata_with_set_values(PropRecord *arg0, Model *arg1, struct
     var_s0->weapons_held[0] = NULL;
     var_s0->weapons_held[1] = NULL;
     var_s0->handle_positiondata_hat = NULL;
+#ifdef GEVR
+    var_s0->tacticalReinforcement = FALSE;
+    memset(&var_s0->tacticalCover, 0, sizeof(var_s0->tacticalCover));
+#endif
     var_s0->chrwidth = 20.0f;
     var_s0->chrheight = 185.0f;
 
@@ -1775,6 +1797,10 @@ void chrpropCleanupForRemoval(PropRecord *prop)
 
     chr = prop->chr;
     model = chr->model;
+#ifdef GEVR
+    gevrAvatarGuardForget(chr);
+    gevrGuardCigarettesForget(chr);
+#endif
 #ifdef GEVR
     gevrRagdollForgetChr(chr);
 #endif
@@ -2461,6 +2487,7 @@ s32 chrTick(PropRecord *prop)
      * one player, its AI and fire run as that player (set_cur_player).
      */
     const s32 gevrPuppet = !gevrStill && prop->type == PROP_TYPE_CHR && gevrCoopPuppets();
+    const s32 gevrHostGuard = !gevrStill && prop->type == PROP_TYPE_CHR && gevrCoopHostGuards();
     s32 gevrTarget = -1;
     s32 gevrPrevPlayer = 0;
 #endif
@@ -2468,11 +2495,14 @@ s32 chrTick(PropRecord *prop)
     renderdata = D_8002CC6C;
     chr = prop->chr;
     model = chr->model;
+#ifdef GEVR
+    gevrAvatarGuardForget(chr);
+#endif
     headVisible = 1;
     tickamount = g_ClockTimer;
 
 #ifdef GEVR
-    if (!gevrStill && prop->type == PROP_TYPE_CHR && gevrCoopHostGuards())
+    if (gevrHostGuard)
     {
         gevrTarget = gevrCoopGuardTarget(chr);
     }
@@ -2508,6 +2538,15 @@ s32 chrTick(PropRecord *prop)
                 chrlvActionTick(chr);
                 g_gevrCoopGuardTick = FALSE;
                 set_cur_player(gevrPrevPlayer);
+            }
+            else if (gevrHostGuard)
+            {
+                /* Run mission scripts without giving the guard a downed
+                 * player to see. Native player-targeted shots are held below. */
+                const s32 visible = bondviewGetVisibleToGuardsFlag();
+                bondviewSetVisibleToGuardsFlag(FALSE);
+                chrlvActionTick(chr);
+                bondviewSetVisibleToGuardsFlag(visible);
             }
             else
 #endif
@@ -2748,9 +2787,24 @@ after_position_update:
 #ifdef GEVR
         gevrAvatarApply(chr, &renderdata);
         gevrRagdollCapture(chr);
+        if (chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD)
+            gevrBloodyCombatAnimatedWound(model, prop->stan ? getTileRoom(prop->stan) : -1);
 #endif
 
         g_ModelJointPositionedFunc = NULL;
+#ifdef GEVR
+        if (sysArgCheck("--tactical-enemy-rigs") && sysArgCheck("--tactical-mesh") && gevrTacticalCampaignRules()
+            && prop->type == PROP_TYPE_CHR && (chr->weapons_held[GUNRIGHT] || chr->weapons_held[GUNLEFT]) && !g_gevrExtraPass
+            && chr->actiontype != ACT_DIE && chr->actiontype != ACT_DEAD) {
+            const PropRecord *right = chr->weapons_held[GUNRIGHT];
+            const int kind = right && right->weapon ? gevrTacticalItem(right->weapon->weaponnum) : -1;
+            /* A no-draw pass gives the IK the native attachment matrix. */
+            if (kind >= 0 && !chr->weapons_held[GUNLEFT] && !tacticalGunIsPistol(kind) && kind != TACTICAL_GUN_RPG)
+                chrRenderHeldWeapon(prop, GUNRIGHT, NULL);
+            gevrAvatarGuardApply(chr, &renderdata);
+        }
+        const int coverApplied = gevrGuardCoverApply(chr);
+#endif
         modelSetDistanceScale(1.0f);
 
 #ifdef GEVR
@@ -2764,6 +2818,10 @@ after_position_update:
 
         chrRenderHeldWeapon(prop, GUNRIGHT, (Gfx **)(&chr->field_20));
         chrRenderHeldWeapon(prop, GUNLEFT, (Gfx **)(&chr->field_20));
+
+#ifdef GEVR
+        if (coverApplied) gevrGuardCoverCaptureMuzzles(chr);
+#endif
 
         if (chr->handle_positiondata_hat != NULL)
         {
@@ -3086,6 +3144,13 @@ gevr_hat_seated:
             g_gevrCoopGuardViewToWorld = NULL;
             set_cur_player(gevrPrevPlayer);
         }
+        else if (gevrHostGuard && !(chr->actiontype == ACT_ATTACK
+            && (chr->act_attack.attacktype & ATTACKTYPE_TARGET)
+            && (chr->chrflags & CHRFLAG_CAN_SHOOT_CHRS)))
+        {
+            chrStopFiring(chr);
+            chr->hidden &= ~(CHRHIDDEN_FIRE_TRACER | CHRHIDDEN_FIRE_WEAPON_RIGHT | CHRHIDDEN_FIRE_WEAPON_LEFT);
+        }
         else if (!gevrStill && !gevrPuppet)
 #endif
         chrlvTriggerFireWeapon(chr);
@@ -3100,6 +3165,11 @@ gevr_hat_seated:
  */
 void chrDropItems(ChrRecord *self)
 {
+#ifdef GEVR
+    /* Misses, explosions and distant kills can drop the last held weapon
+     * before the body is first drawn. Capture its loadout before that drop. */
+    gevrEnemyRigForDraw(self);
+#endif
     PropRecord *childprop = self->prop->child;
     while (childprop)
     {
@@ -3196,6 +3266,11 @@ Gfx *chrRenderProp(PropRecord *prop, Gfx *gdl, s32 withalpha)
         f32 f = chrobjFogVisRangeRelated(prop, getinstsize(chrmodel)); //0-1
         chrfadealpha = (s32) (f * (f32) chrfadealpha);
     }
+#ifdef GEVR
+    if (sysArgCheck("--tactical-rig-visibility-test") && sysArgCheck("--tactical-sim")
+        && sysArgCheck("--input-script") && chrfadealpha > 0)
+        chrfadealpha = 192;
+#endif
 
     if ((chrfadealpha < 0xFF) || (chr->chrflags & CHRFLAG_00020000))
     {
@@ -3305,9 +3380,22 @@ Gfx *chrRenderProp(PropRecord *prop, Gfx *gdl, s32 withalpha)
             {
                 gDPNoOpTag(mrData.gdl++, 0x56620000 | (u8)chrfadealpha);
             }
+            const s32 warm = sysArgCheck("--tactical-gear") && chr->actiontype != ACT_DEAD;
+            if (warm) gDPNoOpTag(mrData.gdl++, GEVR_OPTIC_SCOPE_WARM);
+#ifdef _WIN32
+            const int capture = gevrEditorCaptureActor(chr, withalpha);
+            if (capture) gDPNoOpTag(mrData.gdl++, GEVR_EDITOR_CAPTURE_BEGIN);
+#endif
 #endif
             drawjointlist(&mrData, chr->field_20);
 #ifdef GEVR
+#ifdef _WIN32
+            if (capture) gDPNoOpTag(mrData.gdl++, GEVR_EDITOR_CAPTURE_END);
+#endif
+            if (warm) gDPNoOpTag(mrData.gdl++, GEVR_OPTIC_SCOPE_COLD);
+            mrData.gdl = gevrEnemyRigDraw(chr, &mrData, mrData.gdl, withalpha, chrfadealpha);
+            if (!withalpha)
+                mrData.gdl = gevrAvatarTacticalDraw(chr, &mrData, mrData.gdl);
             {
                 /* other players' first-person gun models (gevr_heldgun.c) */
                 extern Gfx *gevrHeldGunDraw(ChrRecord *chr, ModelRenderData *body, Gfx *gdl, s32 withalpha);
@@ -3453,11 +3541,29 @@ void chrCreateHitPuffs(PropRecord *prop, s32 anim_id, coord3d *vec, coord3d *pos
 }
 
 
+#ifdef GEVR
+static void chrDarkenWound(Vertex *vertices, int count, const Vertex *contact, int hitpart)
+{
+    const float radius = hitpart == HIT_HEAD ? 105.f : 158.f;
+    for (int i = 0; i < count; ++i) {
+        const float dx = vertices[i].coord.x - contact->coord.x;
+        const float dy = vertices[i].coord.y - contact->coord.y;
+        const float dz = vertices[i].coord.z - contact->coord.z;
+        const float t = (dx*dx + dy*dy + dz*dz) / (radius * radius);
+        if (t >= 1.f) continue;
+        const int alpha = (int)(14.f + 241.f * t);
+        if (vertices[i].a > alpha) vertices[i].a = (u8)alpha;
+    }
+}
+#endif
+
 static void chrPaintBloodStainVertices(
     const ModelRoData_DisplayList_CollisionRecord *rodata,
     ModelRwData_DisplayList_CollisionRecord *rwdata,
     s32 colIndex,
-    s32 paintval)
+    s32 paintval,
+    s32 darkWound,
+    s32 hitpart)
 {
     s32 index;
     s32 steps;
@@ -3473,6 +3579,14 @@ static void chrPaintBloodStainVertices(
         return;
     }
 
+#ifdef GEVR
+    if (darkWound)
+        chrDarkenWound(rwdata->Vertices, rodata->numVertices,
+                      &rodata->CollisionVertices[colIndex], hitpart);
+#else
+    (void)darkWound;
+    (void)hitpart;
+#endif
     index = rodata->CollisionVertices[colIndex].index;
     steps = 0;
 
@@ -3649,6 +3763,12 @@ after_opcode:
         paintval += 50;
     }
 
+#ifdef GEVR
+    const int darkWound = gevrBloodyCombatEffects();
+    if (darkWound) paintval = 14;
+#else
+    const int darkWound = 0;
+#endif
     /* a segment-5 offset into the model file; the record's BaseAddr is that file */
     relatednode = NULL;
 
@@ -3704,7 +3824,7 @@ after_opcode:
 
     chrPaintBloodStainVertices((ModelRoData_DisplayList_CollisionRecord *) node,
                                (ModelRwData_DisplayList_CollisionRecord *) rwdata,
-                               bestindex, paintval);
+                               bestindex, paintval, darkWound, arg1);
 
 #ifdef GEVR
     /* the bruise, for a Bean body's own vertices (gevr_bean_wounds.inc.h) */
@@ -3716,9 +3836,36 @@ after_opcode:
                           pos, paintval);
     }
 #endif
-    chrPaintBloodStainVertices(relatedrodata, relatedrwdata, relatedindex, paintval);
+    chrPaintBloodStainVertices(relatedrodata, relatedrwdata, relatedindex, paintval, darkWound, arg1);
 }
 
+
+#ifdef GEVR
+static Model *gevrChrArmorHelmet(const ChrRecord *chr)
+{
+    PropRecord *hat = chr->handle_positiondata_hat;
+    return hat && hat->obj && gevrTacticalHelmetModel(hat->obj->model) ? hat->obj->model : NULL;
+}
+
+static bool gevrChrHelmetImpact(const ChrRecord *chr, Model *helmet, const ShotData *shot, coord3d *impact)
+{
+    if (!helmet || !helmet->render_pos || shot->viewDir.z >= -1e-6f
+        || !gevrTacticalIsArmorShot(shot->weapon)) return FALSE;
+    const PropRecord *hat = chr->handle_positiondata_hat;
+    const int hits = gevrTacticalHelmetHits(hat);
+    if (hits > 0 && hat->obj->damage >= hits) return FALSE;
+    Mtxf inverse;
+    matrix_4x4_invert_affine(&helmet->render_pos[0].pos, &inverse);
+    coord3d localOrigin = shot->viewOrigin, localDir = shot->viewDir;
+    mtx4TransformVecInPlace(&inverse, &localOrigin);
+    mtx4RotateVecInPlace(&inverse, &localDir);
+    const float limit = (shot->maxdist + shot->viewOrigin.z) / -shot->viewDir.z;
+    const float at = gevrTacticalHelmetRaycast(helmet, localOrigin.f, localDir.f, limit);
+    if (at < 0.f) return FALSE;
+    for (int axis = 0; axis < 3; ++axis) impact->f[axis] = shot->viewOrigin.f[axis] + at * shot->viewDir.f[axis];
+    return TRUE;
+}
+#endif
 
 /**
  * 
@@ -3822,15 +3969,15 @@ static void chrTestHitAnimated(PropRecord *prop, ShotData *shotdata)
     Model *hitmodel;
     ModelNode *hitnode;
     s32 hitbounds;
-    struct HitThing hitthing;
-    s32 mtxindex;
+    struct HitThing hitthing = {0};
+    s32 mtxindex = 0;
     ModelNode *dlnode;
     Mtxf *submatrix;
     f32 heldmodelsize;
     Mtxf *nodemtx;
     f32 len;
     struct WeaponObjRecord *weapon;
-    f32 dist;
+    f32 dist = shotdata->maxdist;
     ModelHitEntry *entry;
     coord3d viewdir;
     f32 size;
@@ -3851,6 +3998,9 @@ static void chrTestHitAnimated(PropRecord *prop, ShotData *shotdata)
 
     model = chr->model;
     modelsize = getinstsize(model);
+#ifdef GEVR
+    Model *helmet = gevrChrArmorHelmet(chr);
+#endif
 
     if ((prop->flags & PROPFLAG_ONSCREEN) == FALSE)
     {
@@ -3900,7 +4050,11 @@ static void chrTestHitAnimated(PropRecord *prop, ShotData *shotdata)
 
         while ((hitpart == HIT_GUN) || (hitpart == HIT_HAT))
         {
-            if (propobjFindHit(hitmodel, hitnode, &shotdata->viewOrigin, &shotdata->viewDir, &hitthing, &mtxindex, &dlnode))
+            if (
+#ifdef GEVR
+                !(hitpart == HIT_HAT && (!chr->handle_positiondata_hat || (helmet && hitmodel == helmet))) &&
+#endif
+                propobjFindHit(hitmodel, hitnode, &shotdata->viewOrigin, &shotdata->viewDir, &hitthing, &mtxindex, &dlnode))
             {
                 break;
             }
@@ -3974,11 +4128,51 @@ static void chrTestHitAnimated(PropRecord *prop, ShotData *shotdata)
 
         len = sqrtf((diff.z * diff.z) + ((diff.x * diff.x) + (diff.y * diff.y)));
         dist = -((shotdata->viewDir.z * len) + shotdata->viewOrigin.z);
+    }
 
-        if (dist < shotdata->maxdist)
-        {
-            chrpropAddBulletHit(shotdata, prop, dist, hitpart, hitnode, &hitthing, mtxindex, dlnode, hitmodel, TRUE, FALSE);
+#ifdef GEVR
+    HitThing armor = {.texturenum = -1};
+    ModelNode *vest = hitbounds ? gevrEnemyVestImpact(chr, shotdata, &armor.hitpos) : NULL;
+    HitThing shell = {.texturenum = -1};
+    if (hitbounds && helmet) {
+        const f32 surface = hitpart > HIT_NULL_PART
+            ? gevrChrBulletSurfaceDepth(shotdata, hitmodel, hitnode, dist) : shotdata->maxdist;
+        bool helmetHit = gevrChrHelmetImpact(chr, helmet, shotdata, &shell.hitpos) && -shell.hitpos.z <= surface;
+        /* Closed helmets protect the head through seams between the shell,
+         * visor and mask. The visible mesh supplies the usual impact. */
+        if (!helmetHit && gevrTacticalPermanentHelmet(chr->handle_positiondata_hat)
+            && (hitpart == HIT_HEAD || hitpart == HIT_HAT) && surface <= shotdata->maxdist
+            && shotdata->viewDir.z < -1e-6f && gevrTacticalIsArmorShot(shotdata->weapon)) {
+            const f32 t = (-surface - shotdata->viewOrigin.z) / shotdata->viewDir.z;
+            for (int axis = 0; axis < 3; ++axis)
+                shell.hitpos.f[axis] = shotdata->viewOrigin.f[axis] + t * shotdata->viewDir.f[axis];
+            helmetHit = TRUE;
         }
+        if (helmetHit && (!vest || shell.hitpos.z >= armor.hitpos.z)) {
+            chrpropAddBulletHit(shotdata, prop, -shell.hitpos.z, GEVR_HIT_TACTICAL_HELMET, NULL,
+                &shell, 0, 0, helmet, FALSE, TRUE);
+            return;
+        }
+    }
+    if (vest) {
+        /* Forearms and weapons can overlap the plate from the player's
+         * view. A round crossing the vest still stops on it. A visible head
+         * or leg in front of the vest keeps its own hit. */
+        const bool exposed = hitpart == HIT_HEAD || hitpart == HIT_HAT
+            || hitpart == HIT_LEFT_LEG || hitpart == HIT_RIGHT_LEG
+            || hitpart == HIT_LEFT_FOOT || hitpart == HIT_RIGHT_FOOT;
+        const f32 first = exposed
+            ? gevrChrBulletSurfaceDepth(shotdata, hitmodel, hitnode, dist) : shotdata->maxdist;
+        if (-armor.hitpos.z <= first) {
+            chrpropAddBulletHit(shotdata, prop, -armor.hitpos.z, GEVR_HIT_KLMK_VEST, vest,
+                &armor, 0, 0, model, FALSE, TRUE);
+            return;
+        }
+    }
+#endif
+    if (hitpart > HIT_NULL_PART && dist < shotdata->maxdist)
+    {
+        chrpropAddBulletHit(shotdata, prop, dist, hitpart, hitnode, &hitthing, mtxindex, dlnode, hitmodel, TRUE, FALSE);
     }
 
     if (hitbounds && (prop->zDepth <= shotdata->maxdist))
@@ -3990,6 +4184,13 @@ static void chrTestHitAnimated(PropRecord *prop, ShotData *shotdata)
 
 
 /* IK is presentation only: hit tests use the original animated body pose. */
+#ifdef GEVR
+static bool s_klmkShotCheckPending;
+static void gevrTacticalRunKlmkShotCheck(ChrRecord *chr);
+
+void gevrTacticalKlmkShotCheck(void) { s_klmkShotCheckPending = TRUE; }
+#endif
+
 void chrTestHit(PropRecord *prop, ShotData *shotdata)
 {
 #ifdef GEVR
@@ -4009,6 +4210,15 @@ void chrTestHit(PropRecord *prop, ShotData *shotdata)
     posed = model ? model->render_pos : NULL;
     base = model ? gevrAvatarCollisionPose(model) : NULL;
     if (base) model->render_pos = base;
+    if (s_klmkShotCheckPending && model && model->render_pos && gevrEnemyVestSelected(prop->chr) != GEVR_VEST_NONE
+        && (prop->flags & PROPFLAG_ONSCREEN)
+        && (g_gevrEditorPreviewActor ? prop == g_gevrEditorPreviewActor
+            : (!(gevrTacticalFacilityArmor() || gevrTacticalHeavyGuards(bossGetStageNum()))
+                || prop->chr->chrnum == sysArgGetInt("--tactical-klmk-guard",
+                    gevrTacticalFacilityArmor() ? GEVR_FACILITY_CORRIDOR_CENTER : GEVR_DAM_KORUND_GUARD)))) {
+        s_klmkShotCheckPending = FALSE;
+        gevrTacticalRunKlmkShotCheck(prop->chr);
+    }
 #endif
     chrTestHitAnimated(prop, shotdata);
 #ifdef GEVR
@@ -4040,6 +4250,39 @@ void chrHandleBulletHit(struct ShotData *shot, struct BulletHit *bhit)
 
     chr = bhit->prop->chr;
 
+#ifdef GEVR
+    if (gevrChrArmorHitPart(bhit->hitpart)) {
+        coord3d impact = bhit->hit.hitpos;
+        mtx4TransformVecInPlace(currentPlayerGetViewToWorldMtxf(), &impact);
+        gunSetTracerTarget(&impact);
+        extern s16 metal_ricochet_SFX[3];
+        ALSoundState *ricochet = sndPlaySfx((struct ALBankAlt_s *)g_musicSfxBufferPtr,
+            metal_ricochet_SFX[randomGetNext() % 3U], NULL);
+        if (ricochet) chrobjSndCreatePostEventDefault(ricochet, &impact);
+        /* Use the standard wall impact sprite on a stopped shot. */
+        if (bhit->prop->stan) bullet_spark_create(&impact, 1, 26.f, getTileRoom(bhit->prop->stan));
+        chr->chrflags |= CHRFLAG_NEAR_MISS;
+        chr->numclosearghs++;
+        if (bhit->hitpart == GEVR_HIT_TACTICAL_HELMET) {
+            PropRecord *hat = chr->handle_positiondata_hat;
+            const int hits = gevrTacticalHelmetHits(hat);
+            if (hits > 0 && hat->obj->model == bhit->model) {
+                const int strike = ++hat->obj->damage;
+                if (strike >= hits) {
+                    propobjSetDropped(hat, DROPTYPE_HAT);
+                    if (!objDrop(hat)) hat->obj->damage = hits - 1;
+                }
+                if (sysArgCheck("--input-script"))
+                    sysLogPrintf(LOG_NOTE, "tactical helmet: guard %d strike %d, detached %d, damage %.3f",
+                        chr->chrnum, strike, hat->parent == NULL, (double)chr->damage);
+            }
+        } else if (sysArgCheck("--input-script")) {
+            sysLogPrintf(LOG_NOTE, "tactical vest: stopped item %d on guard %d, damage %.3f", shot->weapon, chr->chrnum, (double)chr->damage);
+        }
+        return;
+    }
+#endif
+
     // Calculate the view space hit position for impact effects.
     hitpos.f[0] = shot->viewOrigin.x - ((bhit->dist * shot->viewDir.x) / shot->viewDir.z);
     hitpos.f[1] = shot->viewOrigin.y - ((bhit->dist * shot->viewDir.y) / shot->viewDir.z);
@@ -4062,13 +4305,43 @@ void chrHandleBulletHit(struct ShotData *shot, struct BulletHit *bhit)
     // Make a fleshy impact sound.
     recall_joy2_hits_edit_detail_edit_flag(shot->weapon, bhit->prop, -1);
 
-    chrCreateHitPuffs(bhit->prop, bhit->hitpart, &hitpos, &nearhitpos);
+#ifdef GEVR
+    coord3d impact = {0};
+    const int wasDead = chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD;
+    const int sharedBlood = gevrCoopGuardGore(chr);
+    const float beforeDamage = chr->damage;
+    int impactMatrix = -1;
+    int texturedBlood = FALSE;
+    if (gevrBloodyCombatEffects() && gevrTacticalIsArmorShot(shot->weapon)
+        && bhit->hitpart >= HIT_LEFT_FOOT && bhit->hitpart <= HIT_CHEST
+        && shot->viewDir.z < -1e-6f) {
+        const f32 depth = gevrChrBulletSurfaceDepth(shot, bhit->model, bhit->node, bhit->dist);
+        const f32 distance = (-depth - shot->viewOrigin.z) / shot->viewDir.z;
+        const int room = bhit->prop->stan ? getTileRoom(bhit->prop->stan) : -1;
+        for (int axis = 0; axis < 3; ++axis)
+            impact.f[axis] = shot->gunpos.f[axis] + shot->dir.f[axis] * distance;
+        impactMatrix = modelFindNodeMtxIndex(bhit->node, 0);
+        texturedBlood = sharedBlood || gevrBloodyCombatImpact(shot->weapon, room, impact.f, shot->dir.f);
+        if (sharedBlood) gevrCoopGuardImpactPoint(chr, &impact, impactMatrix, FALSE);
+    }
+    if (!texturedBlood)
+#endif
+        chrCreateHitPuffs(bhit->prop, bhit->hitpart, &hitpos, &nearhitpos);
 
 #ifdef GEVR
     gevrRagdollNoteHit(chr, bhit->room, bhit->hitpart, shot->dir.f, shot->weapon);
 #endif
     // Apply damage to the character.
-    if (!handles_shot_actors(chr, bhit->hitpart, &shot->dir, shot->weapon, TRUE)) {
+    const int applied = handles_shot_actors(chr, bhit->hitpart, &shot->dir, shot->weapon, TRUE);
+#ifdef GEVR
+    if (sharedBlood && texturedBlood) {
+        gevrCoopGuardImpactPoint(NULL, NULL, -1, FALSE);
+        if (applied && (wasDead || chr->damage > beforeDamage))
+            gevrCoopGuardBlood(chr, shot->weapon, impactMatrix,
+                !wasDead && (chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD), &impact, &shot->dir);
+    }
+#endif
+    if (!applied) {
         return;
     }
 
@@ -4128,6 +4401,10 @@ void chrHandleBulletHit(struct ShotData *shot, struct BulletHit *bhit)
         return;
     }
 
+#ifdef GEVR
+    if (texturedBlood && !sharedBlood && !wasDead && (chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD))
+        gevrBloodyCombatFatalHit(bhit->model, modelFindNodeMtxIndex(bhit->node, 0), impact.f, shot->dir.f);
+#endif
     mtx = modelFindNodeMtx(bhit->model, bhit->node, 0);
 
     jointpos.x = hitpos.f[0];
@@ -4149,6 +4426,122 @@ void chrHandleBulletHit(struct ShotData *shot, struct BulletHit *bhit)
     chrCreateBloodStain(bhit->model, bhit->hitpart, bhit->node, &jointpos);
 }
 
+#ifdef GEVR
+static void gevrTacticalHelmetCheck(ChrRecord *chr, Model *helmet)
+{
+    if (!helmet->render_pos) return;
+    const int hits = gevrTacticalHelmetHits(chr->handle_positiondata_hat);
+    const bool permanent = hits == 0;
+    ModelNode *head = gevrEnemyRigHitbox(chr->model->obj->RootNode, HIT_HEAD);
+    if (!head) return;
+    const struct bbox *box = &head->Data->BoundingBox.Bounds;
+    coord3d face = { .f = {(box->xmin + box->xmax) * .5f, (box->ymin + box->ymax) * .5f, box->zmax} };
+    coord3d shell = {0};
+    Mtxf *pose = &helmet->render_pos[0].pos;
+    mtx4TransformVecInPlace(modelFindNodeMtx(chr->model, head, 0), &face);
+    /* Select a point on the visible crown across the different shell shapes. */
+    static const float heights[] = {22.f, 40.f, 2.f, 54.f, -14.f};
+    for (int i = 0; i < ARRAYCOUNT(heights); ++i) {
+        shell = (coord3d){.f = {0.f, heights[i], 55.f}};
+        mtx4TransformVecInPlace(pose, &shell);
+        const float length = sqrtf(SQ(shell.x) + SQ(shell.y) + SQ(shell.z));
+        if (length <= 0.f) continue;
+        ShotData probe = {.weapon = ITEM_WPPKSIL, .maxdist = -shell.z + 600.f};
+        for (int axis = 0; axis < 3; ++axis) probe.viewDir.f[axis] = shell.f[axis] / length;
+        chrTestHitAnimated(chr->prop, &probe);
+        if (probe.hits[0].prop && probe.hits[0].hitpart == GEVR_HIT_TACTICAL_HELMET) break;
+    }
+    sysLogPrintf(LOG_NOTE, "Facility helmet aim: face %.1f %.1f %.1f shell %.1f %.1f %.1f depth %.1f",
+        (double)face.x, (double)face.y, (double)face.z, (double)shell.x, (double)shell.y, (double)shell.z,
+        (double)chr->prop->zDepth);
+    static const int weapons[] = {ITEM_WPPKSIL, ITEM_TACTICAL_AK74N, ITEM_RUGER, ITEM_TACTICAL_PKM};
+    const int count = permanent ? 12 : hits + 2;
+    for (int i = 0; i < count; ++i) {
+        const bool isShell = permanent ? (i & 1) : i >= 1 && i <= hits;
+        const coord3d *target = isShell ? &shell : &face;
+        const float length = sqrtf(SQ(target->x) + SQ(target->y) + SQ(target->z));
+        if (length == 0.f) continue;
+        ShotData shot = {.weapon = permanent ? weapons[(i / 2) % ARRAYCOUNT(weapons)] : ITEM_WPPKSIL,
+            .maxdist = -target->z + 600.f};
+        for (int axis = 0; axis < 3; ++axis) shot.viewDir.f[axis] = target->f[axis] / length;
+        shot.dir = shot.viewDir;
+        mtx4RotateVecInPlace(currentPlayerGetViewToWorldMtxf(), &shot.dir);
+        chrTestHitAnimated(chr->prop, &shot);
+        BulletHit *hit = &shot.hits[0];
+        if ((permanent || i > 0) && hit->prop) chrHandleBulletHit(&shot, hit);
+        sysLogPrintf(LOG_NOTE, "tactical helmet check: test %d guard %d part %d hat %d damage %.3f",
+            i, chr->chrnum, hit->prop ? hit->hitpart : HIT_NULL_PART,
+            chr->handle_positiondata_hat != NULL, (double)chr->damage);
+    }
+    if (permanent && chr->handle_positiondata_hat) {
+        PropRecord *hat = chr->handle_positiondata_hat;
+        propobjSetDropped(hat, DROPTYPE_HAT);
+        const int dropped = objDrop(hat);
+        sysLogPrintf(LOG_NOTE, "tactical helmet retention: guard %d dropped %d attached %d damage %.3f",
+            chr->chrnum, dropped, hat->parent == chr->prop, (double)hat->obj->damage);
+    }
+}
+
+/* Contract check for the desktop input-script harness, using the live animated
+ * guard and the same gathering and damage callbacks as a player's shot. */
+static void gevrTacticalRunKlmkShotCheck(ChrRecord *chr)
+{
+    const bool facility = gevrTacticalFacilityArmor();
+    const bool heavy = gevrTacticalHeavyGuards(bossGetStageNum());
+    Model *helmet = gevrChrArmorHelmet(chr);
+    const GevrTacticalVest checkedVest = gevrEnemyVestSelected(chr);
+    sysLogPrintf(LOG_NOTE, "tactical armour check: guard %d vest %d helmet %d durability %d",
+        chr->chrnum, checkedVest, gevrTacticalHelmetKind(helmet), gevrTacticalHelmetHits(chr->handle_positiondata_hat));
+    static const struct {
+        const char *name;
+        int part, weapon;
+        coord3d target;
+    } cases[] = {
+        {"plate", HIT_CHEST, ITEM_WPPKSIL, {.f = {0, 80, 480}}},
+        {"hem", HIT_CHEST, ITEM_TACTICAL_AK74N, {.f = {-72, -445, 480}}},
+        {"magnum", HIT_CHEST, ITEM_RUGER, {.f = {0, 120, 480}}},
+        {"silver", HIT_CHEST, ITEM_SILVERWPPK, {.f = {0, 120, 480}}},
+        {"leg", HIT_RIGHT_LEG, ITEM_WPPKSIL, {0}},
+        {"head", HIT_HEAD, ITEM_WPPKSIL, {0}},
+    };
+    for (int i = 0; i < ARRAYCOUNT(cases); ++i) {
+        const bool covered = cases[i].part == HIT_CHEST;
+        if ((helmet || ((facility || heavy) && !g_gevrEditorPreviewActor)) && !covered) break;
+        ModelNode *node = gevrEnemyRigHitbox(chr->model->obj->RootNode, cases[i].part);
+        if (!node) continue;
+        const struct bbox *box = &node->Data->BoundingBox.Bounds;
+        coord3d point = cases[i].target;
+        if (covered) {
+            Mtxf fit;
+            gevrEnemyVestFit(box, &fit);
+            mtx4TransformVecInPlace(&fit, &point);
+        } else {
+            for (int axis = 0; axis < 3; ++axis) point.f[axis] = (box->f[axis][0] + box->f[axis][1]) * .5f;
+        }
+        mtx4TransformVecInPlace(modelFindNodeMtx(chr->model, node, 0), &point);
+        ShotData shot = {.weapon = cases[i].weapon, .maxdist = -point.z + 600.f};
+        if (facility) {
+            if (i == 0) shot.weapon = ITEM_TACTICAL_PKM;
+            shot.viewOrigin = (coord3d){.f = {14.f, -9.f, -34.f}};
+        }
+        for (int axis = 0; axis < 3; ++axis) shot.viewDir.f[axis] = point.f[axis] - shot.viewOrigin.f[axis];
+        const float distance = sqrtf(SQ(shot.viewDir.x) + SQ(shot.viewDir.y) + SQ(shot.viewDir.z));
+        if (distance <= 0.f) continue;
+        for (int axis = 0; axis < 3; ++axis) shot.viewDir.f[axis] /= distance;
+        shot.dir = shot.viewDir;
+        mtx4RotateVecInPlace(currentPlayerGetViewToWorldMtxf(), &shot.dir);
+        if (covered) shot.hits[9] = (BulletHit){.prop = chr->prop, .dist = -point.z + 500.f};
+        const float before = chr->damage;
+        chrTestHitAnimated(chr->prop, &shot);
+        const int hit = shot.hits[0].prop ? shot.hits[0].hitpart : HIT_NULL_PART;
+        if (shot.hits[0].prop) chrHandleBulletHit(&shot, &shot.hits[0]);
+        sysLogPrintf(LOG_NOTE, "KLMK check: %s guard %d item %d part %d damage %.3f -> %.3f farther hit %d stop %d",
+            cases[i].name, chr->chrnum, shot.weapon, hit, (double)before, (double)chr->damage,
+            shot.hits[9].prop != NULL, hit == GEVR_HIT_KLMK_VEST && shot.maxdist == shot.hits[0].dist);
+    }
+    if (helmet) gevrTacticalHelmetCheck(chr, helmet);
+}
+#endif
 
 /**
  * Removed.
@@ -4231,8 +4624,24 @@ void sub_GAME_7F022EE0(s32 param_1){
  *
  * Address 0x7F022EEC.
  */
+#ifdef GEVR
+#include "gevr_tactical_guard_ai.h"
+#include "gevr_tactical_loadouts.h"
+#endif
+
 void chrCheckGuardsHeardSound(f32 noise)
 {
+#ifdef GEVR
+    f32 report = 0.0f;
+    for (int hand = GUNRIGHT; hand <= GUNLEFT; hand++) {
+        const int item = getCurrentPlayerWeaponId(hand);
+        if (get_hands_firing_status(hand) && gevrCampaignGunIsFirearm(item)) {
+            const f32 minimum = gevrTacticalWeaponSuppressed(item, hand) ? 1200.0f : 3200.0f;
+            report = fmaxf(report, fmaxf(minimum, noise * 100.0f));
+        }
+    }
+    if (report > 0.0f) gevrTacticalGuardNoise(get_cur_playernum(), report);
+#endif
     s32 i;
 
     for (i=0; i<g_NumChrSlots; i++)

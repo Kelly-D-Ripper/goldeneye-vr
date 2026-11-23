@@ -38,6 +38,7 @@ prelude = '''#include <algorithm>
 using GLuint=unsigned; using GLint=int; using GLsizei=int; using GLenum=unsigned;
 using GLfloat=float; using GLboolean=bool;
 struct ShaderProgram { int scopeLocation=0,scopeVPLocation=1,scopeHeadPLocation=2;
+ int scopeHeatLocation=-1;
  int three_point_filter_locations[2]={3,4}; bool used_textures[2]={true,true};
  bool is_mesh=false; int num_floats=4; GLuint opengl_program_id=1; };
 struct GevrProfileSection { GevrProfileSection(int) {} }; enum {GEVR_TIME_SCOPE,LOG_NOTE};

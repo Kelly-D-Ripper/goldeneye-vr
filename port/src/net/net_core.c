@@ -14,6 +14,8 @@
 #include "net_voice.h"
 #include "net_objects.h"
 #include "net_coop.h"
+#include "gevr_tactical_net.h"
+#include "gevr_tactical_loot_net.h"
 #include "net_horde.h"
 #include "net_timing.h"
 #include "bondconstants.h"
@@ -1127,7 +1129,12 @@ const char *netGetSlotAppVersion(int slot) {
 static uint64_t netContentPart(uint32_t part) {
     extern u64 gevrRomContentHash(void);   /* gevr_romload.c */
     if (part == NET_CONTENT_CAMPAIGN) return (uint64_t)gevrRomPlayCampaign() + 1u;
-    return part == NET_CONTENT_ROM ? gevrRomContentHash() : 0;
+    if (part != NET_CONTENT_ROM) return 0;
+    const uint64_t rom = gevrRomContentHash();
+    /* The Tactical campaign changes setup items and the meaning of weapon IDs.
+     * Fold its compatibility ID into the existing mandatory content check. */
+    return rom && sysArgCheck("--tactical-coop")
+        ? rom ^ UINT64_C(0x4745565254414310) ^ gevrTacticalGearCatalogHash() : rom;
 }
 
 /* gevr_romlayout.h GEVR_CAMPAIGN_*, as the launcher names them */
@@ -1605,26 +1612,16 @@ static bool netSnapshotObjectType(int type) {
     }
 }
 
-/* The world-object index both headsets share: 0x9000+ ammo crates, 0x8000+
- * multiplayer weapon slots, else the setup command index (the snapshot's). */
+/* Only setup-command indices are shared across peers. Tactical drops
+ * have separate IDs independent of each peer's weapon pool. */
 static ObjectRecord *netObjectByIndex(u16 index, u8 type) {
-    ObjectRecord *obj = NULL;
-    if (index >= 0x9000 && index < 0x9000 + MAX_AMMO_CRATES)
-        obj = (ObjectRecord *)&g_AmmoCrates[index - 0x9000];
-    else if (index >= 0x8000 && index < 0x8000 + MAX_WEAPON_SLOTS)
-        obj = (ObjectRecord *)&g_WeaponSlots[index - 0x8000];
-    else if (index < 0x8000 && netSnapshotObjectType(type))
-        obj = setupGetPtrToCommandByIndex(index);
-    if (!obj || obj->type != type) return NULL;
-    return obj;
+    if (index >= 0x8000 || !netSnapshotObjectType(type)) return NULL;
+    ObjectRecord *obj = setupGetPtrToCommandByIndex(index);
+    return obj && obj->type == type ? obj : NULL;
 }
 
 static int netObjectIndex(ObjectRecord *target) {
     if (!target) return -1;
-    for (int slot = 0; slot < MAX_AMMO_CRATES; slot++)
-        if ((ObjectRecord *)&g_AmmoCrates[slot] == target) return 0x9000 + slot;
-    for (int slot = 0; slot < MAX_WEAPON_SLOTS; slot++)
-        if ((ObjectRecord *)&g_WeaponSlots[slot] == target) return 0x8000 + slot;
     PropDefHeaderRecord *def = g_CurrentSetup.propDefs;
     if (!def) return -1;
     for (int index = 0; def->type != PROPDEF_END && index < 0x8000; index++) {
@@ -1815,57 +1812,40 @@ static void netSendWorldSnapshot(ENetPeer *peer) {
     netbufWriteU8(&buf, NET_MSG_WORLD_SNAPSHOT);
     netbufWriteU8(&buf, 0);
     netbufWriteU8(&buf, 0); /* record count, filled before sending */
-    /* Setup objects only (source 0): the weapon and ammo-crate pools are
-     * recycled per headset, so their slot numbers name different objects on
-     * the joiner (see netSendObjectEvent). */
-    for (int source = 0; source < 1; source++) {
-        int limit = source == 1 ? MAX_WEAPON_SLOTS : MAX_AMMO_CRATES;
-        for (int slot = 0; source == 0 ? (def->type != PROPDEF_END && slot < 0x8000) :
-             slot < limit; slot++) {
-            ObjectRecord *obj;
-            u16 index;
-            if (source == 0) {
-                obj = (ObjectRecord *)def;
-                index = (u16)slot;
-                def += sizepropdef(def);
-                if (!netSnapshotObjectType(obj->type)) continue;
-            } else if (source == 1) {
-                obj = (ObjectRecord *)&g_WeaponSlots[slot];
-                index = (u16)(0x8000 + slot);
-            } else {
-                obj = (ObjectRecord *)&g_AmmoCrates[slot];
-                index = (u16)(0x9000 + slot);
+    for (int slot = 0; def->type != PROPDEF_END && slot < 0x8000; slot++) {
+        ObjectRecord *obj = (ObjectRecord *)def;
+        u16 index = (u16)slot;
+        def += sizepropdef(def);
+        if (!netSnapshotObjectType(obj->type)) continue;
+        netbufWriteU16(&buf, index);
+        netbufWriteU8(&buf, (u8)obj->type);
+        netbufWriteU8(&buf, obj->prop ? 1 : 0);
+        netbufWriteU8(&buf, obj->prop && (obj->prop->flags & PROPFLAG_ENABLED) ? 1 : 0);
+        netbufWriteU32(&buf, obj->runtime_bitflags &
+                       (RUNTIMEBITFLAG_REMOVE | RUNTIMEBITFLAG_DESTROYED | RUNTIMEBITFLAG_BEENOPENED));
+        if (obj->type == PROPDEF_DOOR) {
+            DoorRecord *door = (DoorRecord *)obj;
+            netbufWriteF32(&buf, door->openPosition);
+            netbufWriteU8(&buf, (u8)door->openstate);
+        } else {
+            netbufWriteF32(&buf, 0);
+            netbufWriteU8(&buf, 0);
+        }
+        netbufWriteU32(&buf, obj->prop ? (u32)obj->prop->timetoregen : 0);
+        count++;
+        if (count == 24) {
+            if (!buf.error) {
+                raw[8] = (u8)count;
+                ENetPacket *packet = enet_packet_create(raw, buf.wp, ENET_PACKET_FLAG_RELIABLE);
+                enet_peer_send(peer, NET_CHAN_RELIABLE, packet);
             }
-            netbufWriteU16(&buf, index);
-            netbufWriteU8(&buf, (u8)obj->type);
-            netbufWriteU8(&buf, obj->prop ? 1 : 0);
-            netbufWriteU8(&buf, obj->prop && (obj->prop->flags & PROPFLAG_ENABLED) ? 1 : 0);
-            netbufWriteU32(&buf, obj->runtime_bitflags &
-                           (RUNTIMEBITFLAG_REMOVE | RUNTIMEBITFLAG_DESTROYED | RUNTIMEBITFLAG_BEENOPENED));
-            if (source == 0 && obj->type == PROPDEF_DOOR) {
-                DoorRecord *door = (DoorRecord *)obj;
-                netbufWriteF32(&buf, door->openPosition);
-                netbufWriteU8(&buf, (u8)door->openstate);
-            } else {
-                netbufWriteF32(&buf, 0);
-                netbufWriteU8(&buf, 0);
-            }
-            netbufWriteU32(&buf, obj->prop ? (u32)obj->prop->timetoregen : 0);
-            count++;
-            if (count == 24) {
-                if (!buf.error) {
-                    raw[8] = (u8)count;
-                    ENetPacket *packet = enet_packet_create(raw, buf.wp, ENET_PACKET_FLAG_RELIABLE);
-                    enet_peer_send(peer, NET_CHAN_RELIABLE, packet);
-                }
-                netbufStartWrite(&buf);
-                netbufWriteU32(&buf, GEVR_NET_MAGIC);
-                netbufWriteU16(&buf, GEVR_NET_VERSION);
-                netbufWriteU8(&buf, NET_MSG_WORLD_SNAPSHOT);
-                netbufWriteU8(&buf, 0);
-                netbufWriteU8(&buf, 0);
-                count = 0;
-            }
+            netbufStartWrite(&buf);
+            netbufWriteU32(&buf, GEVR_NET_MAGIC);
+            netbufWriteU16(&buf, GEVR_NET_VERSION);
+            netbufWriteU8(&buf, NET_MSG_WORLD_SNAPSHOT);
+            netbufWriteU8(&buf, 0);
+            netbufWriteU8(&buf, 0);
+            count = 0;
         }
     }
     if (count && !buf.error) {
@@ -2238,12 +2218,16 @@ static void netReadyProgress(void) {
 void netStageLoaded(void) {
     s_coop_ended = false;
     netCoopMenuReset();
+    gevrTacticalVisualReset();
     netSpectatorReset();
     netPlayersTickedReset(); /* events queued through the load are for the old stage */
     /* Spectators must acknowledge their load too: otherwise they block the
      * next round forever and never receive their in-progress snapshot. */
     if (s_state != NET_STATE_INGAME || s_local_slot < 0) return;
     s_loaded_map = s_round.config.stage;
+    /* The launcher can have already loaded a Tactical drop-in's mission. */
+    if (netCoopSession() && sysArgCheck("--tactical-coop") && netRoundLoadStage() == bossGetStageNum())
+        s_round_reset_pending = false;
     s_stage_fade_in = true;
     s_lobby_state.slots[s_local_slot].loaded = 1;
     if (!netIsHost()) {
@@ -2387,7 +2371,8 @@ NetMatchConfig netMatchConfigFromSettings(void) {
     c.bot_mode = (uint8_t)netClampChoice(VrMpBotMode, NET_BOT_MODE_COUNT, NET_BOT_OFF);
     c.bot_count = (uint8_t)(VrMpBotCount >= 1 && VrMpBotCount < GEVR_MAX_PLAYERS ? VrMpBotCount : 3);
     c.bot_difficulty = (uint8_t)netClampChoice(VrMpBotDifficulty, NET_BOT_DIFF_COUNT, NET_BOT_NORMAL);
-    if (VrMpMode == NET_MODE_HORDE) {
+    const int mode = VrMpMode;
+    if (mode == NET_MODE_HORDE) {
         c.mode=NET_MODE_HORDE;c.difficulty=0;
         c.stage=(uint8_t)(netHordeStageValid((unsigned)VrHordeStage)?VrHordeStage:NET_HORDE_STAGE);
         c.horde_start_wave=(uint8_t)(VrHordeStartWave<1?1:VrHordeStartWave>NET_HORDE_MAX_START_WAVE?NET_HORDE_MAX_START_WAVE:VrHordeStartWave);
@@ -2396,11 +2381,12 @@ NetMatchConfig netMatchConfigFromSettings(void) {
         c.scenario=0;c.game_length=0;c.loadouts=0;c.dual_wield=NET_DUAL_DOUBLES;
         return c;
     }
-    if (VrMpMode == NET_MODE_COOP) {
+    if (mode == NET_MODE_COOP) {
         /* the solo campaign for the party: it starts in the game's menus, where the
          * host picks each mission and difficulty; four players at most (the deathmatch
          * fields ride along unused) */
         c.mode = NET_MODE_COOP;
+        if (sysArgCheck("--tactical-coop")) c.dual_wield = NET_DUAL_ANY;
         if (VrCoopFastReinforcements) c.fun_flags |= NET_COOP_FAST_REINFORCEMENTS;
         c.stage = NET_COOP_FRONT_STAGE;
         c.difficulty = 0;
@@ -2515,6 +2501,19 @@ int netCoopSession(void) {
 }
 int gevrCoopSession(void) { return netCoopSession(); }
 
+int gevrTacticalCampaignRules(void)
+{
+    return netIsActive()
+        ? netCoopSession() && sysArgCheck("--tactical-coop")
+        : getPlayerCount() == 1;
+}
+
+int gevrTacticalLocalPlayer(void)
+{
+    return gevrTacticalCampaignRules() && (!netIsActive()
+        || (netGetLocalSlot() >= 0 && get_cur_playernum() == netGetLocalSlot()));
+}
+
 int gevrCoopFastReinforcements(void) {
     return netCoopSession() && (s_round.config.fun_flags & NET_COOP_FAST_REINFORCEMENTS) != 0;
 }
@@ -2610,6 +2609,7 @@ static void netApplyCoopConfig(const NetMatchConfig *c) {
     }
     gamemode = GAMEMODE_MULTI;
     selected_num_players = NET_COOP_MAX_PLAYERS;
+    if (!netIsHost() && sysArgCheck("--tactical-coop")) gevrTacticalGearBindGuestStage(LEVELID_TITLE, c->stage);
     s_coop_tally_valid = false;   /* the statistics page's tally is the next end's */
     g_StageNum = c->stage;
     selected_stage = c->stage;
@@ -2917,10 +2917,13 @@ int netGetHostSlot(void) { return s_host_slot; }
 int netLobbyCanLaunch(void) {
     if (!netIsHost()) return 0;
     int connected = 0;
+    const bool tacticalBriefing = s_state == NET_STATE_HOSTING_LOBBY
+        && s_lobby_state.config.mode == NET_MODE_COOP && sysArgCheck("--tactical-coop");
     for (int i=0;i<GEVR_MAX_PLAYERS;i++) if (s_lobby_state.slots[i].connected) {
         /* a dedicated server has no host to wait for players' Ready: in its
          * warmup they are playing already, and the round starts by itself */
-        if (i >= s_max_players || (i != s_host_slot && !s_lobby_state.slots[i].ready && !s_lobby_state.slots[i].is_bot && !s_dedicated)) return 0;
+        if (i >= s_max_players || (i != s_host_slot && !s_lobby_state.slots[i].ready &&
+            !s_lobby_state.slots[i].is_bot && !s_dedicated && !tacticalBriefing)) return 0;
         connected++;
     }
     return connected > 0;
@@ -3037,6 +3040,10 @@ int netRemoteWeapon(int slot, int hand) {
     if (hand == GUNLEFT && !netActiveDualWield()) return ITEM_UNARMED;
     int item = hand == GUNLEFT ? s_remote_moves[slot].weaponnum_left : s_remote_moves[slot].weaponnum;
     return item >= ITEM_UNARMED && item < ITEM_IDS_MAX ? item : ITEM_UNARMED;
+}
+int netRemoteSuppressed(int slot, int hand) {
+    if (netRemoteWeapon(slot, hand) == ITEM_UNARMED) return false;
+    return (s_remote_moves[slot].ucmd & (hand == GUNLEFT ? UCMD_SUPPRESSED_LEFT : UCMD_SUPPRESSED_RIGHT)) != 0;
 }
 int netRemoteTrigger(int slot, int hand) {
     return netIsRemotePlayerActive(slot) && netSlotOccupied(slot) && hand >= 0 && hand <= 1 &&
@@ -3502,7 +3509,12 @@ static void netReceiveStageReady(ENetPeer *peer, struct netbuf *buf, size_t size
     netBroadcastLobbyState();
     netReadyProgress();
     /* co-op: its guards and where to start (a mission under way), or the new host's slots */
-    if (!was_ready || returning) { netCoopPlayerJoined(slot, returning); netHordeSend(slot); }
+    if (!was_ready || returning) {
+        netCoopPlayerJoined(slot, returning);
+        netHordeSend(slot);
+        gevrTacticalVisualSendTo(slot);
+        gevrTacticalLootSendTo(slot);
+    }
 }
 
 static void netHandlePacket(ENetPeer *peer, const uint8_t *data, size_t size) {
@@ -3814,7 +3826,18 @@ static void netHandlePacket(ENetPeer *peer, const uint8_t *data, size_t size) {
                 } else {
                     s_round_reset_pending = true;
                 }
+            } else if (netCoopSession() && sysArgCheck("--tactical-coop")
+                && netRoundLoadStage() != LEVELID_TITLE && !netRoundMatchesLoadedMap(bossGetStageNum())) {
+                /* A new peer can enter with the game loop already running.
+                 * It still needs to load the mission before acknowledging it. */
+                s_round_reset_pending = true;
             }
+#ifdef GEVR_PC
+            else if (sysArgCheck("--input-script") && sysArgCheck("--tactical-coop-test")
+                && sysArgCheck("--tactical-mp-test-mode")) {
+                s_round_reset_pending = true;
+            }
+#endif
             break;
         }
         case NET_MSG_STAGE_READY:
@@ -3925,6 +3948,11 @@ static void netHandlePacket(ENetPeer *peer, const uint8_t *data, size_t size) {
             if (netIsHost() || peer != s_server_peer || s_state != NET_STATE_INGAME) break;
             netCoopReceiveMenu(&buf);
             break;
+        case NET_MSG_TACTICAL_KIT_READY:
+            if (netIsHost() && s_state == NET_STATE_INGAME
+                && slot_id < GEVR_MAX_PLAYERS && s_client_peers[slot_id] == peer)
+                netCoopReceiveKitReady(slot_id, &buf);
+            break;
         case NET_MSG_CHR_STATE:
         case NET_MSG_CHR_SPAWN:
         case NET_MSG_CHR_REMOVE:
@@ -3939,6 +3967,8 @@ static void netHandlePacket(ENetPeer *peer, const uint8_t *data, size_t size) {
         case NET_MSG_COOP_ALLY:
         case NET_MSG_COOP_CLOCK:
         case NET_MSG_COOP_SCRIPT:
+        case NET_MSG_TACTICAL_GUARD:
+        case NET_MSG_TACTICAL_GORE:
         case NET_MSG_COOP_SHOT:
         case NET_MSG_COOP_POKES:
             if (netIsHost() || peer != s_server_peer || s_state != NET_STATE_INGAME) break;
@@ -3950,6 +3980,29 @@ static void netHandlePacket(ENetPeer *peer, const uint8_t *data, size_t size) {
                 s_client_peers[slot_id] != peer || (int)(intptr_t)peer->data - 1 != slot_id) break;
             netCoopReceive(msg_type, slot_id, 0, &buf);
             break;
+        case NET_MSG_TACTICAL_LOOT:
+            if (s_state != NET_STATE_INGAME || s_round_reset_loading || slot_id >= GEVR_MAX_PLAYERS) break;
+            if (netIsHost()) {
+                if ((int)(intptr_t)peer->data - 1 != slot_id || s_client_peers[slot_id] != peer
+                    || !s_lobby_state.slots[slot_id].loaded) break;
+            } else if (peer != s_server_peer) break;
+            gevrTacticalLootReceive(&buf, slot_id);
+            break;
+        case NET_MSG_TACTICAL_LAYOUT:
+        case NET_MSG_TACTICAL_VISUAL: {
+            if (s_state != NET_STATE_INGAME || s_round_reset_loading || slot_id >= GEVR_MAX_PLAYERS
+                || !s_lobby_state.slots[slot_id].connected) break;
+            if (netIsHost()) {
+                if ((int)(intptr_t)peer->data - 1 != slot_id || s_client_peers[slot_id] != peer
+                    || !s_lobby_state.slots[slot_id].loaded) break;
+            } else if (peer != s_server_peer) break;
+            if (gevrTacticalVisualReceive(slot_id, msg_type, &buf) && netIsHost()) {
+                const bool layout = msg_type == NET_MSG_TACTICAL_LAYOUT;
+                netBroadcastPacket(data, size, layout ? NET_CHAN_RELIABLE : NET_CHAN_PLAYER_STATE,
+                    layout ? ENET_PACKET_FLAG_RELIABLE : 0, peer);
+            }
+            break;
+        }
         case NET_MSG_COOP_TANK:
             /* a player's driven tank: the host poses its own and relays it (net_coop.c netCoopSendTank) */
             if (s_state != NET_STATE_INGAME || slot_id >= GEVR_MAX_PLAYERS || (int)slot_id == s_local_slot) break;
@@ -4941,6 +4994,9 @@ static void netHostDropSlot(int slot, ENetPeer *stale) {
     s_remote_active[slot] = false;
     netVoiceForgetSlot((uint8_t)slot);
     netForgetPlayerScore(slot);
+    gevrTacticalVisualForgetSlot(slot);
+    netCoopKitForgetSlot(slot);
+    gevrTacticalLootForgetSlot(slot);
     netCoopSlotLeft(slot);
     memset(&s_lobby_state.slots[slot], 0, sizeof(NetLobbySlot));
     s_lobby_state.slots[slot].team = NET_TEAM_NONE;
@@ -5015,7 +5071,88 @@ static bool netClientKickDisconnected(ENetPeer *peer, uint32_t reason) {
     return true;
 }
 
+#ifdef GEVR_PC
+static void netTacticalLoopbackTick(void)
+{
+    extern int VrMpMode, VrHordeStage, VrHordeStartWave;
+    if (!sysArgCheck("--input-script") || !sysArgCheck("--tactical-coop")) return;
+    const char *role = sysArgGetString("--tactical-coop-test");
+    if (!role || !netContentPart(NET_CONTENT_ROM)) return;
+    const bool host = !strcmp(role, "host");
+    if (!host && strcmp(role, "guest")) return;
+    const char *mode = sysArgGetString("--tactical-mp-test-mode");
+    const bool horde = mode && !strcmp(mode, "horde");
+    const bool teams = mode && !strcmp(mode, "teams");
+    const bool stock = horde || teams || (mode && !strcmp(mode, "pvp"));
+    static bool started, ready, team_requested, start_requested;
+    if (!started) {
+        started = true;
+        const int port = sysArgGetInt("--tactical-coop-test-port", 37007);
+        if (port < 1024 || port > 65535) return;
+        if (host) {
+            if (!netHostStart((uint16_t)port)) return;
+            VrMpMode = horde ? NET_MODE_HORDE : stock ? NET_MODE_DEATHMATCH : NET_MODE_COOP;
+            if (horde) {
+                VrHordeStage = sysArgGetInt("--tactical-coop-test-stage", NET_HORDE_STAGE);
+                VrHordeStartWave = sysArgGetInt("--tactical-mp-test-wave", 1);
+            } else if (stock) {
+                VrMpStage = sysArgGetInt("--tactical-coop-test-stage", LEVELID_FACILITY);
+                VrMpScenario = teams ? SCENARIO_2v1 : SCENARIO_NORMAL;
+                VrMpBotMode = teams ? NET_BOT_FILL : NET_BOT_OFF;
+                VrMpMaxPlayers = teams ? 3 : 2;
+                VrMpNextRound = NET_NEXT_PLAYLIST;
+            }
+            const NetMatchConfig config = netMatchConfigFromSettings();
+            netLobbySetConfig(&config);
+            if (teams) netLobbySetTeam(NET_TEAM_RED);
+        } else netConnect("127.0.0.1", (uint16_t)port);
+    } else if (host && s_state == NET_STATE_HOSTING_LOBBY && netGetHumanPlayerCount() >= 2
+        && netLobbyHostLaunchMatch()) {
+        if (stock) {
+            s_round_reset_pending = true;
+        } else if (sysArgCheck("--tactical-coop-test-menus")) {
+            netApplyMatchConfig();
+            netStageLoaded(); /* the headless host is already at the title */
+        } else {
+            netCoopHostStartMission(sysArgGetInt("--tactical-coop-test-stage", LEVELID_DAM),
+                sysArgGetInt("--tactical-coop-test-difficulty", 0));
+        }
+    } else if (!host && !ready && s_state == NET_STATE_CLIENT_LOBBY) {
+        if (teams && netGetSlotTeam(s_local_slot) != NET_TEAM_BLUE) {
+            if (!team_requested) {
+                team_requested = true;
+                netLobbySetTeam(NET_TEAM_BLUE);
+            }
+            return;
+        }
+        ready = true;
+        netLobbySetReady(true);
+    } else if (stock && s_state == NET_STATE_INGAME && netRoundMatchesLoadedMap(bossGetStageNum())
+        && netPlayersWereTicked()) {
+        if (host && !horde && !start_requested && netAllLoaded() && netRoundRosterReady()) {
+            start_requested = true;
+            netHostStartRoundNow();
+        }
+        static int last_phase = -1, last_playing = -1;
+        static unsigned last_wave;
+        const int playing = netGetPlayingCount();
+        const unsigned wave = horde ? gevrHordeState()->wave : 0;
+        if ((int)s_phase != last_phase || playing != last_playing || wave != last_wave) {
+            NET_LOG("tactical stock test: slot %d mode %d scenario %d phase %d playing %d wave %u team %d",
+                s_local_slot, s_round.config.mode, s_round.config.scenario, s_phase, playing, wave,
+                s_round.team[s_local_slot]);
+            last_phase = s_phase;
+            last_playing = playing;
+            last_wave = wave;
+        }
+    }
+}
+#endif
+
 void netPoll(void) {
+#ifdef GEVR_PC
+    netTacticalLoopbackTick();
+#endif
     netHordeTick();
     static uint64_t last_ammo_us;
     uint64_t ammo_now=sysGetMicroseconds();
@@ -5029,8 +5166,11 @@ void netPoll(void) {
         netCoopRunPlayerLists();
         netCoopClientTick();
     }
-    if (s_state == NET_STATE_INGAME && !s_round_reset_loading && netPlayersWereTicked())
+    if (s_state == NET_STATE_INGAME && !s_round_reset_loading && netPlayersWereTicked()) {
+        gevrTacticalVisualTick();
+        gevrTacticalLootTick();
         netCoopReviveTick();
+    }
     if (netIsHost() && s_state == NET_STATE_INGAME && s_phase == NET_PHASE_IN_PROGRESS && netPlayersWereTicked()) {
         bool changed = false;
         for (int i=0;i<GEVR_MAX_PLAYERS;i++) {

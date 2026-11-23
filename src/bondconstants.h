@@ -3442,6 +3442,16 @@ enum CCRMLUT
         PROP_DOORCONSOLE,         /* Console w/ Activation Light                                        */
         PROP_CHRTESTTUBE,         /* Glass Test Tube                                                    */
         PROP_BOLLARD,             /* Bollard                                                            */
+#ifdef GEVR
+        PROP_TACTICAL_AK74N,
+#define TACTICAL_EXPANDED(id, group, native, gun, prop, capacity, cadence, name) PROP_TACTICAL_##id,
+#define TACTICAL_EXPANDED_BOUNDARY PROP_TACTICAL_ALTYN, PROP_TACTICAL_FAST_TROOPER,
+#define TACTICAL_EXPANDED_MELEE_BOUNDARY PROP_TACTICAL_KATANA,
+#include "gevr_tactical_expanded.inc.h"
+#undef TACTICAL_EXPANDED
+#undef TACTICAL_EXPANDED_BOUNDARY
+#undef TACTICAL_EXPANDED_MELEE_BOUNDARY
+#endif
         PROP_MAX
     } PROP;
 #ifdef AIPARSE
@@ -4196,6 +4206,14 @@ typedef enum PROJECTILES
         ITEM_ROCKETROUND,
         ITEM_GRENADEROUND ,
         ITEM_TOKEN,
+#ifdef GEVR
+        ITEM_TACTICAL_AK74N,
+#define TACTICAL_EXPANDED(id, group, native, gun, prop, capacity, cadence, name) ITEM_TACTICAL_##id,
+#define TACTICAL_EXPANDED_MELEE_BOUNDARY ITEM_TACTICAL_KATANA,
+#include "gevr_tactical_expanded.inc.h"
+#undef TACTICAL_EXPANDED
+#undef TACTICAL_EXPANDED_MELEE_BOUNDARY
+#endif
         ITEM_IDS_MAX
     } ITEM_IDS;
 #if defined(GEVR) && !defined(AIPARSE)
@@ -4206,7 +4224,18 @@ typedef enum PROJECTILES
  * item itself otherwise.
  */
 int gevrItemAs(int item);
-#define GEVR_ITEM_AS(item) gevrItemAs(item)
+static inline int gevrTacticalItemAs(int item) {
+    switch (item) {
+    case ITEM_TACTICAL_AK74N: return ITEM_AK47;
+    case ITEM_TACTICAL_KATANA: return ITEM_KNIFE;
+#define TACTICAL_EXPANDED(id, group, native, gun, prop, capacity, cadence, name) \
+    case ITEM_TACTICAL_##id: return ITEM_##native;
+#include "gevr_tactical_expanded.inc.h"
+#undef TACTICAL_EXPANDED
+    default: return gevrItemAs(item);
+    }
+}
+#define GEVR_ITEM_AS(item) gevrTacticalItemAs(item)
 /* Cartridge mission numbers, with the original constants in non-VR builds. */
 int gevrRomMissionLimit(void);
 int gevrRomFinalMission(void);

@@ -31,6 +31,8 @@ def build(directory, sources, name, pal=False):
         "AI_EXISTENCE": block(ai, "case AI_IFChrDoesNotExist:\n                {"),
         "AI_CLONE": block(ai, "case AI_TRYCloningChr:\n                {"),
     }
+    if "gevr_tactical_reinforcements.inc.h" in ai:
+        parts["REINFORCEMENTS"] = '#define TEST_TACTICAL_REINFORCEMENTS\n#include "gevr_tactical_reinforcements.inc.h"'
     for marker, code in parts.items():
         fixture = fixture.replace("/* INSERT_" + marker + " */", code)
     source, exe = directory / (name + ".c"), directory / (name + ".exe")

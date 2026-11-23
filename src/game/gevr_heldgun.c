@@ -28,6 +28,7 @@
 #include "chrobjdata.h"
 #include "dyn.h"
 #include "gun.h"
+#include "gevr_tactical_mesh.h"
 #include "image.h"
 #include "matrixmath.h"
 #include "model.h"
@@ -36,6 +37,7 @@
 #include "propobj.h"
 #include "net_game.h"
 #include "net_rules.h"
+#include "gevr_hollywood_fx.h"
 
 extern bool netIsActive(void);
 extern void gevrBeanSetLoaded(int loaded);          /* port/src/gevr_bean.c: DAB fpRound */
@@ -649,6 +651,13 @@ s32 gevrHeldGunCompute(ChrRecord *chr, PropRecord *weapon, GUNHAND hand, Mtxf *b
     }
 
     item = weapon->weapon->weaponnum;
+    /* The tactical models use their Pchr draw lists for guards. */
+    if (gevrTacticalItem(item) >= 0 && sysArgCheck("--tactical-mesh") && gevrTacticalCampaignRules())
+        return FALSE;
+    /* The katana's own prop header carries its mesh. Its shared GknifeZ
+     * first-person file resolves to a knife when loaded for a remote copy. */
+    if (item == ITEM_TACTICAL_KATANA && gevrTacticalKatanaEnabled())
+        return FALSE;
     f = gevrHeldGunLoad(item);
 
     if (f == NULL)
@@ -837,6 +846,7 @@ Gfx *gevrHeldGunDraw(ChrRecord *chr, ModelRenderData *body, Gfx *gdl, s32 withal
 
         if (inst == NULL || !inst->pending || inst->chr != chr || inst->file == NULL)
         {
+            if (withalpha) gdl = gevrHollywoodGuardMuzzle(gdl, chrGetEquippedWeaponProp(chr, hand), NULL);
             continue;
         }
 
@@ -880,6 +890,7 @@ Gfx *gevrHeldGunDraw(ChrRecord *chr, ModelRenderData *body, Gfx *gdl, s32 withal
 
         if (withalpha)
         {
+            gdl = gevrHollywoodGuardMuzzle(gdl, chrGetEquippedWeaponProp(chr, hand), &inst->model);
             bondviewTransformManyPosToViewMatrix(inst->model.render_pos, inst->file->header.numMatrices);
 
             if (inst->rocketon)

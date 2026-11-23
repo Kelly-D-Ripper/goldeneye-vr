@@ -3,6 +3,10 @@
 #include "gevr_reload_input.h"
 #include "gevr_hand_reload.h"
 #include "gevr_locomotion.h"
+#include "gevr_tactical_optics.h"
+#include "gevr_tactical_range.h"
+#include "gevr_hollywood_fx.h"
+#include "gevr_guard_cigarettes.h"
 #endif
 #include "system.h"
 #include <ultra64.h>
@@ -324,6 +328,8 @@ void lvlStageLoad(s32 stage)
 
 #ifdef GEVR
     gevrRagdollReset();
+    gevrHollywoodReset(stage);
+    gevrTacticalRangeStageLoad(stage);
 #endif
     g_CurrentStageToLoad = stage;
 
@@ -555,7 +561,9 @@ void lvlStageLoad(s32 stage)
         {
             extern void gevrPreloadStageGuns(void);   /* bondview_r.c: the HD textures of the guns met above (#95) */
 
+            extern void gevrPreloadTacticalStageGear(int stage);
             gevrPreloadStageGuns();
+            gevrPreloadTacticalStageGear(stage);
         }
 #endif
     }
@@ -1039,10 +1047,11 @@ Gfx* lvlRender(Gfx* DL)
                 /* issue #40: the world, up to the gun, is kept for the sniper scope */
                 extern s32 gevrScopeBegin(void);
 
-                gevrScopeRec = gevrScopeBegin();
+                const s32 tacticalScope = gevrTacticalOpticsWantScope();
+                gevrScopeRec = gevrScopeBegin() || tacticalScope;
                 if (gevrScopeRec)
                 {
-                    gDPNoOpTag(DL++, 0x565D0000); /* VR_SCOPE_REC_BEGIN */
+                    gDPNoOpTag(DL++, tacticalScope ? GEVR_OPTIC_SCOPE_RECORD : 0x565D0000);
                 }
             }
 #endif
@@ -1136,12 +1145,16 @@ Gfx* lvlRender(Gfx* DL)
 
                 if (reloadMask & 1)
                 {
-                    if (!gevrReloadButtonDrops(GUNRIGHT)) attempt_reload_item_in_hand(GUNRIGHT);
+                    extern s32 gevrTacticalManualOn(s32 hand);
+                    if (gevrTacticalManualOn(GUNRIGHT)) { /* tactical magazines are handled by hand */ }
+                    else if (!gevrReloadButtonDrops(GUNRIGHT)) attempt_reload_item_in_hand(GUNRIGHT);
                     else gevrGexDropMagazine(GUNRIGHT);
                 }
                 if (reloadMask & 2)
                 {
-                    if (!gevrReloadButtonDrops(GUNLEFT)) attempt_reload_item_in_hand(GUNLEFT);
+                    extern s32 gevrTacticalManualOn(s32 hand);
+                    if (gevrTacticalManualOn(GUNLEFT)) { /* tactical magazines are handled by hand */ }
+                    else if (!gevrReloadButtonDrops(GUNLEFT)) attempt_reload_item_in_hand(GUNLEFT);
                     else gevrGexDropMagazine(GUNLEFT);
                 }
 #else
@@ -1152,6 +1165,9 @@ Gfx* lvlRender(Gfx* DL)
 
             propsTickPlayer();
             DL = bgLevelRender(DL);
+#ifdef GEVR
+            DL = gevrTacticalRangeRender(DL);
+#endif
 
             if (get_debug_portal_flag())
             {
@@ -1215,6 +1231,13 @@ Gfx* lvlRender(Gfx* DL)
 #endif
             DL = glassRenderShards(DL);
             DL = explosionRenderFlyingParticles(DL);
+#ifdef GEVR
+            extern void gevrTacticalDrawPlayerAccessories(void);
+            extern s32 g_gevrExtraPass;
+            if (!g_gevrExtraPass) gevrTacticalDrawPlayerAccessories();
+            DL = gevrGuardCigarettesDraw(DL);
+            DL = gevrHollywoodDrawWorld(DL);
+#endif
 
             if (
 
@@ -1485,6 +1508,8 @@ void lvlManageMpGame(void)
 #ifdef GEVR
     gevrVrStatsSimulation((unsigned)g_ClockTimer);
     gevrRagdollTick(g_ClockTimer);
+    if (g_ClockTimer > 0) gevrHollywoodTick();
+    gevrTacticalRangeTick();
     { extern void gevrHordeTick(int ticks); gevrHordeTick(g_ClockTimer); }
     { extern void gevrArenaTick(s32 ticks); gevrArenaTick(g_ClockTimer); }
 #endif

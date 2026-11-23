@@ -4,6 +4,9 @@
 #include "initmenus.h"
 #include "initintromatrices.h"
 #include <macro.h>
+#ifdef GEVR
+#include "gevr_tactical_range.h"
+#endif
 
 void init_menus_or_reset(void)
 {
@@ -30,6 +33,12 @@ void init_menus_or_reset(void)
     {
         menu_update = MENU_FILE_SELECT;
     }
+#ifdef GEVR
+    if (gevrTacticalRangeReturning())
+    {
+        menu_update = MENU_MODE_SELECT;
+    }
+#endif
 
     ptr_logo_and_walletbond_DL = (u8 *)mempAllocBytesInBank(GEVR_MENU_BUFFER_BYTES, MEMPOOL_STAGE); // allocation in bytes so cast to u8 from gfx
 

@@ -6,6 +6,7 @@
 #include "gevr_gexgrip.h"
 #include "gevr_hand_reload.h"
 #include "gevr_rack.h"
+#include "gevr_tactical_session.h"
 typedef int s32;
 typedef float f32;
 typedef unsigned u32;
@@ -16,6 +17,27 @@ typedef unsigned u32;
 /* DEFINITIONS */
 typedef struct { float m[4][4]; } Mtxf;
 struct coord3d { union { struct { float x, y, z; }; float f[3]; }; };
+/* This fixture tests the original GE-X reload path with the opt-in tactical
+ * mode disabled. The tactical session has its own focused native tests. */
+static TacticalSession s_tactical;
+static int s_tacticalStarted, s_tacticalClaim, s_tacticalActionAsset, s_tacticalShotFrames[TACTICAL_GUN_COUNT];
+static unsigned int s_tacticalEnemyGrabId;
+static int s_tacticalEnemyGrabKind;
+static float s_tacticalActionCm;
+static struct { TacticalMagazine mag; struct coord3d pos; float speed, ground; int falling; } s_tacticalWorldMags[128];
+static int gevrTacticalMode(void) { return 0; }
+static int gevrTacticalItem(int item) { (void)item; return -1; }
+static unsigned int gevrTacticalCapacity(int gun) { (void)gun; return 30; }
+static int gevrTacticalManualOn(int hand) { (void)hand; return 0; }
+static void gevrTacticalTick(void) {}
+static void gevrTacticalEnsureStarted(void) {}
+void gevrEnemyRigReset(void) {}
+void gevrAvatarGuardReset(void) {}
+void tacticalSessionInit(TacticalSession *s) { memset(s, 0, sizeof(*s)); }
+unsigned int tacticalSessionLoaded(const TacticalSession *s, int pistol) { (void)s; (void)pistol; return 0; }
+int tacticalSessionStow(TacticalSession *s, int gun) { (void)s; (void)gun; return 0; }
+int tacticalSessionEquip(TacticalSession *s, int gun, unsigned int loaded, unsigned int cap, unsigned int *reserve, unsigned int *shown)
+{ (void)s; (void)gun; (void)loaded; (void)cap; (void)reserve; (void)shown; return 0; }
 struct hand { int weapon, weapon_current_animation, weapon_ammo_in_magazine, numvisibleshells; Mtxf gunmtx_camspace; };
 struct Player { int bonddead, watch_animation_state, mpmenuon, cur_item_weapon_getname, ammoheldarr[2]; struct hand hands[2]; } player;
 static struct Player *g_CurrentPlayer = &player;
@@ -62,10 +84,10 @@ static float lastNeed = -1;
 static void sndPlaySfx(void *buffer, int sound, void *state)
 { (void)buffer; (void)state; lastSound = sound; whiffs++; }
 s32 gevrChopHit(const f32 from[3], const f32 to[3], f32 touch, const f32 dir[3], s32 item,
-                const f32 velocity[3], f32 need, s32 land, f32 *into)
+                const f32 velocity[3], f32 need, s32 land, s32 piercer, f32 *into)
 {
     (void)from; (void)to; (void)touch; (void)dir;
-    (void)velocity; (void)need; (void)land; (void)into;
+    (void)velocity; (void)need; (void)land; (void)piercer; (void)into;
     lastChopItem = item; lastNeed = need;
     chopHits++;
     return chopResult;

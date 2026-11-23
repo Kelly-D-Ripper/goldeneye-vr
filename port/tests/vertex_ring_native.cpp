@@ -43,7 +43,7 @@ static void sysLogPrintf(int level, const char *, ...) { assert(level == LOG_WAR
 static uint64_t gevrFrameTimingNow(void) { return 0; }
 static void gevrFrameTimingAdd(int section, uint64_t) { assert(section == GEVR_TIME_VERTEX_WAIT); }
 #define GEVR_PM_SEGMENTS 3
-static GLsizeiptr s_pmSegSize = 100, s_pmOff;
+static GLsizeiptr s_pmSegSize = 100, s_pmBase, s_pmOff;
 static int s_pmSeg = -1;
 static GLsync s_pmFence[GEVR_PM_SEGMENTS];
 /* INSERT_RING */
@@ -82,6 +82,9 @@ int main() {
     gevr_pm_next_segment();
     assert(take() == "create8 wait6 delete6");
     for (auto &f : fences) assert(!f.live || f.id >= 7);
+    s_pmBase = 512;                            /* growth preserved the earlier offsets */
+    gevr_pm_next_segment();
+    assert(take() == "create9 wait7 delete7" && s_pmSeg == 1 && s_pmOff == 612);
     puts("PASS: vertex ring reuses segments only after their fence or a full GPU drain");
     return 0;
 }
