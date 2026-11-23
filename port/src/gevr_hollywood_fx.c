@@ -615,7 +615,7 @@ int gevrHollywoodImpact(int item, int texture, const f32 point[3], const f32 nor
 
 int gevrBloodyCombatEffects(void)
 {
-    return s_bloodReady && (gevrTacticalLootEnabled() || (VrBloodPatch && !netIsActive()));
+    return s_bloodReady && (gevrTacticalGearEnabled() || gevrTacticalLootEnabled() || (VrBloodPatch && !netIsActive()));
 }
 
 /* Hit points returned by the BSP tracer are in room scale. Test the hit

@@ -3465,6 +3465,7 @@ Gfx *chrRenderProp(PropRecord *prop, Gfx *gdl, s32 withalpha)
  */
 #ifdef GEVR
 extern int VrBloodPatch;   /* vr_settings: Mods, the blood patch */
+extern int gevrTacticalGearEnabled(void); /* Tactical always uses the blood patch */
 #endif
 void chrCreateHitPuffs(PropRecord *prop, s32 anim_id, coord3d *vec, coord3d *pos)
 {
@@ -3502,7 +3503,7 @@ void chrCreateHitPuffs(PropRecord *prop, s32 anim_id, coord3d *vec, coord3d *pos
      * behind the body. The cartridge's table itself stays as it is.
      */
     struct ChrHitReaction gevrBlood;
-    if (VrBloodPatch && entry->hitpart != -1)
+    if ((VrBloodPatch || gevrTacticalGearEnabled()) && entry->hitpart != -1)
     {
         gevrBlood = *entry;
         if (gevrBlood.hitpart >= HIT_LEFT_FOOT && gevrBlood.hitpart <= HIT_CHEST)

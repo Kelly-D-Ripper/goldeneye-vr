@@ -15,6 +15,7 @@
 #include "gevr_bean.h"
 #include "gevr_avatar_math.h"
 #include "gevr_hollywood_fx.h"
+#include "gevr_tactical_gear.h"
 #include "gevr_tactical_loot_net.h"
 #include "gevr_tactical_mesh.h"
 #include "gevr_tactical_guard_ai.h"
@@ -33,13 +34,17 @@ extern int netHordeActive(void);
  * waves, 22 ragdolls down with Bodies stay at 48). */
 #define RD_HORDE_BODIES 12
 #define RD_TACTICAL_COOP_BODIES 12
-static int rdEnabled(void) { return VrRagdolls || gevrTacticalLootEnabled(); }
-static int rdDismember(void) { return VrDismemberment || gevrTacticalLootEnabled(); }
+/* Tactical playthroughs, solo or co-op, always use ragdolls and
+ * dismemberment whatever the stock Game rules toggles say (user,
+ * 2026-11-23: 0.17-test started from stock settings and lost the gore
+ * 0.08 players had switched on). */
+static int rdEnabled(void) { return VrRagdolls || gevrTacticalGearEnabled(); }
+static int rdDismember(void) { return VrDismemberment || gevrTacticalGearEnabled(); }
 
 static int rdBodyLimit(void)
 {
     if (gevrTacticalLootEnabled()) return RD_TACTICAL_COOP_BODIES;
-    int limit=VrBodiesStay>0?VrBodiesStay:RD_BODIES;
+    int limit=VrBodiesStay>0?VrBodiesStay:gevrTacticalGearEnabled()?RD_TACTICAL_COOP_BODIES:RD_BODIES;
     if(limit>RD_BODIES)limit=RD_BODIES;
     if(netHordeActive() && limit>RD_HORDE_BODIES)limit=RD_HORDE_BODIES;
     return limit;
@@ -271,6 +276,14 @@ int gevrRagdollNeedsPose(ChrRecord *chr)
         && chr->actiontype == ACT_DIE && !s->immediate) return 0;
     return !s->attempted && !s->suppressed && !(chr->chrflags & CHRFLAG_HIDDEN)
         && chr->model->obj->Skeleton == &skeleton_guard;
+}
+
+/* The dead chr already has a physics body, which gevrRagdollGuardBody reports */
+int gevrRagdollHasBody(ChrRecord *chr)
+{
+    if (!rdEnabled() || !chr || !rdDead(chr)) return 0;
+    RdSeen *s=rdSeen(chr,0);
+    return s && s->attempted && !s->suppressed;
 }
 
 int gevrRagdollSuppress(ChrRecord *chr)
@@ -1581,7 +1594,8 @@ void gevrRagdollTick(int ticks60)
             rdRelease(b, FALSE);
             continue;
         }
-        if(!VrBodiesStay && !b->coopId && !b->bladeHeld) {
+        /* Tactical keeps its bodies (and their rigs) as 0.08's Bodies stay 12 did */
+        if(!VrBodiesStay && !b->coopId && !b->bladeHeld && !gevrTacticalGearEnabled()) {
             b->alpha=fmaxf(0,fminf(255,(b->fadeEnd-b->age)*170));
             if(b->alpha<=0)rdRelease(b, FALSE);
         }

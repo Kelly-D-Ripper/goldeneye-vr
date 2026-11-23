@@ -39,6 +39,7 @@ void gevrRagdollVolley(int begin);
 struct coord3d;
 /* -1 ends the scan, 0 means no guard body in this slot, 1 returns its torso. */
 int gevrRagdollGuardBody(int slot, int *actorId, struct coord3d *point);
+int gevrRagdollHasBody(struct ChrRecord *chr);
 void gevrRagdollExplosionChr(struct ChrRecord *chr, const struct coord3d *centre, float radius, float damage);
 void gevrRagdollBlast(const struct coord3d *centre, float radius, float damage);
 Gfx *gevrRagdollRender(Gfx *gdl);

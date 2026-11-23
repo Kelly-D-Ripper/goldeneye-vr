@@ -4,6 +4,7 @@
 #include "net_horde.h"
 static int s_gevrHordeBHeld;
 #include "gevr_hud_geometry.h"
+#include "gevr_hollywood_fx.h"
 #include "gevr_reload_input.h"
 #include "gevr_hand_reload.h"
 #include "gevr_bodyslots.h"
@@ -24114,6 +24115,10 @@ static s32 gevrTacticalTestHook(const char *word)
                 gevrCoopGuardImpactPoint(NULL, NULL, -1, FALSE);
                 if (hit && chr->damage > before)
                     gevrCoopGuardBlood(chr, ITEM_TACTICAL_AK74N, -1, chr->actiontype == ACT_DIE, &at, &shot);
+            } else if (hit && chr->damage > before) {
+                /* solo: the same textured blood a real AK round makes (chr.c bullet hit) */
+                gevrBloodyCombatImpact(ITEM_TACTICAL_AK74N, chr->prop->stan ? getTileRoom(chr->prop->stan) : -1,
+                    at.f, shot.f);
             }
             sysLogPrintf(LOG_NOTE, "tactical sim: guard %d region %d hit %d dying %d",
                 chr->chrnum, hitRegion, hit, chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD);

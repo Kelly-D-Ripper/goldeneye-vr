@@ -32,6 +32,8 @@ typedef struct TacticalGuardMind {
 typedef struct TacticalGunNoise {
     coord3d location;
     StandTile *floor;
+    coord3d aim;          /* what a firing guard was shooting at */
+    StandTile *aimFloor;
     f32 radius;
     s32 time;
     s16 guard;
@@ -50,7 +52,10 @@ void gevrTacticalGuardAiReset(void)
     memset(s_gunNoises, 0, sizeof(s_gunNoises));
     memset(s_guardNoises, 0, sizeof(s_guardNoises));
     s_nextGuardNoise = 0;
-    s_tacticalGuardAi = sysArgCheck("--tactical-physical") && sysArgCheck("--tactical-guards");
+    /* --tactical-classic-ai leaves ordinary guards on their native lists, as in
+     * 0.08, for side-by-side tests of the 0.11-0.16 combat behaviour. */
+    s_tacticalGuardAi = sysArgCheck("--tactical-physical") && sysArgCheck("--tactical-guards")
+        && !sysArgCheck("--tactical-classic-ai");
     s_traceGuardAi = sysArgCheck("--tactical-ai-trace");
     s_pathTick = -1;
     s_pathsTried = 0;
@@ -221,8 +226,19 @@ static void tacticalGuardDischarge(ChrRecord *guard, bool suppressed)
     TacticalGuardMind *mind = tacticalGuardMind(guard);
     if (!mind || g_GlobalTimer - mind->lastDischarge < 10) return;
     mind->lastDischarge = g_GlobalTimer;
+    /* Guards who hear this turn toward the threat, not toward the friendly
+     * shooter (0.16 had them kneel facing the guard who fired). */
+    coord3d aim = guard->prop->pos;
+    StandTile *aimFloor = guard->prop->stan;
+    if (mind->floor && mind->expires > g_GlobalTimer && mind->contact >= CONTACT_SOUND) {
+        aim = mind->location;
+        aimFloor = mind->floor;
+    } else if (guard->targetTile) {
+        aim = guard->lastknowntargetpos;
+        aimFloor = guard->targetTile;
+    }
     s_guardNoises[s_nextGuardNoise++ % TACTICAL_GUARD_REPORTS] = (TacticalGunNoise){
-        .location = guard->prop->pos, .floor = guard->prop->stan,
+        .location = guard->prop->pos, .floor = guard->prop->stan, .aim = aim, .aimFloor = aimFloor,
         .radius = suppressed ? 1100.0f : 2200.0f, .time = g_GlobalTimer, .guard = guard->chrnum};
 }
 
@@ -299,7 +315,8 @@ static void tacticalGuardHear(ChrRecord *guard, TacticalGuardMind *mind, bool he
         best = tacticalLoudestNoise(guard, s_guardNoises, TACTICAL_GUARD_REPORTS, mind->lastGuardNoise, TRUE);
         if (best) {
             mind->lastGuardNoise = best->time;
-            tacticalGuardNotice(mind, &best->location, best->floor, CONTACT_COMBAT, 370);
+            tacticalGuardNotice(mind, best->aimFloor ? &best->aim : &best->location,
+                best->aimFloor ? best->aimFloor : best->floor, CONTACT_COMBAT, 370);
         }
     }
 }
@@ -344,17 +361,22 @@ static void tacticalGuardFindBody(ChrRecord *guard, TacticalGuardMind *mind)
         tacticalGuardNotice(mind, &body, floor, CONTACT_BODY, 450);
         return;
     }
+    /* Kept bodies give up their chrnum for mission scripts about 1.5 s after
+     * death (gevrBodyRetireForAi), so a retired body is known by its slot.
+     * 0.16 skipped them, and patrols walked past anything but a fresh kill. */
     for (int i = 0; i < g_NumChrSlots; i++) {
         ChrRecord *body = &g_ChrSlots[i];
+        const int id = body->chrnum >= 0 ? body->chrnum : -2 - i;
         if (body == guard || !body->model || !body->prop || !body->prop->stan
-            || body->chrnum < 0 || body->chrnum == mind->corpse
+            || id == mind->corpse || gevrRagdollHasBody(body)
             || (body->actiontype != ACT_DIE && body->actiontype != ACT_DEAD)
             || body->prop->type != PROP_TYPE_CHR || (body->hidden & CHRHIDDEN_REMOVE)
             || (body->chrflags & CHRFLAG_HIDDEN) || !tacticalGuardHostile(body)
             || tacticalDistance(&guard->prop->pos, &body->prop->pos) > SQR(1550.0f)
             || !tacticalGuardFacing(guard, &body->prop->pos, TRUE)
             || !tacticalGuardSight(guard, body->prop, guard->chrheight - 20.0f, 0)) continue;
-        mind->corpse = body->chrnum;
+        mind->corpse = id;
+        if (s_traceGuardAi) sysLogPrintf(LOG_NOTE, "tactical AI: guard %d noticed body %d", guard->chrnum, id);
         tacticalGuardNotice(mind, &body->prop->pos, body->prop->stan, CONTACT_BODY, 450);
         return;
     }
@@ -438,7 +460,7 @@ int gevrTacticalGuardScriptBody(ChrRecord *guard)
     const int old = mind->corpse;
     tacticalGuardFindBody(guard, mind);
     if (mind->corpse == old) return FALSE;
-    guard->chrseedie = mind->corpse;
+    guard->chrseedie = mind->corpse >= 0 ? mind->corpse : CHR_FREE;
     return TRUE;
 }
 
@@ -456,6 +478,7 @@ static bool tacticalGuardRoute(ChrRecord *guard, coord3d *point, StandTile *floo
 static void tacticalGuardFaceContact(ChrRecord *guard, const TacticalGuardMind *mind)
 {
     const coord3d *pos = &guard->prop->pos;
+    if (SQR(mind->location.x - pos->x) + SQR(mind->location.z - pos->z) < SQR(40.0f)) return;
     const f32 angle = atan2f(mind->location.x - pos->x, mind->location.z - pos->z);
     check_set_actor_standing_still(guard, TARGET_COMPASS, (s32)(angle * 65536.0f / M_TAU_F) & 0xffff);
 }
@@ -536,8 +559,15 @@ static bool tacticalGuardThink(ChrRecord *guard)
             tacticalGuardTeam(guard, mind, squad);
             if (mind->contact < CONTACT_COMBAT) tacticalGuardFindBody(guard, mind);
             if (mind->contact == CONTACT_NONE && chrIfNearMiss(guard)) {
-                const PropRecord *prop = guard->prop;
-                tacticalGuardNotice(mind, &prop->pos, prop->stan, CONTACT_IMPACT, 90);
+                /* 0.16 noted the guard's own position, so the guard knelt
+                 * and aimed at compass 0, usually away from the shooter. */
+                const int shooter = get_cur_playernum();
+                const TacticalGunNoise *shot = shooter >= 0 && shooter < MAX_PLAYER_COUNT
+                    ? &s_gunNoises[shooter] : NULL;
+                if (shot && shot->floor && now - shot->time <= 30)
+                    tacticalGuardNotice(mind, &shot->location, shot->floor, CONTACT_IMPACT, 90);
+                else if (target && target->stan)
+                    tacticalGuardNotice(mind, &target->pos, target->stan, CONTACT_IMPACT, 90);
             }
         }
     }
