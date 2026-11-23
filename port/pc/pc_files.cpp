@@ -80,8 +80,8 @@ long long fileTimeMs(const std::string &path)
     std::error_code ec;
     const auto t = fs::last_write_time(P(path), ec);
     if (ec) return 0;
-#if defined(__APPLE__) || defined(ANDROID)
-    // Apple's and the NDK's libc++ have no clock_cast: the same instant through both clocks' now
+#ifdef _LIBCPP_VERSION
+    // libc++ versions without clock_cast can compare the same instant in both clocks.
     const auto sys = std::chrono::system_clock::now() +
         std::chrono::duration_cast<std::chrono::system_clock::duration>(t - fs::file_time_type::clock::now());
     return std::chrono::duration_cast<std::chrono::milliseconds>(sys.time_since_epoch()).count();

@@ -723,7 +723,11 @@ public:
             for (;;) {   // everything curl has buffered, not one frame per poll
                 char buf[4096];
                 size_t got = 0;
+#if CURL_AT_LEAST_VERSION(8, 2, 0)
                 const struct curl_ws_frame *meta = nullptr;
+#else
+                struct curl_ws_frame *meta = nullptr;
+#endif
                 CURLcode rc;
                 {
                     std::lock_guard<std::mutex> lock(lock_);
