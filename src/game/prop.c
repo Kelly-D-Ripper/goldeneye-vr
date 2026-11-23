@@ -235,6 +235,47 @@ int gevrJunglePatrolSquad(const ChrRecord *chr)
 }
 
 extern s32 g_GlobalTimer; /* lv.c */
+
+/* No added guard may stand where a door opens (user, 2026-11-23: a Facility
+ * guard by the bathroom door kept it from opening). 2.6 m from a door's
+ * centre on the same floor covers its leaf and swing. */
+static bool campaignSpotBesideDoor(const coord3d *pos, StandTile *stan)
+{
+    /* compare floors: a spot's and a door's stored heights aren't both on the ground */
+    const f32 floor = stan ? stanGetPositionYValue(stan, pos->x, pos->z) : pos->y;
+    for (PropDefHeaderRecord *def = g_CurrentSetup.propDefs; def && def->type != PROPDEF_END; def += sizepropdef(def)) {
+        if (def->type != PROPDEF_DOOR) continue;
+        const ObjectRecord *door = (const ObjectRecord *)def;
+        if (!door->prop) continue;
+        const coord3d *at = &door->prop->pos;
+        if (SQR(at->x - pos->x) + SQR(at->z - pos->z) >= SQR(260.0f)) continue;
+        const f32 doorFloor = door->prop->stan ? stanGetPositionYValue(door->prop->stan, at->x, at->z) : at->y - 120.0f;
+        if (fabsf(doorFloor - floor) < 150.0f || (at->y > floor && at->y - floor < 300.0f)) return TRUE;
+    }
+    return FALSE;
+}
+
+static f32 campaignChrFloor(const ChrRecord *chr)
+{
+    return chr->prop->stan ? stanGetPositionYValue(chr->prop->stan, chr->prop->pos.x, chr->prop->pos.z) : chr->prop->pos.y;
+}
+
+/* Another living guard within 10 m on the same floor: added idle guards are
+ * placed with company, never dotted on their own. */
+static bool campaignSpotHasCompany(const coord3d *pos, StandTile *stan, const ChrRecord *except)
+{
+    const f32 floor = stan ? stanGetPositionYValue(stan, pos->x, pos->z) : pos->y;
+    for (int i = 0; i < g_NumChrSlots; i++) {
+        const ChrRecord *chr = &g_ChrSlots[i];
+        if (chr == except || !chr->model || !chr->prop || chr->prop->type != PROP_TYPE_CHR
+            || chr->actiontype == ACT_DIE || chr->actiontype == ACT_DEAD
+            || (chr->hidden & CHRHIDDEN_REMOVE) || (chr->chrflags & CHRFLAG_HIDDEN)) continue;
+        if (SQR(chr->prop->pos.x - pos->x) + SQR(chr->prop->pos.z - pos->z) < SQR(1000.0f)
+            && fabsf(campaignChrFloor(chr) - floor) < 200.0f) return TRUE;
+    }
+    return FALSE;
+}
+
 /* Whether stock guard n has a partner actor, rechecked once a second. */
 static bool campaignHasBuddy(int sentry)
 {
@@ -337,7 +378,7 @@ static void spawnJunglePatrols(int npads)
             const u16 index = squadPads[i][j];
             if (!index || index >= npads) continue;
             const PadRecord *pad = &g_CurrentSetup.pads[index];
-            if (!gevrCampaignOpeningPointClear(pad)) continue;
+            if (campaignSpotBesideDoor(&pad->pos, pad->stan) || !gevrCampaignOpeningPointClear(pad)) continue;
 
             const int id = JUNGLE_PATROL_FIRST_ID + (int)i * GEVR_JUNGLE_SQUAD_SIZE + members;
             const f32 angle = atan2f(pad->look.x, pad->look.z);
@@ -402,6 +443,10 @@ static PropRecord *spawnSentryPartner(ChrRecord *sentry, const PadRecord *prefer
                 *failure = "too close to first partner";
                 continue;
             }
+        }
+        if (campaignSpotBesideDoor(&spot.pos, spot.stan)) {
+            *failure = "beside a door";
+            continue;
         }
         if (!gevrCampaignOpeningPointClear(&spot)) {
             *failure = "start area, sightline or standing space rejected";
@@ -663,7 +708,7 @@ static void spawnCampaignExpansions(int stage, int npads, bool host)
             const u16 index = encounter->pads[j];
             if (!index || index >= npads) continue;
             const PadRecord *pad = &g_CurrentSetup.pads[index];
-            if (!gevrCampaignOpeningPointClear(pad)) continue;
+            if (campaignSpotBesideDoor(&pad->pos, pad->stan) || !gevrCampaignOpeningPointClear(pad)) continue;
             f32 angle = atan2f(pad->look.x, pad->look.z);
             if (marksman) {
                 const u16 sight = encounter->pads[1];
@@ -700,6 +745,14 @@ static void spawnCampaignExpansions(int stage, int npads, bool host)
         if (placed < encounter->size)
             sysLogPrintf(LOG_NOTE, "tactical encounter: stage %d row %u skipped %s placement (%d/%u)",
                 stage, (unsigned)row, labels[encounter->role], placed, (unsigned)encounter->size);
+        /* An idle post left with one man and nobody within 10 m is a guard
+         * dotted on his own: stand him down before the mission starts. */
+        if (lead && placed == 1 && encounter->role == ENCOUNTER_IDLE
+            && !campaignSpotHasCompany(&lead->pos, lead->stan, lead->chr)) {
+            lead->chr->hidden |= CHRHIDDEN_REMOVE;
+            lead->chr->chrflags |= CHRFLAG_HIDDEN;
+            sysLogPrintf(LOG_NOTE, "tactical encounter: stage %d row %u idle guard alone, not placed", stage, (unsigned)row);
+        }
     }
 }
 
@@ -714,7 +767,7 @@ static void spawnCampaignPatrols(int stage, int npads)
             const u16 index = campaignPatrols[i].pads[j];
             if (index == 0 || index >= npads) continue;
             const PadRecord *pad = &g_CurrentSetup.pads[index];
-            if (!gevrCampaignOpeningPointClear(pad)) continue;
+            if (campaignSpotBesideDoor(&pad->pos, pad->stan) || !gevrCampaignOpeningPointClear(pad)) continue;
             f32 angle = atan2f(pad->look.x, pad->look.z);
             if (first) {
                 if (!campaignPatrolConnected(&first->pos, first->stan, pad, 800.0f)) continue;
@@ -763,7 +816,7 @@ static void spawnSurfaceMarksman(int npads)
         const u16 index = candidates[i];
         if (index >= npads || !g_CurrentSetup.pads[index].stan) continue;
         const PadRecord *pad = &g_CurrentSetup.pads[index];
-        if (!gevrCampaignOpeningPointClear(pad)) continue;
+        if (campaignSpotBesideDoor(&pad->pos, pad->stan) || !gevrCampaignOpeningPointClear(pad)) continue;
         const f32 angle = atan2f(pad->look.x, pad->look.z);
         PropRecord *actor = gevrSpawnCampaignGuard(BODY_Siberian_Special_Forces, pad, angle, ai,
                                                   SURFACE_ROOF_MARKSMAN);
@@ -835,7 +888,7 @@ static void spawnCampaignPerches(int stage, int npads)
             near = chr->model && chr->prop && gevrCampaignGuardIsMarksman(chr)
                 && SQR(chr->prop->pos.x - pad->pos.x) + SQR(chr->prop->pos.z - pad->pos.z) < SQR(2500.0f);
         }
-        if (near) { rejectNear++; continue; }
+        if (near || campaignSpotBesideDoor(&pad->pos, pad->stan)) { rejectNear++; continue; }
         if (!gevrCampaignOpeningPointClear(pad)) { rejectClear++; continue; }
         /* Count the lower pads it can actually see, and face their middle. */
         const f32 ground = stanGetPositionYValue(pad->stan, pad->pos.x, pad->pos.z);
@@ -881,6 +934,47 @@ static void spawnCampaignPerches(int stage, int npads)
         " standing space, %d without a view)", stage, placed, found, rejectNear, rejectClear, rejectSight);
 }
 
+/* --tactical-placement-audit: every door and every guard after the added
+ * guards are placed, with what is near each, for the placement review. */
+static const char *campaignGuardKind(const ChrRecord *chr)
+{
+    const int n = chr->chrnum;
+    if (n < 0) return "retired";
+    if (n < 20000) return chr->chrflags & CHRFLAG_CLONE ? "clone" : "stock";
+    if (n < 20900) return "jungle-squad";
+    if (n >= CAMPAIGN_PARTNER_FIRST_ID && n < CAMPAIGN_PARTNER_FIRST_ID + 100) return "partner";
+    if (n >= CAMPAIGN_THIRD_FIRST_ID && n < CAMPAIGN_THIRD_FIRST_ID + 100) return "third";
+    if (n >= CAMPAIGN_PERCH_FIRST_ID && n < CAMPAIGN_PERCH_FIRST_ID + CAMPAIGN_PERCH_MAX) return "perch";
+    if (n >= 23000 && n < 24000) return "marksman";
+    if (n >= 24000 && n < 25000) return "reinforcement";
+    if (n >= CAMPAIGN_PATROL_FIRST_ID && n < CAMPAIGN_EXPANSION_FIRST_ID) return "patrol";
+    if (n >= CAMPAIGN_EXPANSION_FIRST_ID) return "expansion";
+    return "other";
+}
+
+static void campaignPlacementAudit(int stage)
+{
+    if (!sysArgCheck("--tactical-placement-audit")) return;
+    for (PropDefHeaderRecord *def = g_CurrentSetup.propDefs; def && def->type != PROPDEF_END; def += sizepropdef(def)) {
+        if (def->type != PROPDEF_DOOR) continue;
+        const ObjectRecord *door = (const ObjectRecord *)def;
+        if (door->prop) sysLogPrintf(LOG_NOTE, "placement audit: stage %d door at %.0f %.0f %.0f room %d", stage,
+            door->prop->pos.x, door->prop->pos.y, door->prop->pos.z, door->prop->stan ? door->prop->stan->room : -1);
+    }
+    for (s32 i = 0; i < startpadcount; i++)
+        if (g_Startpad[i]) sysLogPrintf(LOG_NOTE, "placement audit: stage %d start at %.0f %.0f %.0f", stage,
+            g_Startpad[i]->pos.x, g_Startpad[i]->pos.y, g_Startpad[i]->pos.z);
+    for (int i = 0; i < g_NumChrSlots; i++) {
+        const ChrRecord *chr = &g_ChrSlots[i];
+        if (!chr->model || !chr->prop || chr->prop->type != PROP_TYPE_CHR) continue;
+        const PropRecord *held = chr->weapons_held[GUNRIGHT] ? chr->weapons_held[GUNRIGHT] : chr->weapons_held[GUNLEFT];
+        sysLogPrintf(LOG_NOTE, "placement audit: stage %d guard %d %s at %.0f %.0f %.0f room %d action %d item %d yaw %.2f",
+            stage, chr->chrnum, campaignGuardKind(chr), chr->prop->pos.x, chr->prop->pos.y, chr->prop->pos.z,
+            chr->prop->stan ? chr->prop->stan->room : -1, chr->actiontype,
+            held && held->weapon ? held->weapon->weaponnum : -1, getsubroty(chr->model));
+    }
+}
+
 void gevrCampaignEncountersStageLoaded(int stage)
 {
     memset(campaignRoutes, 0, sizeof(campaignRoutes));
@@ -900,6 +994,7 @@ void gevrCampaignEncountersStageLoaded(int stage)
         spawnCampaignPerches(stage, npads);
         if (stage != LEVELID_JUNGLE) spawnCampaignLoneBuddies(stage);
     }
+    campaignPlacementAudit(stage);
 }
 #endif
 
