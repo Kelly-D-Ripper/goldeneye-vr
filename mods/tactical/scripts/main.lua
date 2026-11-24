@@ -105,7 +105,7 @@ end)
 
 mod.on("item_pickup", function(kind, id, rounds)
   if kind == "weapon" then
-    local key = arsenal.carry(id)
+    local key = arsenal.pickedUp(id)
     if key then magazines.trackAmmo(id) end
   end
   -- rounds reach the reserve; the next sync counts them as loose

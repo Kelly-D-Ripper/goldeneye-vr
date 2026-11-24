@@ -12,6 +12,7 @@ local catalog = require "tactical.catalog"
 local progress = require "tactical.progress"
 local state = require "tactical.state"
 local util = require "tactical.util"
+local arsenal = require "tactical.arsenal"
 
 local firing = {}
 
@@ -72,7 +73,13 @@ function firing.multiplier(slot, itemId)
   end
   local def = key and catalog.byKey[key]
   if not def then return 1 end
-  return util.clamp(def.damage, 0.75, 1.75)
+  local m = util.clamp(def.damage, 0.75, 1.75)
+  -- a gun on a borrowed cartridge gun hits as it would on its home one
+  if itemId ~= def.itemId then
+    local home, here = arsenal.baseDamage(def.itemId), arsenal.baseDamage(itemId)
+    if home and here and here > 0 then m = m * home / here end
+  end
+  return m
 end
 
 function firing.beforeDamage(d)

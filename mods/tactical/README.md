@@ -17,6 +17,19 @@ example. The table is `scripts/tactical/guns.lua`, generated from 0.18.4's
 reviewed unlock tables and Workshop stats by `tools/generate_data.py`. Each gun
 brings its magazine sizes, rate of fire, fire modes and damage.
 
+The game's inventory holds only one of each cartridge gun, so Tactical guns
+that share one are given separate cartridge guns. For example, with an M4A1 in
+your hands you can loot an HK416 and carry it on your back:
+- The HK416 borrows a free cartridge gun, here the KF7.
+- The borrowed gun fires the same way and, where possible, takes the same
+  ammo.
+- Both guns share the rig's STANAG magazines.
+- The HK416 keeps its own damage, rate of fire and magazine size.
+
+Two pistols work the same way. A looted PPK next to a Glock 17 takes the
+silenced PPK, for example. A borrowed gun looks like the cartridge gun it
+borrows until the API can attach models.
+
 **Magazines and the chamber.** The game's reload runs on a spare-round
 reserve. The mod keeps that reserve equal to the next magazine in your rig, so
 both the button reload and the VR belt reload seat real magazines:

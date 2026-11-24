@@ -69,13 +69,14 @@ end
 function magazines.pack()
   local order = {}
   for _, hand in ipairs(arsenal.HANDS) do
-    local key = state.held[hand] and state.carried[state.held[hand]]
-    if key then order[#order + 1] = key end
+    local itemId = state.held[hand]
+    if itemId and state.carried[itemId] then order[#order + 1] = itemId end
   end
-  for _, key in pairs(state.carried) do order[#order + 1] = key end
-  for _, key in ipairs(order) do
+  for itemId in pairs(state.carried) do order[#order + 1] = itemId end
+  for _, itemId in ipairs(order) do
+    local key = state.carried[itemId]
     local def = catalog.byKey[key]
-    local ammo = catalog.ammo(def.itemId)
+    local ammo = catalog.ammo(itemId)
     if not catalog.noMagazine[key] and ammo then
       local cap = arsenal.gun(key).cap
       while (state.loose[ammo] or 0) > 0 and room(def) do

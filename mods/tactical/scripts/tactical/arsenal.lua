@@ -1,9 +1,13 @@
 -- Which Tactical gun each cartridge gun is, the starting kit, carry limits,
 -- and the per-gun stats the game's weapon types carry while one is held.
 --
--- Several Tactical guns ride on one cartridge gun (the M4A1, HK416, L85A2,
--- AUG, FAMAS and KAC PDW all on the AR33), so the player carries at most one
--- of each family at a time; which one it is lives here.
+-- The game's inventory holds one of each cartridge gun, and several Tactical
+-- guns ride on the same one (the M4A1, HK416, L85A2, AUG, FAMAS and KAC PDW
+-- all on the AR33). So each gun the player carries gets a cartridge gun of
+-- its own: its home one when that's free, else a free one from a pool that
+-- fires the same way and, where it can, takes the same ammo. An M4A1 in the
+-- hands and an HK416 on the back are then two guns, the HK416 on the KF7,
+-- sharing one rig of STANAG magazines.
 local catalog = require "tactical.catalog"
 local progress = require "tactical.progress"
 local state = require "tactical.state"
@@ -122,8 +126,63 @@ local function enforceCarry(slot, keep)
   end
 end
 
+-- Cartridge guns a Tactical gun can borrow. Not the golden guns (one-shot
+-- kills), the Moonraker laser (no ammo), the pump shotgun (its rack reads a
+-- lower count as a shot) or the launchers (their own projectiles).
+local POOL = { "m16", "ak47", "spectre", "mp5k", "mp5ksil", "uzi", "fnp90", "skorpion", "autoshot",
+               "wppk", "wppksil", "tt33", "silverwppk", "ruger", "sniperrifle" }
+local AUTOMATIC = { m16 = true, ak47 = true, spectre = true, mp5k = true, mp5ksil = true, uzi = true,
+                    fnp90 = true, skorpion = true, autoshot = true }
+local PISTOL_LOOK = { wppk = true, wppksil = true, tt33 = true, silverwppk = true, ruger = true }
+
+function arsenal.carries(key)
+  for _, k in pairs(state.carried) do if k == key then return true end end
+  return false
+end
+
+local function free(itemId)
+  return state.carried[itemId] == nil and not util.try(mod.inventory.has, itemId)
+end
+
+-- The cartridge gun this Tactical gun should take now, or nil when none is free.
+function arsenal.slotFor(key)
+  local def = catalog.byKey[key]
+  if free(def.itemId) then return def.itemId end
+  if catalog.noMagazine[key] then return nil end   -- launchers keep their own
+  local ammo = catalog.ammo(def.itemId)
+  local needsAuto = def.modes & 6 ~= 0
+  local best, bestScore
+  for i, name in ipairs(POOL) do
+    local id = mod.items[name]
+    if free(id) then
+      local score = (catalog.ammoOf[name] == ammo and 8 or 0)
+        + ((needsAuto and AUTOMATIC[name]) and 16 or 0)
+        + ((not needsAuto and not AUTOMATIC[name]) and 1 or 0)
+        + (((def.slot == "pistol") == (PISTOL_LOOK[name] == true)) and 4 or 0)
+        - i / 100
+      if not best or score > bestScore then best, bestScore = id, score end
+    end
+  end
+  return best
+end
+
+-- Put a Tactical gun in the inventory on a cartridge gun of its own.
+function arsenal.issue(key)
+  if arsenal.carries(key) then return nil end
+  local itemId = arsenal.slotFor(key)
+  if not itemId then
+    mod.log("no free cartridge gun for " .. catalog.byKey[key].name)
+    return nil
+  end
+  util.try(mod.inventory.give, itemId)
+  state.carried[itemId] = key
+  enforceCarry(catalog.byKey[key].slot, itemId)
+  return itemId
+end
+
+-- A cartridge gun in the inventory (held or drawn) that has no Tactical gun yet.
 function arsenal.carry(itemId)
-  if not catalog.isGunItem(itemId) then return nil end
+  if not catalog.isGunItem(itemId) then return state.carried[itemId] end
   local key = state.carried[itemId]
   if not key then
     key = identify(itemId)
@@ -132,6 +191,21 @@ function arsenal.carry(itemId)
     enforceCarry(catalog.byKey[key].slot, itemId)
   end
   return key
+end
+
+-- item_pickup: a looted gun. When the player already carries a different
+-- Tactical gun on that cartridge gun, the game only gave its rounds, so the
+-- looted gun gets a cartridge gun of its own.
+function arsenal.pickedUp(itemId)
+  local had = state.carried[itemId]
+  if not had then return arsenal.carry(itemId) end
+  local key = identify(itemId)
+  if key and key ~= had and not arsenal.carries(key) then
+    local slot = arsenal.issue(key)
+    if slot then mod.log(catalog.byKey[key].name .. " carried on the " .. catalog.itemName[slot]) end
+    return key
+  end
+  return had
 end
 
 -- The starting kit: the loadout's primary and pistol in place of the
@@ -143,24 +217,24 @@ function arsenal.applyKit(stage)
   if NO_STARTING_KIT[stage] or not mod.setting("starting_kit", true) then return end
   local lo = progress.loadout()
   -- the cartridge's own guns go; gadgets, keys and thrown weapons stay
-  for itemId, _ in pairs(catalog.byItem) do
-    if util.try(mod.inventory.has, itemId) then util.try(mod.inventory.take, itemId) end
-  end
   for name, id in pairs(mod.items) do
-    if catalog.ammoOf[name] and not catalog.byItem[id] and util.try(mod.inventory.has, id) then
-      util.try(mod.inventory.take, id)
-    end
+    if catalog.ammoOf[name] and util.try(mod.inventory.has, id) then util.try(mod.inventory.take, id) end
   end
   state.carried = {}
   for _, key in ipairs({ lo.primary, lo.pistol }) do
-    local def = catalog.byKey[key]
-    if def and progress.owned(key) and not state.carried[def.itemId] then
-      util.try(mod.inventory.give, def.itemId)
-      state.carried[def.itemId] = key
+    if catalog.byKey[key] and progress.owned(key) and arsenal.issue(key) then
       arsenal.gun(key).cap = progress.magazineChoice(key)
     end
   end
   state.kitApplied = true
+end
+
+-- The cartridge gun's own damage, for the multiplier (the item a gun
+-- borrows may hit harder or softer than its home one).
+function arsenal.baseDamage(itemId)
+  if not state.original[itemId] then state.original[itemId] = util.try(mod.weapon.stats, itemId) end
+  local st = state.original[itemId]
+  return st and st.damage or nil
 end
 
 -- The guns this player brings home: those in hand and the primary on the back.
@@ -172,8 +246,7 @@ function arsenal.broughtHome()
     if key then keys[key] = true end
   end
   if state.lastPrimary then
-    local def = catalog.byKey[state.lastPrimary]
-    if def and state.carried[def.itemId] == state.lastPrimary then keys[state.lastPrimary] = true end
+    if arsenal.carries(state.lastPrimary) then keys[state.lastPrimary] = true end
   end
   return keys
 end

@@ -113,6 +113,24 @@ ALL = "mode 2\nloadout {p} {s}\n"
 GUNS = ["stats", M16, 30, 4, 1.5, "stats", SPECTRE, 30, 4, 1.0, "stats", UZI, 32, 3, 1.0]
 
 
+def draw(stage, gid):
+    """scripts/tactical/util.lua util.draw: the 0.18.4 roster roll."""
+    m = 0xffffffff
+    d = ((stage & 0xff) << 16) | (gid & 0xffff)
+    d = ((d ^ (d >> 16)) * 0x7feb352d) & m
+    d = ((d ^ (d >> 15)) * 0x846ca68b) & m
+    return (d ^ (d >> 16)) & m
+
+
+def elite_hk416(stage):
+    """A Janus special forces guard id whose roster gun is the HK416."""
+    for gid in range(1, 500):
+        d = draw(stage, gid)
+        if d % 100 >= 18 and d % 8 in (4, 5):
+            return gid
+    raise AssertionError("no HK416 guard")
+
+
 def scenarios(exe, temp):
     # 1. It loads in the real sandbox and asks the one-time question.
     r = Run(exe, temp, "load")
@@ -271,6 +289,36 @@ def scenarios(exe, temp):
     out = r("start", "prepare", 34, "begin", 34, "addguard", 3, 2, 50, 1, AK47, 0, 1, 1, 0, 0, 0,
             *(["frame"] * 500), "alerted", 3, 1, 0, *(["frame"] * 160))
     check(not lines(out, "SPAWNGUARD"), "Facility has no approach pads, so no wave")
+
+    # 10. Guns that share a cartridge gun are carried together, each on its own.
+    gid = elite_hk416(34)
+    r = Run(exe, temp, "pair", save="mode 1\nloadout 16 1\ngun 16 1 0 0 0 0 0\n")   # M4A1 owned
+    out = r("start", "prepare", 34, "stats", M16, 30, 4, 2.0,
+            "spawning", gid, 0, 4, 50, M16, "begin", 34,
+            "addguard", gid, 4, 50, 1, M16, 0, 1, 1, 0, 0, 0, "killed", gid, 1, M16, 0,
+            "took", "weapon", M16, "inv",
+            "hold", 0, AK47, 0, "draw", 0, AK47, "frame", "ammois", RIFLE, "reload", 0, 0, "loadedis", 0,
+            "show", AK47, "hurt", 1, 9, 1.0, 1, 2, AK47, 0,
+            "draw", 0, M16, "frame", "complete", "title")
+    check(not errors(out), "pair scenario without errors: %s" % errors(out)[:3])
+    inv = lines(out, "INV")[0] + " "
+    check(" 13 " in inv and " 8 " in inv, "a looted HK416 joins the M4A1, on the KF7 (%s)" % inv.strip())
+    check(any("HK416A5 carried on the ak47" in l for l in logs(out)), "the log says where it went")
+    check(lines(out, "AMMO %d " % RIFLE)[0] == "AMMO 3 30", "the HK416 draws on the M4's STANAG magazines")
+    check(lines(out, "LOADED")[0] == "LOADED 30", "the HK416 seats a STANAG magazine from the shared rig")
+    check(lines(out, "STATS %d " % AK47)[0].split()[2] == "31", "the KF7 carries the STANAG's size while it's the HK416")
+    check(lines(out, "DAMAGE")[0] == "DAMAGE 1.53",
+          "the HK416 hits as on the AR33: 1.15 x 2.0 / 1.5 (%s)" % lines(out, "DAMAGE")[0])
+    p = r.progress()
+    check(re.search(r"^gun 17 1 ", p, re.M) is not None, "the HK416 on the back comes home and unlocks:\n" + p)
+    check(re.search(r"^gun 16 1 \d+ \d+ \d+ \d+ 1$", p, re.M) is not None, "and the M4A1 in hand gets its clear")
+
+    # two pistols on the PPK: the second takes the silenced PPK
+    r = Run(exe, temp, "pistols", save=ALL.format(p=-1, s=22))   # Glock 17
+    out = r("start", "prepare", 34, "begin", 34, "addguard", 6, 2, 50, 1, WPPK, 0, 1, 1, 0, 0, 0,
+            "killed", 6, 1, WPPK, 0, "took", "weapon", WPPK, "inv")
+    inv = lines(out, "INV")[0] + " "
+    check(" 4 " in inv and " 5 " in inv, "a Glock 17 and a looted PPK are both carried (%s)" % inv.strip())
 
 
 def main():
