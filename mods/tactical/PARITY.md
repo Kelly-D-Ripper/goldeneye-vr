@@ -106,6 +106,48 @@ tests. Otherwise it stays out of the mod for good.
 | C10 | **Tactical's model files, as they are** | `gevr_tactical_mesh.c` (the loader and its display lists), the `GEVRWPN1`/`GEVRWPN2` files | Full-colour, high-detail guns, hands, gloves, vests, helmets and blades, with moving action parts | The API only takes GoldenEye-format models that fit a cartridge model's header (4 MB at most). A loader for a model format with its own header would serve any mod. MrSco noted GoldenEye's files have no header of their own. |
 | C9 | Tactical's own items | 32 `ITEM_TACTICAL_*` ids in `bondconstants.h` | Each gun is its own item, with its own stats, carried and dropped like any other | Mods can't add items. Borrowing cartridge guns caps it at 15, and B1's per-hand models keep the ROM gun's stats and sounds (B9 can move some of them). |
 
+### C2 and C10 in detail: what "exactly as native" means
+
+**Optics.** The pack has 136 optic profiles (`gear/optics/*.opt`,
+`GEVROPT4`). They hold 80 collimator modes (red dots and holographics), 85
+scope modes, 27 thermal and 3 night. Each mode carries:
+- its lens outline (up to 64 points) and the lens frame in the part's own
+  coordinates;
+- a full-colour reticle image, its axis and its angular size;
+- a low and a high zoom. 45 modes have variable zoom, up to 25.5x;
+  `mod.weapon.scope` caps zoom at 25.
+- whether its reticle is in the first focal plane (34 modes; the reticle
+  scales with the zoom);
+- a palette for night and thermal views.
+
+The lens is drawn depth-tested at the assembled gun's pose, with the
+eye's position in the lens for parallax, and zeroed by distance. While
+aiming, the stick changes the zoom and a click changes mode
+(`gevrTacticalOpticInput`, `gevrTacticalOpticCycle`).
+
+**Folding magnifiers.** The EOTech HHS-1, in black and in tan, is a
+holographic sight with a 3x magnifier that folds:
+- Mode 0 is the magnifier deployed (a 3x scope mode). Mode 1 is the
+  magnifier folded (the 1x holographic).
+- To fold or deploy it, the off hand's fingertip swipes across the
+  magnifier housing along a measured path on the housing. The swipe has to
+  travel 2.6 cm within 18 ticks, starting at least 1.7 cm along the path
+  (`gevrTacticalMagnifierFlick`, `gevrTacticalOpticFlick`).
+- A short haptic pulse confirms it (0.24 for 0.045 s).
+- The housing is drawn in two states, folded and deployed, from two meshes.
+  Co-op copies of the player show the same state.
+
+For parity, the engine has to run this from the pack's data, at the
+headset's frame rate. A script can't do it: scripts tick at 60 Hz, and
+MrSco has already said placing parts from a script would lag the hand.
+
+**Models.** The `GEVRWPN1`/`GEVRWPN2` files load and draw as they are:
+- full-colour textures (the SVD has 14, up to 512 by 512);
+- the bolt and charging handle tagged, so they move with the action;
+- glove variants (ready, trigger, support);
+- parts with two states, like the HHS-1's housing;
+- the gear parts placed by their mount frames (C1).
+
 Also not portable today:
 - **Firing range:** a private practice stage (`gevr_tactical_range.c`).
 - **Guard smoking:** guards smoking while idle (`gevr_guard_cigarettes.c`).
