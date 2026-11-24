@@ -317,6 +317,18 @@ def scenarios(exe, temp):
     check(re.search(r"^gun 16 1 ", r.progress(), re.M) is not None and "reserve 1 0" in r.progress(),
           "one reserve buys the M4A1 after four successes on the same stage")
 
+    r = Run(exe, temp, "reserve_owned_at_launch",
+            save="mode 1\nreserve 1 0\nmissions 4\ncleared 34\nloadout -1 1\n")
+    out = r(*mission, *select_m4, "uiclick", page, 1, "frame", "draw", 0, M16, "frame", "inv",
+            "complete", "title")
+    check(not errors(out) and any(line.startswith("INV 4 13 ") for line in lines(out, "INV")),
+          "the M4A1 can still be bought and issued through Apply now")
+    check(re.search(r"^gun 16 1 (?:\d+ ){4}0$", r.progress(), re.M) is not None,
+          "buying and equipping mid-mission does not count as owning the M4A1 at launch")
+    r(*mission, "draw", 0, M16, "frame", "complete", "title")
+    check(re.search(r"^gun 16 1 (?:\d+ ){4}1$", r.progress(), re.M) is not None,
+          "the next successful mission with the M4A1 awards its first clear")
+
     # 9. Reinforcements: a sighting on an open map calls a wave at its approach pads.
     r = Run(exe, temp, "reinforce", save=ALL.format(p=4, s=1))
     cmds = ["start", "prepare", 35, "begin", 35, "addguard", 3, 2, 50, 1, AK47, 0, 1, 1, 0, 0, 0]

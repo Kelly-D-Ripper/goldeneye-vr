@@ -230,9 +230,6 @@ end
 -- The starting kit: the loadout's primary and pistol in place of the
 -- mission's own guns.
 function arsenal.applyKit(stage)
-  for _, def in ipairs(catalog.guns) do
-    if progress.owned(def.key) then state.ownedAtStart[def.key] = true end
-  end
   if NO_STARTING_KIT[stage] or not mod.setting("starting_kit", true) then return end
   local lo = progress.loadout()
   -- the cartridge's own guns go; gadgets, keys and thrown weapons stay

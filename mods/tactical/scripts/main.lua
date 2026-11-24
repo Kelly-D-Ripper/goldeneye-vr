@@ -46,6 +46,11 @@ local function issueKit()
 end
 
 mod.on("mission_start", function(stage)
+  -- Reapplying a kit can equip a new purchase without changing which guns were
+  -- eligible to earn a mastery clear when the mission began.
+  for _, def in ipairs(catalog.guns) do
+    if progress.owned(def.key) then state.ownedAtStart[def.key] = true end
+  end
   issueKit()
   pages.refresh()
   pages.ask()
