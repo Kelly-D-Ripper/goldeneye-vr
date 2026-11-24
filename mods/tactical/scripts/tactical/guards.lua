@@ -67,14 +67,24 @@ function guards.spawning(g)
   return { weapon = item }
 end
 
--- A guard's gun is likely loot once it falls.
-function guards.killed(id)
+local function droppedKey(id, item)
   local g = state.guards[id]
+  if g and g.key and catalog.byKey[g.key].itemId == item then return g.key end
+  return catalog.defaultKey(item)
+end
+
+function guards.dropped(pickup, item, from)
+  if type(from) == "number" then
+    arsenal.trackDrop(pickup, item, droppedKey(from, item))
+  end
+end
+
+-- Older hosts lack the drop event; use guard kills only for those hosts.
+function guards.killed(id)
+  if arsenal.hasPickupIds then return end
   local info = util.try(mod.guards.get, id)
   local item = info and info.weapon
-  if item and catalog.isGunItem(item) then
-    arsenal.noteDrop(item, (g and g.key and catalog.byKey[g.key].itemId == item) and g.key or catalog.defaultKey(item))
-  end
+  if item and catalog.isGunItem(item) then arsenal.noteDrop(item, droppedKey(id, item)) end
 end
 
 ---------------------------------------------------------------------------

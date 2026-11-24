@@ -41,6 +41,7 @@ FAILS = []
 # cartridge items (mod.items) and ammo types (mod.ammo) the scenarios use
 WPPK, AK47, UZI, SPECTRE, M16 = 4, 8, 9, 12, 13
 NINE, RIFLE = 1, 3
+HAS_PICKUP_IDS = "gevrModApiWeaponDropped(" in (ROOT / "port/tests/modapi_native.c").read_text()
 
 
 def check(cond, what):
@@ -56,6 +57,16 @@ def build(temp):
     assert anchor in src
     harness = temp / "tactical_harness.c"
     extra = EXTRA
+    if HAS_PICKUP_IDS:
+        extra += r'''        } else if (!strcmp(cmd, "tookat") && i + 2 < argc) {
+            GevrModPickup got = {0};
+            got.kind = GEVR_MODPICKUP_WEAPON;
+            got.item = atoi(argv[i + 1]);
+            got.pickup = atoi(argv[i + 2]);
+            s_inv[got.item] = 1;
+            gevrModApiItemPickup(&got);
+            i += 2;
+'''
     if "int gevrModGameFolder(void)" in src:
         src = re.sub(r"int gevrModGameFolder\(void\) \{[^\n]*\}",
                      "static int s_tacFolder = -1;\nint gevrModGameFolder(void) { return s_tacFolder; }", src)
@@ -317,7 +328,8 @@ def scenarios(exe, temp):
     out = r("start", "prepare", 34, "stats", M16, 30, 4, 2.0,
             "spawning", gid, 0, 4, 50, M16, "begin", 34,
             "addguard", gid, 4, 50, 1, M16, 0, 1, 1, 0, 0, 0, "killed", gid, 1, M16, 0,
-            "took", "weapon", M16, "inv",
+            *(["dropped", 65536, M16, gid, "tookat", M16, 65536] if HAS_PICKUP_IDS
+              else ["took", "weapon", M16]), "inv",
             "hold", 0, AK47, 0, "draw", 0, AK47, "frame", "ammois", RIFLE, "reload", 0, 0, "loadedis", 0,
             "show", AK47, "hurt", 1, 9, 1.0, 1, 2, AK47, 0,
             "draw", 0, M16, "frame", "complete", "title")
@@ -340,6 +352,34 @@ def scenarios(exe, temp):
             "killed", 6, 1, WPPK, 0, "took", "weapon", WPPK, "inv")
     inv = lines(out, "INV")[0] + " "
     check(" 4 " in inv and " 5 " in inv, "a Glock 17 and a looted PPK are both carried (%s)" % inv.strip())
+
+
+def empty_gun(exe, temp):
+    r = Run(exe, temp, "empty", save="mode 1\nloadout -1 1\n")
+    out = r("start", "prepare", 34, "begin", 34, "draw", 0, WPPK,
+            "empty", 0, "hold", 0, 0, 0, "empty", 0)
+    check(not errors(out) and [line for line in out.splitlines() if line in {"KEPT", "SWITCH"}] == ["KEPT", "SWITCH"],
+          "the physical rig keeps an empty Tactical gun without vetoing an unmanaged item")
+
+
+def pickup_identity(exe, temp):
+    stage = 34
+    hk = elite_hk416(stage)
+    m4 = next(gid for gid in range(1, 500) if draw(stage, gid) % 100 >= 18 and draw(stage, gid) % 8 == 3)
+    cmds = ["start", "prepare", stage, "spawning", hk, 0, 4, 50, M16,
+            "spawning", m4, 0, 4, 50, M16, "begin", stage,
+            "dropped", 65536, M16, hk, "dropped", 65537, M16, m4]
+    save = "mode 1\nloadout -1 1\n"
+    # Take the older drop first. Both guards shared the same cartridge slot.
+    r = Run(exe, temp, "older-drop", save=save)
+    out = r(*cmds, "tookat", M16, 65536, "draw", 0, M16, "frame", "complete", "title")
+    check(not errors(out), "exact pickup IDs run without script errors: %s" % errors(out)[:3])
+    check(re.search(r"^gun 17 1 ", r.progress(), re.M) and not re.search(r"^gun 16 1 ", r.progress(), re.M),
+          "taking the older drop brings home the HK416, not the more recently dropped M4A1")
+    r = Run(exe, temp, "setup-pickup", save=save)
+    r(*cmds, "tookat", M16, 77, "draw", 0, M16, "frame", "complete", "title")
+    check(re.search(r"^gun 16 1 ", r.progress(), re.M) and not re.search(r"^gun 17 1 ", r.progress(), re.M),
+          "a stage pickup on the same slot keeps the default M4A1 identity")
 
 
 def profile_isolation(exe, temp):
@@ -369,6 +409,10 @@ def main():
         temp = Path(t)
         exe = build(temp)
         scenarios(exe, temp)
+        if HAS_PICKUP_IDS:
+            pickup_identity(exe, temp)
+        if "gevrModApiOutOfAmmo(" in (ROOT / "port/include/gevr_modapi.h").read_text():
+            empty_gun(exe, temp)
         if "int gevrModGameFolder(void)" in (ROOT / "port/tests/modapi_native.c").read_text():
             profile_isolation(exe, temp)
     if FAILS:

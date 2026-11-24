@@ -15,6 +15,9 @@ local util = require "tactical.util"
 
 local arsenal = {}
 
+-- The older script host did not expose runtime pickup IDs or drop events.
+arsenal.hasPickupIds = mod.pickups and type(mod.pickups.drop) == "function"
+
 local HANDS = { "right", "left" }
 local DROP_MEMORY = 90       -- seconds a killed guard's gun stays the likely loot
 -- The solo intro records give these two missions fists and the watch magnet
@@ -36,16 +39,32 @@ function arsenal.gun(key)
   return g
 end
 
--- A guard's gun that may soon be loot.
+-- Compatibility with hosts that do not report the actual dropped pickup.
 function arsenal.noteDrop(itemId, key)
   local list = state.drops[itemId]
   if not list then list = {}; state.drops[itemId] = list end
   list[#list + 1] = { key = key, at = state.clock }
 end
 
--- Which Tactical gun a newly carried cartridge gun is: the newest guard's
--- gun of that item killed lately, else the item's own Tactical gun.
-local function identify(itemId)
+-- Modern hosts report the world pickup that received the guard's weapon.
+-- That pickup keeps the identity until it is taken or freed, regardless of
+-- which other guards drop a weapon on the same cartridge slot in between.
+function arsenal.trackDrop(pickup, itemId, key)
+  if pickup == nil or not catalog.isGunItem(itemId) then return end
+  state.pickupDrops[pickup] = { item = itemId, key = key }
+end
+
+function arsenal.removeDrop(pickup)
+  if pickup ~= nil then state.pickupDrops[pickup] = nil end
+end
+
+local function identify(itemId, pickup)
+  if arsenal.hasPickupIds then
+    local d = pickup ~= nil and state.pickupDrops[pickup]
+    arsenal.removeDrop(pickup)
+    return d and d.item == itemId and d.key or catalog.defaultKey(itemId)
+  end
+  -- Legacy hosts only know that a guard with this gun died recently.
   local list = state.drops[itemId]
   while list and #list > 0 do
     local d = table.remove(list)
@@ -181,11 +200,11 @@ function arsenal.issue(key)
 end
 
 -- A cartridge gun in the inventory (held or drawn) that has no Tactical gun yet.
-function arsenal.carry(itemId)
+function arsenal.carry(itemId, pickup)
   if not catalog.isGunItem(itemId) then return state.carried[itemId] end
   local key = state.carried[itemId]
   if not key then
-    key = identify(itemId)
+    key = identify(itemId, pickup)
     if not key then return nil end
     state.carried[itemId] = key
     enforceCarry(catalog.byKey[key].slot, itemId)
@@ -196,10 +215,10 @@ end
 -- item_pickup: a looted gun. When the player already carries a different
 -- Tactical gun on that cartridge gun, the game only gave its rounds, so the
 -- looted gun gets a cartridge gun of its own.
-function arsenal.pickedUp(itemId)
+function arsenal.pickedUp(itemId, pickup)
   local had = state.carried[itemId]
-  if not had then return arsenal.carry(itemId) end
-  local key = identify(itemId)
+  if not had then return arsenal.carry(itemId, pickup) end
+  local key = identify(itemId, pickup)
   if key and key ~= had and not arsenal.carries(key) then
     local slot = arsenal.issue(key)
     if slot then mod.log(catalog.byKey[key].name .. " carried on the " .. catalog.itemName[slot]) end

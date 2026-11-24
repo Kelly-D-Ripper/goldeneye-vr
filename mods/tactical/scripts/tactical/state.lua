@@ -10,7 +10,8 @@ function state.reset(stage)
   state.held = {}              -- "right"/"left" -> item id held, as last seen
   state.lastPrimary = nil      -- the primary last put away: the back slot
   state.ownedAtStart = {}      -- keys owned as the mission began
-  state.drops = {}             -- item id -> { {key, at}, ... } guards' guns, newest last
+  state.drops = {}             -- legacy only: guard guns by item id, newest last
+  state.pickupDrops = {}       -- mission pickup id -> { item, key }
   state.rig = { primary = {}, pistol = {} }   -- magazines in pouches: { family, cap, rounds }
   state.loose = {}             -- ammo type -> rounds not yet in a magazine
   state.pinned = {}            -- ammo type -> the spare count the game was last given

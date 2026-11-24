@@ -86,6 +86,12 @@ mod.on("weapon_fire", function(hand, item, loaded)
   end
 end)
 
+-- The native physical rig leaves an exhausted gun in the player's hand.
+-- Leave unmanaged items' normal transitions, such as mine to detonator, alone.
+pcall(mod.on, "out_of_ammo", function(hand, item)
+  if state.carried[item] ~= nil then return false end
+end)
+
 mod.on("reload_attempt", function(hand, item)
   return magazines.attempt(hand, item)
 end)
@@ -112,9 +118,14 @@ end)
 
 -- items ----------------------------------------------------------------
 
-mod.on("item_pickup", function(kind, id, rounds)
+if arsenal.hasPickupIds then
+  mod.on("weapon_dropped", guards.dropped)
+  mod.on("pickup_removed", arsenal.removeDrop)
+end
+
+mod.on("item_pickup", function(kind, id, rounds, pickup)
   if kind == "weapon" then
-    local key = arsenal.pickedUp(id)
+    local key = arsenal.pickedUp(id, pickup)
     if key then magazines.trackAmmo(id) end
   end
   -- rounds reach the reserve; the next sync counts them as loose

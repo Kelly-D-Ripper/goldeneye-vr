@@ -34,7 +34,9 @@ your hands you can loot an HK416 and carry it on your back:
 
 Two pistols work the same way. A looted PPK next to a Glock 17 takes the
 silenced PPK, for example. A borrowed gun looks like the cartridge gun it
-borrows until the API can attach models.
+borrows until the pack ships its fitted models. Modern launcher builds identify
+loot by the pickup ID, so the order guards drop their guns cannot change what
+you loot.
 
 **Magazines and the chamber.** The game's reload runs on a spare-round
 reserve. The mod keeps that reserve equal to the next magazine in your rig, so
