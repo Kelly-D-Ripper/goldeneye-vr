@@ -71,7 +71,8 @@ carrying the same cartridge gun keep its own damage.
 - **Bring it home.** A gun in your hands or on your back when a mission
   completes unlocks. Dying or leaving brings nothing home.
 - **Reserve.** Each first clear of a mission earns one reserve, and so does
-  every third replay. Reserve buys a locked gun once the campaign has 2 clears
+  every third replay. All successful clears, including replays, count toward
+  the unlock threshold. Reserve buys a locked gun once the campaign has 2 clears
   (pistols), 4 (most guns) or 6 (PKM, M32A1, RPG).
 - **Magazines by clears.** Clears with a gun you owned at the start of the
   mission unlock its magazines at that gun's counts: extended at 2, 60-round

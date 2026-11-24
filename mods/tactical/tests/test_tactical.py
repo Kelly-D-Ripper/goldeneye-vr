@@ -302,6 +302,21 @@ def scenarios(exe, temp):
     check(re.search(r"^gun 16 1 ", r.progress(), re.M) is not None and "reserve 1 0" in r.progress(),
           "a reserve token buys the M4A1 after four clears")
 
+    # Replaying the same stage counts toward eligibility, but grants a token
+    # only on the third replay. Reload the save before buying at each threshold.
+    r = Run(exe, temp, "reserve_replays", save="mode 1\nreserve 1 2\nmissions 3\ncleared 34\nloadout -1 1\n")
+    select_m4 = ("uiset", page, 1, 3, "frame", "uiclick", page, 2, "frame")
+    mission = ("start", "prepare", 34, "begin", 34)
+    r(*mission, *select_m4, "title")
+    check(not re.search(r"^gun 16 1 ", r.progress(), re.M) and "reserve 1 2" in r.progress(),
+          "an available reserve cannot buy the M4A1 at only three successful clears")
+    r(*mission, "complete", "title")
+    check("missions 4" in r.progress() and "cleared 34" in r.progress() and "reserve 2 0" in r.progress(),
+          "a third replay awards one reserve and counts as the fourth successful clear")
+    r(*mission, *select_m4, "title")
+    check(re.search(r"^gun 16 1 ", r.progress(), re.M) is not None and "reserve 1 0" in r.progress(),
+          "one reserve buys the M4A1 after four successes on the same stage")
+
     # 9. Reinforcements: a sighting on an open map calls a wave at its approach pads.
     r = Run(exe, temp, "reinforce", save=ALL.format(p=4, s=1))
     cmds = ["start", "prepare", 35, "begin", 35, "addguard", 3, 2, 50, 1, AK47, 0, 1, 1, 0, 0, 0]

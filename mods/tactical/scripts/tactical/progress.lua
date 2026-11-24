@@ -64,6 +64,7 @@ function progress.selectFolder()
     gun(STARTER).unlocked = true
     return true
   end
+  local missionsRecorded = false
   for line in string.gmatch(text, "[^\n]+") do
     local f = {}
     for w in string.gmatch(line, "%S+") do f[#f + 1] = w end
@@ -75,7 +76,10 @@ function progress.selectFolder()
     elseif tag == "cleared" then
       for i = 2, #f do s.cleared[tonumber(f[i])] = true end
     elseif tag == "missions" then
-      s.missions = tonumber(f[2]) or 0
+      local total = tonumber(f[2])
+      if total and total >= 0 and total % 1 == 0 then
+        s.missions, missionsRecorded = total, true
+      end
     elseif tag == "difficulty" and knownDifficulty[f[2]] then
       s.difficultyClears[f[2]] = tonumber(f[3]) or 0
     elseif tag == "gun" and catalog.byKey[tonumber(f[2])] then
@@ -90,6 +94,10 @@ function progress.selectFolder()
     elseif tag == "firemode" and catalog.byKey[tonumber(f[2])] then
       s.firemode[tonumber(f[2])] = f[3]
     end
+  end
+  -- A save without the aggregate can only tell us about its distinct clears.
+  if not missionsRecorded then
+    for _ in pairs(s.cleared) do s.missions = s.missions + 1 end
   end
   gun(STARTER).unlocked = true
   return true
@@ -143,11 +151,9 @@ end
 
 function progress.gunStats(key) return gun(key) end
 
-function progress.totalClears()
-  local n = 0
-  for _ in pairs(s.cleared) do n = n + 1 end
-  return n
-end
+-- The native requisition threshold counts all successes. The distinct stages
+-- in s.cleared are only used to distinguish first-clear and replay rewards.
+function progress.totalClears() return s.missions end
 
 function progress.reserve() return s.reserve end
 
