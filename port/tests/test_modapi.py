@@ -99,6 +99,46 @@ def placement():
     check("gevrModApiReloadStart(hand, getCurrentPlayerWeaponId(hand));   /* reload_start" in view
           and "gevrModApiReloadEnd(hand, getCurrentPlayerWeaponId(hand));   /* reload_end: a magazine seated" in view,
           "a hand reload's magazine out and in")
+    reload_placement(gun, view)
+
+
+def reload_placement(gun, view):
+    """reload_attempt before each reload that takes rounds from the reserve,
+    and a reload_start before each hand reload's reload_end."""
+    def body(text, signature):
+        start = text.index(signature)
+        return text[start:text.index("\n}\n", start)]
+
+    native = gun.index("&& !gevrModApiReloadAttempt(hand, var_s1, get_ammo_in_hands_weapon(hand))")
+    lower = gun.index("handptr->weapon_action_state = GUN_ANIM_STATE_RELOAD_LOWER;", native)
+    check(native < lower < gun.index("gevrModApiReloadStart(hand, var_s1)", lower)
+          and gun.rindex("if (handptr->weapon_action_state == GUN_ANIM_STATE_RELOAD_START)", 0, native) > native - 600,
+          "the native reload is asked as it starts, before it lowers and reload_start")
+    auto = gun.index("&& !gevrModApiReloadDeclined(hand, var_s1, get_ammo_in_hands_weapon(hand)))")
+    check(auto < gun.index("handptr->weapon_action_state = GUN_ANIM_STATE_RELOAD_START;", auto) < auto + 300,
+          "an empty gun's automatic reload waits while a mod's answer holds")
+    grab = body(view, "s32 gevrReloadGrabBelt(s32 ctrl)")
+    check(grab.index("gevrModApiReloadAttempt(") < grab.index("gevrGexMagIn(hand, \"gripped at the belt\", -1);")
+          and "return TRUE;   /* a mod declined it" in grab, "the gun hand's squeeze at the belt is asked first")
+    belt = view.index("gevrGexAtBelt(gunHand, handAt) && get_ammo_in_hands_weapon(gunHand) > 0")
+    fresh = view.index("s_gevrGexHeldRounds = -1;   /* a fresh one */", belt)
+    check(view.index("&& !gevrModApiReloadAttempt(gunHand, getCurrentPlayerWeaponId(gunHand)", belt) < fresh < belt + 600,
+          "a fresh magazine taken at the belt is asked first")
+    touch = view.index("gevrGexMagIn(hand, \"loaded at the belt\", -1);")
+    check(view.rindex("|| !gevrModApiReloadAttempt(hand, getCurrentPlayerWeaponId(hand), get_ammo_in_hands_weapon(hand)))", 0, touch)
+          > touch - 300, "a dual-wielded gun's touch at the belt is asked first")
+    rounds = body(view, "static void gevrGexRoundTick(")
+    check(rounds.index("&& !gevrModApiReloadAttempt(gunHand, roundItem,") < rounds.index("const s32 rounds = gevrReloadPickup(gunHand);"),
+          "a round taken for a gun loaded a round at a time is asked first")
+    seat = body(view, "static void gevrGexMagIn(")
+    check(seat.index("if (!s_gevrGexReloadOpen[hand])") < seat.index("gevrModApiReloadStart(hand,")
+          < seat.index("sub_GAME_7F0649D8(hand);") < seat.index("gevrModApiReloadEnd(hand,"),
+          "a magazine in without a start sends one before its rounds move")
+    out = body(view, "static void gevrGexMagOut(")
+    check(out.index("gevrModApiReloadStart(") < out.index("s_gevrGexReloadOpen[hand] = TRUE;"),
+          "a magazine out opens the reload")
+    check("s_gevrGexReloadOpen[hand] = FALSE;   /* a gun drawn" in body(view, "s32 gevrReloadDraw(s32 hand)"),
+          "a drawn gun closes the last one's reload")
 
 
 def items_placement():
@@ -902,6 +942,17 @@ def ui_placement():
     inp = (ROOT / "port/src/input.c").read_bytes().decode()
     check(inp.count("panelWas = s_gevrPanel;\n            gevrPanelTakeAsk(t, paused);") == 2,
           "mod.ui.open: the flat game's and the headset's panel passes both take the ask")
+    take = function(inp, "static void gevrPanelTakeAsk(u32 t, int paused)")
+    check(take.index("if (gevrIntroPlaying()) return;") < take.index("s_gevrPanelAsk = 0;") < take.index("s_gevrStartUntil"),
+          "a page asked for in the intro waits for play, still asked, before the pause's Start")
+    view = (ROOT / "src/game/bondview2.c").read_bytes().decode()
+    intro = function(view, "s32 gevrIntroPlaying(void)")
+    check("if (netIsActive())" in intro and "getPlayerCount() == 1" in intro
+          and all(m in intro for m in ("CAMERAMODE_INTRO", "CAMERAMODE_FADESWIRL", "CAMERAMODE_SWIRL", "CAMERAMODE_MP")),
+          "the intro: its fly-by, fade and swirl (solo's NONE before it), multiplayer's swirl; online nothing waits")
+    skip = view.index("(buttons & ~oldbuttons & (CONT_A | B_BUTTON | Z_TRIG | START_BUTTON | CONT_R | CONT_L))")
+    check(view.rindex("g_CameraMode == CAMERAMODE_INTRO", 0, skip) > skip - 4000,
+          "the reason: Start skips the intro (if this moves, recheck gevrIntroPlaying)")
     menu = (ROOT / "port/vr/vr_pause_menu.cpp").read_bytes().decode()
     check("gevrModUiAttach(v.settings);" in menu and "gevrModUiAttach(view.settings);" in menu,
           "the solo panel and the online Settings tab both draw the mods' pages")
@@ -923,6 +974,71 @@ mod.ui.page("loadout", { title = "Loadout", text = "Pick a sidearm.",
   buttons = { { id = "ready", label = "Ready" }, { id = "buy", label = "Buy", blocked = true } } })
 mod.ui.page("shop", { title = "Workshop" })
 """
+
+
+def scope_placement():
+    """The per-hand scope asks for the hand's (a mod's or the game's) everywhere it looked up the item's"""
+    view = (ROOT / "src/game/bondview2.c").read_bytes().decode()
+    check(view.count("gevrScopeFor(") == 2 and "return gevrScopeFor(item);\n}" in function(view, "static const struct GevrScope *gevrScopeForHand("),
+          "the item's own table is read only through gevrScopeForHand")
+    for name in ("s32 gevrScopeFitIndex(void)", "f32 gevrScopeMagnificationHand(s32 hand)", "s32 gevrGripSteadyOnCtrl(s32 ctrl)",
+                 "static s32 gevrScopeBeginHand(s32 hand)"):
+        check("gevrScopeForHand(" in function(view, name), name + ": the hand's scope")
+    check(view.count("gevrScopeZoom(item)") == 1 and "gevrScopeZoom(item)" in function(view, "static f32 gevrScopeZoomHand("),
+          "the zoom: a mod's own, else the item's")
+    lens = function(view, "static void gevrScopeLensPlace(")
+    check("gevrScopeInTable(sc) ? gevrScopeFitOf(" in lens and "gexDef->hasScope && gevrScopeInTable(sc)" in lens,
+          "a mod's lens: no Gun fit index of the table's, and its own eyepiece over GoldenEye X's")
+    check("sc != NULL && gevrScopeInTable(sc)" in function(view, "s32 gevrScopeFitIndex(void)"), "Gun fit fits the game's own only")
+    api = (ROOT / "port/src/gevr_modapi.c").read_bytes().decode()
+    drawn = function(api, "void gevrModApiDrawn(int hand, int item)")
+    check(drawn.index("gevrModGameScope(hand, GEVR_MODSCOPE_GAME") < drawn.index('"weapon_drawn"'),
+          "a draw gives the game's scope back before weapon_drawn")
+    check("gevrModGameScope(0, GEVR_MODSCOPE_GAME" in function(api, "void gevrModApiReset(void)"), "a reset gives them back")
+
+
+def scope(exe, temp):
+    """mod.weapon.scope: a lens, none, the game's own; its limits; a draw gives the game's back; look"""
+    play = ("start", "prepare", 9, "begin", 9)
+    lua = r"""
+mod.on("mission_start", function()
+  local bad = 0
+  local function try(t) if not pcall(mod.weapon.scope, "right", t) then bad = bad + 1 end end
+  try({ radius = 16, zoom = 4 })
+  try({ at = { 0, 80 }, radius = 16, zoom = 4 })
+  try({ at = { 0, 80, 4001 }, radius = 16, zoom = 4 })
+  try({ at = { 0, 80, "x" }, radius = 16, zoom = 4 })
+  try({ at = { 0, 80, -44 }, radius = 0.5, zoom = 4 })
+  try({ at = { 0, 80, -44 }, radius = 401, zoom = 4 })
+  try({ at = { 0, 80, -44 }, radius = 16, zoom = 0.9 })
+  try({ at = { 0, 80, -44 }, radius = 16, zoom = 26 })
+  try({ at = { 0, 80, -44 }, radius = 16 })
+  try(true)
+  try(3)
+  print("bad", bad)
+  print("empty", mod.weapon.scope("left", { at = { 0, 0, 0 }, radius = 10, zoom = 2 }))
+  print("back", mod.weapon.scope("right"))
+end)
+mod.on("weapon_drawn", function(hand, item)
+  print("drawn", hand, item, mod.weapon.look(hand))
+  if item == 8 then
+    print("set", mod.weapon.scope(hand, { at = { 0, 80, -44 }, radius = 16, zoom = 4 }))
+  elseif item == 4 then
+    print("none", mod.weapon.scope(hand, false))
+  end
+end)
+"""
+    out = run(exe, temp, "scope", lua, *play, "look", 1, 2, "draw", 0, 8, "draw", 1, 4, "draw", 0, 5,
+              "local", 0, "draw", 0, 8)
+    check(logs(out) == ["bad 11", "empty false", "back true", "drawn right 8 original", "set true", "drawn left 4 bean",
+                        "none true", "drawn right 5 original"],
+          "scope's answers, refusals and look: " + str(logs(out)))
+    scopes = answers(out, "SCOPE")
+    check(scopes[-6:] == ["SCOPE 0 0 4", "SCOPE 0 0 8", "SCOPE 0 1 8 0.0 80.0 -44.0 16.0 16.4", "SCOPE 1 0 4",
+                          "SCOPE 1 2 4", "SCOPE 0 0 5"],
+          "nil the game's own; each draw the game's back, then the mod's (4x is 16.4 degrees) or none; a copy's draw "
+          "touches nothing: " + str(scopes))
+    check(scopes[:2] == ["SCOPE 0 0 0", "SCOPE 1 0 0"], "a mission's reset gives both hands the game's own: " + str(scopes))
 
 
 def ui(exe, temp):
@@ -990,16 +1106,17 @@ mod.on("mission_start", function()
   try("p", { title = "T", buttons = { { id = "a", label = string.rep("b", 15) } } })
   try("p", { title = "T", buttons = { { id = "a", label = "A" }, { id = "a", label = "B" } } })
   print("bad", bad)
-  for i = 1, 4 do mod.ui.page("p" .. i, { title = "P" .. i }) end
-  local ok, err = pcall(mod.ui.page, "p5", { title = "P5" })
-  print("fifth", ok, err:match("at most 4 pages") ~= nil)
-  mod.ui.page("p2", { title = "Again" })
+  local made = 0
+  for i = 1, 4 do if mod.ui.page("p" .. i, { title = "P" .. i }) == true then made = made + 1 end end
+  print("fifth", made, mod.ui.page("p5", { title = "P5" }))
+  print("again", mod.ui.page("p2", { title = "Again" }))
   print("remove", mod.ui.remove("p1"), mod.ui.remove("p1"), (pcall(mod.ui.open, "p1")))
 end)
 """
     out = run(exe, temp, "uibad", lua, *play, "ui")
-    check(logs(out) == ["bad 27", "fifth false true", "remove true false false"],
-          "27 pages refused; 4 at most, every mod's together; a page replaced in its place; remove: " + str(logs(out)))
+    check(logs(out) == ["bad 27", "fifth 4 false", "again true", "remove true false false"],
+          "27 pages refused; 4 at most, every mod's together, a fifth false; a page replaced in its place; remove: "
+          + str(logs(out)))
     check(answers(out, "UIPAGE") == ["UIPAGE 0 tactical p2 Again|", "UIPAGE 1 tactical p3 P3|", "UIPAGE 2 tactical p4 P4|"],
           "the pages left, in their order: " + str(answers(out, "UIPAGE")))
 
@@ -1051,6 +1168,7 @@ def main():
     effects_placement()
     net_placement()
     ui_placement()
+    scope_placement()
     with tempfile.TemporaryDirectory(prefix="gevr-modapi-") as temp:
         temp = Path(temp)
         exe = build(temp)
@@ -1081,6 +1199,29 @@ mod.on("weapon_drawn", function(hand, item) print("drawn", hand, item, mod.weapo
               + str(answers(out, "FIRED", "DECLINED", "LOADED")))
         out = run(exe, temp, "outside", lua, "start", "fire", 0, "prepare", 9, "fire", 0)
         check(logs(out) == [] and answers(out, "FIRED") == ["FIRED 6", "FIRED 5"], "nothing asked outside play")
+
+        # ---- reload_attempt: a reload declined takes nothing; the automatic one waits ----
+        lua = """
+local spare = 0
+mod.on("reload_attempt", function(hand, item)
+  print("reload_attempt", hand, item, spare)
+  return spare > 0
+end)
+mod.on("reload_start", function(hand, item) print("reload_start", hand, item) end)
+mod.on("weapon_fire", function() spare = spare + 1 end)
+"""
+        out = run(exe, temp, "reloadask", lua, *play,
+                  "hold", 0, 4, 0, "reload", 0, 7, "loadedis", 0,
+                  "autoreload", 0, 30, "autoreload", 0, 30, "autoreload", 0, 24,
+                  "hold", 0, 4, 2, "fire", 0, "reload", 0, 7, "loadedis", 0, "autoreload", 0, 24,
+                  "local", 0, "reload", 0, 5, "loadedis", 0)
+        check(logs(out) == ["reload_attempt right 4 0", "reload_attempt right 4 0",
+                            "reload_attempt right 4 1", "reload_start right 4", "reload_attempt right 4 1"],
+              "reload_attempt's events: " + str(logs(out)))
+        check(answers(out, "RELOAD", "LOADED", "AUTO") == ["RELOAD DECLINED 0", "LOADED 0", "AUTO HELD", "AUTO HELD",
+                                                          "AUTO DECLINED", "LOADED 7", "AUTO RELOADS", "LOADED 5"],
+              "declined, nothing moves and the automatic reload waits for a new item or reserve; a copy's isn't asked: "
+              + str(answers(out, "RELOAD", "LOADED", "AUTO")))
 
         # ---- mod.weapon's calls and their limits; mod.items ----
         lua = r"""
@@ -1134,12 +1275,13 @@ mod.on("weapon_fire_attempt", function() error("jam") end)
         effects(exe, temp)
         net(exe, temp)
         ui(exe, temp)
+        scope(exe, temp)
         guards_told(temp)
 
     if FAILS:
         print(f"{len(FAILS)} check(s) failed")
         sys.exit(1)
-    print("PASS: mods' weapons area: fire attempts declined or not, weapon_fire, reloads, draws, the local player only, "
+    print("PASS: mods' weapons area: fire attempts declined or not, weapon_fire, reloads asked and declined, draws, the local player only, "
           "mod.weapon's calls and limits, mod.items, the stats put back; the hooks' places in the gun code. "
           "Items area: pickup_spawning's swaps, turns and refusals, item_pickup, mod.inventory, mod.ammo; "
           "the hooks' places in the stage's setup and the pickup. Hands area: grip, release, hand_near, "
@@ -1149,7 +1291,9 @@ mod.on("weapon_fire_attempt", function() error("jam") end)
           "answers and refusals, damage_applied, downed, revived, died, mod.player's health and armour; the hooks' places. "
           "Sound and smoke: mod.audio's ids, volumes and places, mod.effect's smokes and places. Network: mod.net's sends, "
           "limits and rate, held messages by channel and mod, peer_ready, a stop told to the others and taken from them. "
-          "UI: mod.ui's pages and limits, the screen's clicks and changes, open and close, a stopped mod's pages hidden")
+          "UI: mod.ui's pages and limits, the screen's clicks and changes, open and close, a stopped mod's pages hidden. "
+          "Scopes: mod.weapon.scope's lens, none and the game's own, its limits, a draw's reset; mod.weapon.look; "
+          "the hand's scope wherever the game read the item's")
 
 
 if __name__ == "__main__":
