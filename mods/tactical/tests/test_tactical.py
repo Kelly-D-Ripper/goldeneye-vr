@@ -183,13 +183,13 @@ def scenarios(exe, temp):
     check(lines(out, "RELOAD DECLINED"), "with no magazine left, reload_attempt declines the reload")
     check(ammo[1] == 30, "45 loose rounds the game adds pack a full magazine next (%s)" % ammo)
 
-    # sights: an iron-sighted gun on the KF7 or AR33 loses the game's magnifier; the SVD keeps the sniper scope
+    # sights: the game's own scopes never stand in for Tactical's optics
     r = Run(exe, temp, "sights", save=ALL.format(p=16, s=1))   # M4A1 on the AR33
     out = r("start", "prepare", 34, *GUNS, "begin", 34, "draw", 0, M16)
     check("SCOPE 0 2 13" in out, "the M4A1 has iron sights: the AR33's magnifier comes off")
     r = Run(exe, temp, "svd", save=ALL.format(p=7, s=1))
     out = r("start", "prepare", 34, "stats", 17, 10, -1, 3.0, "begin", 34, "draw", 0, 17)
-    check("SCOPE 0 2 17" not in out and "SCOPE 0 0 17" in out, "the SVD keeps the sniper rifle's own scope")
+    check("SCOPE 0 2 17" in out, "the SVD doesn't take the sniper rifle's scope in place of its own PSO-1")
 
     # 4. Fire modes on an automatic: semi declines the second shot of a pull.
     r = Run(exe, temp, "modes", save=ALL.format(p=4, s=1) + "firemode 4 semi\n")

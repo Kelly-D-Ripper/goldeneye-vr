@@ -4,6 +4,11 @@
 native 0.18.4 build is still the full game, and its source is on branch
 [`tactical/native-0.18.4`](https://github.com/Kelly-D-Ripper/goldeneye-vr/tree/tactical/native-0.18.4).
 
+Rule for this port: **nothing in the native build is replaced by a
+different system that plays or looks differently.** Where the API offers a
+stand-in, like the game's own scope, it isn't used. The feature is listed as
+missing until the real one can run.
+
 Parity needs two things:
 
 1. **New API calls (section B).** Each one is an adapter over a system the game
@@ -29,7 +34,7 @@ run in a full game build or on a headset yet.
 | Carrying guns that share a cartridge gun | Yes | A gun borrows a free cartridge gun, at most 15 in all. Native had 32 items of its own (C9). |
 | Magazines and the chamber | Yes. The reserve is pinned to the next magazine, and `reload_attempt` declines a reload with none left. | No magazine models, no rounds shown in the magazine, no rack gesture (B1, C4) |
 | Rig: 3 primary + 2 pistol pouches | Yes, as counts | Pouches aren't drawn. Native grabbed magazines from where they sat (B1, C4). |
-| Sights | The KF7's and AR33's magnifiers come off iron-sighted guns. The SVD keeps the sniper rifle's scope. | No optics, reticles or magnified attachments yet (B1, B2, C2) |
+| Sights | The game's own scopes are taken off every Tactical gun, as native does | **No Tactical optics at all yet**, including the SVD's PSO-1 and every variable-power scope (C2) |
 | Fire modes | Yes | Switched by a chest grip, not native's selector |
 | Progression: question, PPK start, bring it home, reserve, magazines by clears, stats | Yes | One file per install, not per save folder. No per-difficulty rewards, and "unlock all" can't open missions (B6). |
 | Attachment unlocks (294 kits) | **No** | Nothing to unlock until attachments can be drawn (B1) and have stats (B9) |
@@ -44,7 +49,7 @@ run in a full game build or on a headset yet.
 | # | Need | Call | Existing system | Status | Brings back |
 |---|---|---|---|---|---|
 | B1 | Tactical's models | A gun model per hand: `mod.weapon.model(hand, item, file)`, over each hand's own gun model, the way GoldenEye X swaps it. Then attachments bound to the gun, a hand or a body slot, placed by the engine every frame. Also a guard attachment through the hat path (`PROPDEF_HAT`). | Per-hand gun models, body slots, guards' hats | **Gun model in progress; attachments planned.** We need the details below. | Guns that look like themselves; optics, muzzles, grips, stocks and magazines; guard vests and helmets |
-| B2 | Magnified scopes | `mod.weapon.scope(hand, {at, radius, zoom})` | Per-hand VR scope (issue #40) | **Built (#312)**, without per-scope reticles (C2) | Magnified optics, once B1 draws them |
+| B2 | Turning the game's own scopes off | `mod.weapon.scope(hand, false)` | Per-hand VR scope (issue #40) | **Built (#312), used** | Native's behaviour: no game scope on a Tactical gun. The call's lens mode (`{at, radius, zoom}`) is **not** a substitute for Tactical's optics and isn't used (C2). |
 | B3 | Loot on the floor | Spawn a weapon, ammo or armour pickup during a mission | The game's drop when a guard dies | Asked; in the spec as not built | Dropped magazines that stay, magazines and armour on corpses, stocked mission magazines |
 | B4 | Which gun a pickup is | A pickup id in `item_pickup` and in the unbuilt `weapon_dropped`, matching `pickup_spawning`'s index | Prop records | Asked | Loot keeps its exact gun and build; shared loot in co-op |
 | B5 | Guards placed and moved | Read the setup's pads (position, room); send a guard to a pad and face a pad | `g_CurrentSetup.pads`; the AI's go-to-pad commands | Asked | Reinforcement entries on every map; 0.18's extra sentries, pairs, patrols, jungle squads and perched marksmen |
@@ -70,10 +75,16 @@ run in a full game build or on a headset yet.
 - **The muzzle point and grip places per mod model.** A PKM or SVD model is
   longer than the cartridge gun it replaces. With the ROM gun's muzzle point,
   flashes and shots would start inside the barrel.
-- **Our side of B1:** Tactical's 1.22 GiB asset pack is in its own mesh
-  format. Every gun and part has to be converted to GoldenEye-format models,
-  and it all has to fit the Quest 2 frame budget. It's the largest job in the
-  port.
+- **Our models, as they are.** Tactical's models are in its own format,
+  `GEVRWPN1`/`GEVRWPN2` files drawn by `gevr_tactical_mesh.c`. They carry
+  full-colour textures (the SVD has 14, up to 512 by 512, 17 MB in all), tag
+  the bolt and charging handle so they move, and come with glove variants. The
+  API's only model path today replaces a cartridge model with another
+  GoldenEye-format model: at most 4 MB, and it has to fit the replaced
+  model's own header (its texture count and skeleton). Converting to that
+  format would lose texture detail and the moving parts, and change how
+  Tactical looks. **So the ask is for the game to load our files as they are**
+  (C10), not for us to convert them.
 
 ## C. Game features (outside the API's current rules)
 
@@ -85,13 +96,14 @@ tests. Otherwise it stays out of the mod for good.
 | # | Native system | Native code | What it does | Why the API can't do it |
 |---|---|---|---|---|
 | C1 | Tactical mesh renderer | `gevr_tactical_mesh.c` (3,136 lines), `gevr_tactical_gear.c` | Assembles guns from parts by mount tree, with finishes and variants | B1 places whole models. Assembly by mount tree is a renderer. (Converting each assembled build to one model could stand in for it, at the cost of every combination being its own file.) |
-| C2 | Optic lenses and reticles | `gevr_tactical_optic_render.inc.h`, `gevr_tactical_optics.c` | Each optic's reticle; red dots and holographics; night and thermal views; zeroing; flip-up magnifiers | B2 draws the game's red sight in every scope. MrSco said a reticle image per scope is new drawing code, out of v1. |
+| C2 | **Tactical's optics, unchanged** | `gevr_tactical_optic_render.inc.h`, `gevr_tactical_optics.c`, `gevrTacticalOpticInput` | Each optic's lens shape and reticle (first and second focal plane), variable zoom on the stick, eye-relief parallax, red dots and holographics, night and thermal views, zeroing, flip-up magnifiers | Tactical's lens renderer draws the world through the same per-hand pass the game's scope uses (`gfx_vr_scope_render()`), with its own lens on top. The ask is to bring **that renderer** into the game, driven by each optic's data from the pack, plus a hook for the zoom input. It's not to approximate it with `mod.weapon.scope`'s lens, which draws the game's red sight at one fixed zoom per call. |
 | C3 | Guard combat AI | `gevr_tactical_guard_ai.inc.h`, `gevr_tactical_cover_ai.inc.h` | Roles (assault, support, cover, flank), bounding cover to cover, peeks, squads | The spec excludes new AI behaviour. B5 can place and move guards, not make them fight this way. |
 | C4 | Physical magazine handling | `gevr_tactical_inventory.c`, `gevr_tactical_session.c`, the rig code in `bondview2.c` | Grabbing magazines from pouches, seating, racking by hand, a held magazine showing its rounds | The game's hand reload is a different system. MrSco confirmed a mod's model runs the game's own reload gestures. |
 | C5 | Workshop and presets | `gevr_tactical_gear_menu.inc.h` (1,672 lines), the Loadout Editor | Building a gun from its mount tree; presets shared with the desktop editor | `mod.ui` allows 4 pages of 8 rows each. A Workshop is a new kind of menu. |
 | C6 | Gore and blade cuts | Tactical's parts of `gevr_ragdoll.c`, `gevr_hollywood_fx.c`, `chrDarkenWound`, the co-op gore messages | Blade cuts, blood stains, wound darkening, the HollywoodFX and BloodyCombat effects | `mod.effect` has 7 smokes, and bullet impacts aren't built. This is new rendering. |
 | C7 | Melee weapons | Katana, knife and Huntsman code in `bondview2.c` and `gevr_ragdoll.c` | Swords and knives swung by hand, scabbards on the body | New items, plus C6 |
 | C8 | Gadgets and the watch | `gevrTacticalWatchFrame`, the decoder and detonator code | A wrist watch with gauges, the Facility decoder used by hand, a handheld detonator, mine counts | New hand-held items and new drawing |
+| C10 | **Tactical's model files, as they are** | `gevr_tactical_mesh.c` (the loader and its display lists), the `GEVRWPN1`/`GEVRWPN2` files | Full-colour, high-detail guns, hands, gloves, vests, helmets and blades, with moving action parts | The API only takes GoldenEye-format models that fit a cartridge model's header (4 MB at most). A loader for a model format with its own header would serve any mod. MrSco noted GoldenEye's files have no header of their own. |
 | C9 | Tactical's own items | 32 `ITEM_TACTICAL_*` ids in `bondconstants.h` | Each gun is its own item, with its own stats, carried and dropped like any other | Mods can't add items. Borrowing cartridge guns caps it at 15, and B1's per-hand models keep the ROM gun's stats and sounds (B9 can move some of them). |
 
 Also not portable today:
@@ -106,11 +118,14 @@ and a per-gun recoil option.*
 
 ## What parity takes, in order
 
-1. **B1 with the details above, plus B12.** Then we convert the asset pack.
-   This restores most of how Tactical looks.
+1. **B1 with the details above, B12, and C10.** C10 lets our model files
+   load as they are. This restores how Tactical looks without remaking any
+   model.
 2. **B3 to B9 and B11:** loot, guard placement, mission facts, notes, speed and
    stats. These restore loot, encounters, rewards and per-gun handling.
-3. **A decision from MrSco on C1 to C9.** For each one, either it joins the
+3. **A decision from MrSco on C1 to C10.** C2 (Tactical's optics) and C10
+   (our model files) come first, because without them the game would look
+   and play differently. For each one, either it joins the
    game as a general feature that Tactical uses through the API, or it's out
    of scope for mods and Tactical keeps a native build for it.
 

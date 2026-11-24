@@ -49,9 +49,11 @@ both the button reload and the VR belt reload seat real magazines:
 - With no magazine for that gun in the rig, the reload is declined
   (`reload_attempt`) by either reload, the button's or the belt's.
 
-**Sights.** A gun with iron sights on the KF7 or AR33 has the game's built-in
-magnifier taken off (`mod.weapon.scope`). The SVD keeps the sniper rifle's
-scope.
+**Sights.** The game's own scopes never stand in for Tactical's optics. The
+KF7's and AR33's magnifiers and the sniper rifle's scope are taken off
+(`mod.weapon.scope(hand, false)`). Tactical's optics need Tactical's own
+lens renderer, which isn't in the API yet ([PARITY.md](PARITY.md), C2). Until
+it is, there are no magnified optics, including the SVD's PSO-1.
 
 **Fire modes.** Semi, burst and auto, per gun. To switch the gun in your gun
 hand, grip with your off hand at your chest, or use the Loadout page. A
@@ -115,11 +117,12 @@ lines. Each one defaults to on.
 ## Not in this version
 
 See [PARITY.md](PARITY.md). In short:
-- **Waiting on API calls:** gun and attachment models (in progress), loot on
+- **Waiting on API calls:** placing gun and attachment models (in progress), loot on
   the floor, pickup ids, guard placement, mission facts, an on-screen note,
   move speed, per-gun handling and sound, and keeping an empty gun in hand.
-- **Needs new game features, outside the current API rules:** the parts
-  renderer, optic reticles and night or thermal views, guard combat AI,
+- **Needs new game features, outside the current API rules:** Tactical's
+  own optics (unchanged, with variable zoom) and its model files as they are,
+  the parts renderer, guard combat AI,
   physical magazine handling, the Workshop, gore and blade cuts, melee
   weapons, gadgets and the watch, and Tactical's own items.
 
