@@ -15,12 +15,13 @@ local sights = require "tactical.sights"
 local util = require "tactical.util"
 
 local CHEST_SWITCH = "chest"   -- the off hand's grip here cycles the gun hand's fire mode
-local completed = false
+local completed, missionDifficulty = false, nil
 
-progress.load()
+progress.selectFolder()
 coop.init()
 
 mod.on("campaign_enter", function()
+  progress.selectFolder()
   pages.init()
 end)
 
@@ -28,6 +29,8 @@ mod.on("mission_prepare", function(stage)
   state.reset(stage)
   coop.missionReset()
   completed = false
+  missionDifficulty = mod.mission and mod.mission.difficulty and mod.mission.difficulty()
+  if progress.selectFolder() then pages.init() end
 end)
 
 local function issueKit()
@@ -165,7 +168,7 @@ end)
 mod.on("mission_end", function(stage, result)
   if result == "complete" and not completed then
     completed = true
-    local res = progress.missionComplete(stage, state.ownedAtStart, arsenal.broughtHome())
+    local res = progress.missionComplete(stage, state.ownedAtStart, arsenal.broughtHome(), missionDifficulty)
     pages.debrief(res)
   else
     progress.missionFailed()

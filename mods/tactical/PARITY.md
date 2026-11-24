@@ -1,5 +1,9 @@
 # Tactical parity: the native build against the mod pack
 
+The [current source-to-API audit](PARITY-AUDIT.md) supersedes the status and work order below. It links the complete native change inventory. The original notes are retained for detailed parity criteria.
+
+## Original audit
+
 **The mod pack is not Tactical yet.** It's a partial port of the rules. The
 native 0.18.4 build is still the full game, and its source is on branch
 [`tactical/native-0.18.4`](https://github.com/Kelly-D-Ripper/goldeneye-vr/tree/tactical/native-0.18.4).

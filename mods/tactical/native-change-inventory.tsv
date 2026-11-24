@@ -1,0 +1,247 @@
+change	area	path
+M	Launcher and packaging	CMakeLists.txt
+M	Launcher and packaging	android/app/build.gradle
+M	Launcher and packaging	android/app/src/main/AndroidManifest.xml
+M	Launcher and packaging	android/app/src/main/java/com/gevr/port/MainActivity.java
+M	Launcher and packaging	android/app/src/mobile/AndroidManifest.xml
+A	Launcher and packaging	android/app/src/tactical/AndroidManifest.xml
+A	Launcher and packaging	android/app/src/tactical/res/values/strings.xml
+M	Weapon assets, fit and rendering	assets/obseg/gun/gunModelFileRecord.inc.c
+M	Effects, damage and physics	assets/obseg/prop/propExplosionDetailsRecords.inc.c
+M	Weapon assets, fit and rendering	assets/obseg/prop/propItemModelFileRecord.inc.c
+M	Effects, damage and physics	port/external/pdphysics/pdphysics.cpp
+M	Effects, damage and physics	port/external/pdphysics/pdphysics.h
+A	Shared integration (types, render, lifecycle, settings)	port/fast3d/gevr_tactical_editor_capture.inc.h
+A	Optics	port/fast3d/gevr_tactical_optic_render.inc.h
+M	Shared integration (types, render, lifecycle, settings)	port/fast3d/gfx_opengl.cpp
+M	Shared integration (types, render, lifecycle, settings)	port/fast3d/gfx_pc.cpp
+M	Shared integration (types, render, lifecycle, settings)	port/fast3d/gfx_rendering_api.h
+M	Shared integration (types, render, lifecycle, settings)	port/fast3d/gfx_sdl2.cpp
+M	Shared integration (types, render, lifecycle, settings)	port/flat/flat_headset.c
+M	Audio	port/include/audio.h
+A	Launcher and packaging	port/include/gevr_android_paths.h
+M	Hands, controls and VR	port/include/gevr_avatar.h
+A	Campaign, guard gear and AI	port/include/gevr_guard_cigarettes.h
+A	Campaign, guard gear and AI	port/include/gevr_guard_cover.h
+A	Effects, damage and physics	port/include/gevr_hollywood_fx.h
+M	Effects, damage and physics	port/include/gevr_ragdoll.h
+M	Weapon assets, fit and rendering	port/include/gevr_recoil.h
+M	Effects, damage and physics	port/include/gevr_static_mesh.h
+A	Shared integration (types, render, lifecycle, settings)	port/include/gevr_tactical_asset.h
+A	Shared integration (types, render, lifecycle, settings)	port/include/gevr_tactical_editor_capture.h
+A	Weapon assets, fit and rendering	port/include/gevr_tactical_expanded.inc.h
+A	Weapon assets, fit and rendering	port/include/gevr_tactical_fit.h
+A	Weapon assets, fit and rendering	port/include/gevr_tactical_gear.h
+A	Shared integration (types, render, lifecycle, settings)	port/include/gevr_tactical_helmets.inc.h
+A	Items, inventory and loot	port/include/gevr_tactical_inventory.h
+A	Weapon assets, fit and rendering	port/include/gevr_tactical_loadout_guns.inc.h
+A	Items, inventory and loot	port/include/gevr_tactical_loot.h
+A	Co-op and networking	port/include/gevr_tactical_loot_net.h
+A	Weapon assets, fit and rendering	port/include/gevr_tactical_mesh.h
+A	Items, inventory and loot	port/include/gevr_tactical_native_mags.h
+A	Co-op and networking	port/include/gevr_tactical_net.h
+A	Optics	port/include/gevr_tactical_optics.h
+A	Progression and saves	port/include/gevr_tactical_progress.h
+A	Menus, gadgets and range	port/include/gevr_tactical_range.h
+A	Items, inventory and loot	port/include/gevr_tactical_rig_bounds.h
+A	Weapon assets, fit and rendering	port/include/gevr_tactical_scale.h
+A	Items, inventory and loot	port/include/gevr_tactical_session.h
+A	Weapon assets, fit and rendering	port/include/gevr_tactical_stats.h
+A	Items, inventory and loot	port/include/gevr_tactical_support.h
+A	Shared integration (types, render, lifecycle, settings)	port/include/gevr_tactical_vest_fits.inc.h
+A	Shared integration (types, render, lifecycle, settings)	port/include/gevr_tactical_vests.inc.h
+M	Menus, gadgets and range	port/include/gevr_watch_status.h
+M	Launcher and packaging	port/pc/pc_files.cpp
+M	Launcher and packaging	port/pc/pc_http.cpp
+M	Launcher and packaging	port/server/server_headset.c
+M	Audio	port/src/audio.c
+M	Hands, controls and VR	port/src/gevr_avatar.c
+M	Shared integration (types, render, lifecycle, settings)	port/src/gevr_engine_shim.c
+A	Campaign, guard gear and AI	port/src/gevr_guard_cigarettes.c
+M	Hands, controls and VR	port/src/gevr_handpatch.c
+A	Effects, damage and physics	port/src/gevr_hollywood_fx.c
+M	Shared integration (types, render, lifecycle, settings)	port/src/gevr_oddjobhat.c
+M	Effects, damage and physics	port/src/gevr_ragdoll.c
+M	Effects, damage and physics	port/src/gevr_ragdoll_internal.h
+M	Effects, damage and physics	port/src/gevr_ragdoll_mesh.c
+M	Effects, damage and physics	port/src/gevr_ragdoll_movers.c
+M	Shared integration (types, render, lifecycle, settings)	port/src/gevr_settings.c
+M	Effects, damage and physics	port/src/gevr_static_mesh_build.inc.h
+A	Shared integration (types, render, lifecycle, settings)	port/src/gevr_tactical_asset.c
+A	Weapon assets, fit and rendering	port/src/gevr_tactical_gear.c
+A	Items, inventory and loot	port/src/gevr_tactical_inventory.c
+A	Weapon assets, fit and rendering	port/src/gevr_tactical_mesh.c
+A	Optics	port/src/gevr_tactical_optics.c
+A	Progression and saves	port/src/gevr_tactical_progress.c
+A	Progression and saves	port/src/gevr_tactical_progression_data.inc.h
+A	Items, inventory and loot	port/src/gevr_tactical_session.c
+A	Weapon assets, fit and rendering	port/src/gevr_tactical_stats.c
+M	Hands, controls and VR	port/src/input.c
+M	Shared integration (types, render, lifecycle, settings)	port/src/libultra.c
+M	Shared integration (types, render, lifecycle, settings)	port/src/main.c
+M	Co-op and networking	port/src/net/net_coop.c
+M	Co-op and networking	port/src/net/net_coop.h
+M	Co-op and networking	port/src/net/net_coop_menu.c
+M	Co-op and networking	port/src/net/net_core.c
+M	Co-op and networking	port/src/net/net_discovery.c
+M	Co-op and networking	port/src/net/net_game.h
+M	Co-op and networking	port/src/net/net_player_sync.c
+M	Co-op and networking	port/src/net/net_protocol.h
+A	Co-op and networking	port/src/net/net_tactical.c
+A	Co-op and networking	port/src/net/net_tactical_loot.c
+M	Co-op and networking	port/src/net/net_voice.c
+M	Shared integration (types, render, lifecycle, settings)	port/src/system.c
+M	QA	port/tests/avatar_math_native.c
+M	QA	port/tests/avatar_rig_native.c
+M	QA	port/tests/campaign_items_native.c
+M	QA	port/tests/campaign_progression_native.c
+M	QA	port/tests/coop_combat_native.c
+M	QA	port/tests/coop_spawns_native.c
+M	QA	port/tests/coop_world_native.c
+M	QA	port/tests/hand_native.c
+M	QA	port/tests/hand_reload_native.c
+A	QA	port/tests/mirror_sdl_native.c
+A	QA	port/tests/mirror_viewport_native.c
+M	QA	port/tests/ragdoll_native.c
+M	QA	port/tests/reinforcements_native.c
+A	QA	port/tests/tactical_ak_chamber_native.c
+A	QA	port/tests/tactical_corpse_loot_native.c
+A	QA	port/tests/tactical_cover_native.c
+A	QA	port/tests/tactical_enemy_rig_native.c
+A	QA	port/tests/tactical_inventory_native.c
+A	QA	port/tests/tactical_ppk_native.c
+A	QA	port/tests/tactical_progression_native.c
+A	QA	port/tests/tactical_rig_grab_native.c
+A	QA	port/tests/tactical_session_native.c
+A	QA	port/tests/tactical_support_native.c
+A	QA	port/tests/tactical_trigger_reload_native.c
+A	QA	port/tests/tactical_variety_native.c
+M	QA	port/tests/test_avatar.py
+M	QA	port/tests/test_body_slots.py
+M	QA	port/tests/test_coop_combat.py
+M	QA	port/tests/test_mesh_dispatch.py
+M	QA	port/tests/test_ragdolls.py
+M	QA	port/tests/test_reinforcements.py
+M	QA	port/tests/test_scope_mesh.py
+A	QA	port/tests/test_tactical_cover.py
+A	QA	port/tests/test_tactical_progression.py
+M	QA	port/tests/test_v043.py
+M	QA	port/tests/test_watch_grip.py
+A	QA	port/tests/test_weapon_pool.py
+M	QA	port/tests/vertex_ring_native.cpp
+M	QA	port/tests/watch_status_native.cpp
+A	QA	port/tests/weapon_pool_native.c
+A	Shared integration (types, render, lifecycle, settings)	port/vr/gevr_mirror_viewport.h
+M	Hands, controls and VR	port/vr/vr_input.cpp
+M	Hands, controls and VR	port/vr/vr_input.h
+M	Launcher and packaging	port/vr/vr_launcher.cpp
+M	Hands, controls and VR	port/vr/vr_openxr.cpp
+M	Shared integration (types, render, lifecycle, settings)	port/vr/vr_settings.cpp
+M	Audio	src/audi.c
+M	Shared integration (types, render, lifecycle, settings)	src/bondconstants.h
+M	Shared integration (types, render, lifecycle, settings)	src/bondtypes.h
+M	Shared integration (types, render, lifecycle, settings)	src/boss.c
+M	Shared integration (types, render, lifecycle, settings)	src/game/bgfog.c
+M	Items, inventory and loot	src/game/bondinv.c
+M	Hands, controls and VR	src/game/bondview.h
+M	Hands, controls and VR	src/game/bondview2.c
+M	Hands, controls and VR	src/game/bondview_r.c
+M	Campaign, guard gear and AI	src/game/chr.c
+M	Campaign, guard gear and AI	src/game/chr.h
+M	Campaign, guard gear and AI	src/game/chraction.c
+M	Campaign, guard gear and AI	src/game/chraction.h
+M	Campaign, guard gear and AI	src/game/chrai.c
+M	Campaign, guard gear and AI	src/game/chrai.h
+M	Campaign, guard gear and AI	src/game/chrprop.c
+M	Effects, damage and physics	src/game/explosion.c
+M	Progression and saves	src/game/file.c
+M	Progression and saves	src/game/file2.c
+M	Menus, gadgets and range	src/game/front.c
+M	Items, inventory and loot	src/game/gevr_bodyslots.c
+A	Campaign, guard gear and AI	src/game/gevr_campaign_expanded_early.inc.h
+A	Campaign, guard gear and AI	src/game/gevr_campaign_expanded_late.inc.h
+A	Campaign, guard gear and AI	src/game/gevr_campaign_patrols_open.inc.h
+A	Campaign, guard gear and AI	src/game/gevr_campaign_posts_open.inc.h
+A	Campaign, guard gear and AI	src/game/gevr_campaign_posts_tight.inc.h
+A	Campaign, guard gear and AI	src/game/gevr_enemy_rig.inc.h
+M	Hands, controls and VR	src/game/gevr_forcepull.c
+M	Hands, controls and VR	src/game/gevr_grip_gesture.h
+M	Weapon assets, fit and rendering	src/game/gevr_heldgun.c
+A	Campaign, guard gear and AI	src/game/gevr_tactical_campaign_probe.inc.h
+A	Shared integration (types, render, lifecycle, settings)	src/game/gevr_tactical_cover_ai.inc.h
+A	Shared integration (types, render, lifecycle, settings)	src/game/gevr_tactical_editor_capture.inc.h
+A	Campaign, guard gear and AI	src/game/gevr_tactical_enemy_outfits.h
+A	Menus, gadgets and range	src/game/gevr_tactical_facility.h
+A	Weapon assets, fit and rendering	src/game/gevr_tactical_gear_menu.inc.h
+A	Campaign, guard gear and AI	src/game/gevr_tactical_guard_ai.h
+A	Campaign, guard gear and AI	src/game/gevr_tactical_guard_ai.inc.h
+A	Campaign, guard gear and AI	src/game/gevr_tactical_heavy_guards.h
+A	Shared integration (types, render, lifecycle, settings)	src/game/gevr_tactical_loadouts.c
+A	Shared integration (types, render, lifecycle, settings)	src/game/gevr_tactical_loadouts.h
+A	Menus, gadgets and range	src/game/gevr_tactical_range.c
+A	Shared integration (types, render, lifecycle, settings)	src/game/gevr_tactical_reinforcements.inc.h
+M	Weapon assets, fit and rendering	src/game/gun.c
+M	Weapon assets, fit and rendering	src/game/gun.h
+M	Weapon assets, fit and rendering	src/game/gunfire.c
+M	Campaign, guard gear and AI	src/game/initguards.c
+M	Menus, gadgets and range	src/game/initmenus.c
+M	Shared integration (types, render, lifecycle, settings)	src/game/initunk_005520.c
+M	Shared integration (types, render, lifecycle, settings)	src/game/initunk_005520.h
+M	Shared integration (types, render, lifecycle, settings)	src/game/lv.c
+M	Shared integration (types, render, lifecycle, settings)	src/game/lv.h
+M	Shared integration (types, render, lifecycle, settings)	src/game/model.c
+M	Shared integration (types, render, lifecycle, settings)	src/game/model.h
+M	Hands, controls and VR	src/game/objecthandler.c
+M	Hands, controls and VR	src/game/objecthandler_2.c
+M	Menus, gadgets and range	src/game/options.c
+M	Shared integration (types, render, lifecycle, settings)	src/game/player.c
+M	Shared integration (types, render, lifecycle, settings)	src/game/pobjdata.c
+M	Items, inventory and loot	src/game/prop.c
+M	Items, inventory and loot	src/game/prop.h
+M	Items, inventory and loot	src/game/propobj.c
+M	Items, inventory and loot	src/game/propobj.h
+M	Hands, controls and VR	src/joy.c
+A	Asset authoring and catalogues	tools/bake_tactical_gear.py
+A	Asset authoring and catalogues	tools/bake_tactical_katana.py
+A	Asset authoring and catalogues	tools/bake_tactical_roster_nifs.py
+A	Asset authoring and catalogues	tools/blender/gevr_decimate_parts.py
+A	Workshop and editor	tools/loadout_editor/EditorData.cs
+A	Workshop and editor	tools/loadout_editor/EditorForm.cs
+A	Workshop and editor	tools/loadout_editor/EditorTheme.cs
+A	Workshop and editor	tools/loadout_editor/GuardScreen.cs
+A	Workshop and editor	tools/loadout_editor/GunScreen.cs
+A	Workshop and editor	tools/loadout_editor/MissionScreen.cs
+A	Workshop and editor	tools/loadout_editor/PreviewCanvas.cs
+A	Workshop and editor	tools/loadout_editor/PreviewLibrary.cs
+A	Workshop and editor	tools/loadout_editor/Program.cs
+A	Workshop and editor	tools/loadout_editor/Workshop.cs
+A	Workshop and editor	tools/loadout_editor/build.ps1
+A	Workshop and editor	tools/loadout_editor/capture_npcs.py
+A	Workshop and editor	tools/loadout_editor/prepare_catalogue.py
+A	Workshop and editor	tools/loadout_editor/workshop_native.c
+A	Launcher and packaging	tools/package_tactical_demo.py
+A	Asset authoring and catalogues	tools/prepare_tactical_action_assets.py
+A	Asset authoring and catalogues	tools/prepare_tactical_ar_full.py
+A	Asset authoring and catalogues	tools/prepare_tactical_ar_rifles.py
+A	Asset authoring and catalogues	tools/prepare_tactical_attachment_pass.py
+A	Asset authoring and catalogues	tools/prepare_tactical_bloody_combat.py
+A	Asset authoring and catalogues	tools/prepare_tactical_expanded.py
+A	Asset authoring and catalogues	tools/prepare_tactical_front_fittings.py
+A	Asset authoring and catalogues	tools/prepare_tactical_gear.py
+A	Asset authoring and catalogues	tools/prepare_tactical_guard_outfits.py
+A	Asset authoring and catalogues	tools/prepare_tactical_helmet.py
+A	Asset authoring and catalogues	tools/prepare_tactical_hollywood.py
+A	Asset authoring and catalogues	tools/prepare_tactical_klmk.py
+A	Asset authoring and catalogues	tools/prepare_tactical_optics.py
+A	Asset authoring and catalogues	tools/prepare_tactical_progression.py
+A	Asset authoring and catalogues	tools/prepare_tactical_roster.py
+A	Asset authoring and catalogues	tools/prepare_tactical_roster_pack.py
+A	Asset authoring and catalogues	tools/prepare_tactical_smg_attachments.py
+A	Asset authoring and catalogues	tools/prepare_tactical_svd.py
+A	Asset authoring and catalogues	tools/prepare_tactical_weapon_stats.py
+A	Asset authoring and catalogues	tools/prepare_tactical_workshop_ease.py
+A	Asset authoring and catalogues	tools/prepare_tactical_workshop_packs.py
+A	Asset authoring and catalogues	tools/prepare_tactical_workshop_presets.py
+A	Asset authoring and catalogues	tools/prepare_tactical_workshop_roster.py
+A	Asset authoring and catalogues	tools/seat_guard_helmets.py
+A	Launcher and packaging	tools/tactical_demo_launcher.c

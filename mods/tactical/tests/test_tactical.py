@@ -20,7 +20,7 @@ import tempfile
 from pathlib import Path
 
 PACK = Path(__file__).resolve().parent.parent
-ROOT = PACK.parent.parent
+ROOT = Path(os.environ.get("GEVR_TEST_ENGINE", PACK.parent.parent)).resolve()
 sys.path.insert(0, str(PACK / "tools"))
 from validate_pack import validate  # noqa: E402
 
@@ -55,7 +55,18 @@ def build(temp):
     anchor = '        } else if (!strcmp(cmd, "ammois")'
     assert anchor in src
     harness = temp / "tactical_harness.c"
-    harness.write_text(src.replace(anchor, EXTRA + anchor, 1))
+    extra = EXTRA
+    if "int gevrModGameFolder(void)" in src:
+        src = re.sub(r"int gevrModGameFolder\(void\) \{[^\n]*\}",
+                     "static int s_tacFolder = -1;\nint gevrModGameFolder(void) { return s_tacFolder; }", src)
+        src = re.sub(r"int gevrModGameDifficulty\(void\) \{[^\n]*\}",
+                     "static int s_tacDifficulty = -1;\nint gevrModGameDifficulty(void) { return s_tacDifficulty; }", src)
+        extra += '''        } else if (!strcmp(cmd, "folder") && i + 2 < argc) {
+            s_tacFolder = atoi(argv[i + 1]) - 1;
+            s_tacDifficulty = atoi(argv[i + 2]);
+            i += 2;
+'''
+    harness.write_text(src.replace(anchor, extra + anchor, 1))
     flags = ["-std=gnu11", "-O1", "-funsigned-char", "-fwrapv", "-fno-strict-aliasing", "-D_LANGUAGE_C=1", "-DGEVR=1"]
     objects = []
     for name in LUA:
@@ -331,6 +342,26 @@ def scenarios(exe, temp):
     check(" 4 " in inv and " 5 " in inv, "a Glock 17 and a looted PPK are both carried (%s)" % inv.strip())
 
 
+def profile_isolation(exe, temp):
+    legacy = "mode 1\nloadout -1 1\ngun 4 1 0 0 0 0 1\n"
+    r = Run(exe, temp, "folders", save=legacy)
+    r("start", "folder", 1, 2, "prepare", 34, "begin", 34, "complete", "title")
+    save = r.dir / "save" / "mod-data" / "tactical"
+    one = (save / "progress-1.txt").read_text()
+    check("gun 4 1 " in one and "difficulty 00agent 1" in one,
+          "folder 1 inherits the old unlock once and records its difficulty")
+    r("folder", 2, 0, "start", "prepare", 35, "begin", 35, "complete", "title")
+    two = (save / "progress-2.txt").read_text()
+    check("gun 4 1 " not in two and "difficulty agent 1" in two and "00agent" not in two,
+          "folder 2 starts fresh and counts its own mission difficulty")
+    check((save / "progress-1.txt").read_text() == one and r.progress() == legacy,
+          "another folder never overwrites folder 1 or the old save")
+    r("start", "folder", 1, 2, "prepare", 35, "begin", 35, "complete", "title")
+    one = (save / "progress-1.txt").read_text()
+    check("difficulty 00agent 2" in one and "gun 4 1 " in one,
+          "returning to folder 1 keeps its unlocks and difficulty counts")
+
+
 def main():
     problems = validate(PACK)
     check(not problems, "the pack follows docs/mod-system.md's format: %s" % problems)
@@ -338,6 +369,8 @@ def main():
         temp = Path(t)
         exe = build(temp)
         scenarios(exe, temp)
+        if "int gevrModGameFolder(void)" in (ROOT / "port/tests/modapi_native.c").read_text():
+            profile_isolation(exe, temp)
     if FAILS:
         print("%d FAILED" % len(FAILS))
         sys.exit(1)

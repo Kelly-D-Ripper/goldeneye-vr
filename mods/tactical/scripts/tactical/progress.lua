@@ -1,5 +1,5 @@
 -- Progression and stats (Tactical 0.18.4 rules, agreed with the player on
--- 2026-11-23), kept in the mod's own save, progress.txt:
+-- 2026-11-23), kept in the mod's own save, one file per campaign folder:
 --
 --  * Asked once per save whether to unlock everything; never offered again.
 --  * A progression save starts with the Walther PPK only.
@@ -15,17 +15,21 @@ local catalog = require "tactical.catalog"
 
 local progress = {}
 
-local FILE = "progress.txt"
+local LEGACY_FILE = "progress.txt"
+local DIFFICULTIES = { "agent", "secretagent", "00agent", "007" }
+local knownDifficulty = {}
+for _, d in ipairs(DIFFICULTIES) do knownDifficulty[d] = true end
 local REPLAYS_PER_RESERVE = 3
 local STARTER = 1   -- Walther PPK
 
 progress.UNSET, progress.EARN, progress.ALL = 0, 1, 2
 
-local s
+local s, activeFolder, activeFile
 
 local function fresh()
   return {
     mode = progress.UNSET, reserve = 0, replays = 0, cleared = {}, missions = 0,
+    difficultyClears = {},
     guns = {},          -- key -> { unlocked, kills, headshots, shots, hits, clears }
     loadout = { primary = -1, pistol = STARTER },
     magazine = {},      -- key -> chosen capacity
@@ -42,12 +46,23 @@ local function gun(key)
   return g
 end
 
-function progress.load()
+-- The API may have no folder before the folder screen. Keep the last selected
+-- profile in that case, and keep compatibility with older script hosts.
+function progress.selectFolder()
+  local folder = mod.mission and mod.mission.folder and mod.mission.folder()
+  if type(folder) ~= "number" or folder < 1 or folder > 4 or folder % 1 ~= 0 then
+    folder = activeFolder or 0
+  end
+  if folder == activeFolder then return false end
+  activeFolder = folder
+  activeFile = folder == 0 and LEGACY_FILE or ("progress-" .. folder .. ".txt")
   s = fresh()
-  local text = mod.save.read(FILE)
+  local text = mod.save.read(activeFile)
+  -- Old installs had one file. Use it only for folder 1 and preserve it on disk.
+  if not text and folder == 1 then text = mod.save.read(LEGACY_FILE) end
   if not text then
     gun(STARTER).unlocked = true
-    return
+    return true
   end
   for line in string.gmatch(text, "[^\n]+") do
     local f = {}
@@ -61,6 +76,8 @@ function progress.load()
       for i = 2, #f do s.cleared[tonumber(f[i])] = true end
     elseif tag == "missions" then
       s.missions = tonumber(f[2]) or 0
+    elseif tag == "difficulty" and knownDifficulty[f[2]] then
+      s.difficultyClears[f[2]] = tonumber(f[3]) or 0
     elseif tag == "gun" and catalog.byKey[tonumber(f[2])] then
       local g = gun(tonumber(f[2]))
       g.unlocked = f[3] == "1"
@@ -75,6 +92,7 @@ function progress.load()
     end
   end
   gun(STARTER).unlocked = true
+  return true
 end
 
 function progress.save()
@@ -84,6 +102,10 @@ function progress.save()
   for stage in pairs(s.cleared) do cleared[#cleared + 1] = stage end
   table.sort(cleared)
   out[#out + 1] = "cleared " .. table.concat(cleared, " ")
+  for _, difficulty in ipairs(DIFFICULTIES) do
+    local clears = s.difficultyClears[difficulty]
+    if clears then out[#out + 1] = "difficulty " .. difficulty .. " " .. clears end
+  end
   for _, g in ipairs(catalog.guns) do
     local p = s.guns[g.key]
     if p then
@@ -94,7 +116,7 @@ function progress.save()
     if s.firemode[g.key] then out[#out + 1] = "firemode " .. g.key .. " " .. s.firemode[g.key] end
   end
   out[#out + 1] = "loadout " .. s.loadout.primary .. " " .. s.loadout.pistol
-  mod.save.write(FILE, table.concat(out, "\n") .. "\n")
+  mod.save.write(activeFile, table.concat(out, "\n") .. "\n")
 end
 
 function progress.mode() return s.mode end
@@ -130,7 +152,10 @@ end
 function progress.reserve() return s.reserve end
 
 -- Every clear of a mission, first or replay, as a campaign total.
-function progress.missions() return s.missions end
+function progress.missions(difficulty)
+  if difficulty then return s.difficultyClears[difficulty] or 0 end
+  return s.missions
+end
 
 -- Capacities this gun may use now.
 function progress.magazineAllowed(key, cap)
@@ -217,9 +242,12 @@ end
 
 -- A mission completed. ownedAtStart: keys owned when it began. carried:
 -- keys brought home. Returns what unlocked, for the debrief.
-function progress.missionComplete(stage, ownedAtStart, carried)
+function progress.missionComplete(stage, ownedAtStart, carried, difficulty)
   local result = { guns = {}, magazines = {}, reserve = 0 }
   s.missions = s.missions + 1
+  if knownDifficulty[difficulty] then
+    s.difficultyClears[difficulty] = progress.missions(difficulty) + 1
+  end
   if progress.locks() then
     if not s.cleared[stage] then
       s.cleared[stage] = true
