@@ -224,15 +224,31 @@ function magazines.reloadEnd(hand, itemId)
   end
 end
 
--- weapon_drawn: the gun comes up with its own rounds.
+-- reload_attempt: no magazine for this gun in the rig, no reload. (The
+-- reserve's pin can't cover every case: a magazine let go of in a hand
+-- reload gives its rounds back to the reserve.)
+function magazines.attempt(hand, itemId)
+  local key = state.carried[itemId]
+  if not key or catalog.noMagazine[key] then return nil end
+  if magazines.peek(catalog.byKey[key]) then return nil end
+  return false
+end
+
+-- weapon_drawn: the gun comes up with its own rounds. The game has just
+-- topped it up from the reserve, so the reserve is pinned again too.
 function magazines.drawn(hand, itemId)
   local key = state.carried[itemId]
   if not key or catalog.noMagazine[key] then return end
-  local g = arsenal.gun(key)
+  local def, g = catalog.byKey[key], arsenal.gun(key)
   if g.loaded == nil then
     g.loaded = util.try(mod.weapon.loaded, hand) or 0
   end
   g.loaded = util.try(mod.weapon.setLoaded, hand, g.loaded) or g.loaded
+  local ammo = catalog.ammo(itemId)
+  if ammo then
+    state.reloading[ammo] = state.ticks + RELOAD_GRACE_TICKS
+    pinNext(def, ammo)
+  end
 end
 
 -- The rounds in each held gun, as the game counts them now.

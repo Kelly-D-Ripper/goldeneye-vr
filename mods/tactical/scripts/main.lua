@@ -11,6 +11,7 @@ local firing = require "tactical.firing"
 local guards = require "tactical.guards"
 local pages = require "tactical.pages"
 local coop = require "tactical.coop"
+local sights = require "tactical.sights"
 local util = require "tactical.util"
 
 local CHEST_SWITCH = "chest"   -- the off hand's grip here cycles the gun hand's fire mode
@@ -82,6 +83,10 @@ mod.on("weapon_fire", function(hand, item, loaded)
   end
 end)
 
+mod.on("reload_attempt", function(hand, item)
+  return magazines.attempt(hand, item)
+end)
+
 mod.on("reload_start", function(hand, item)
   magazines.reloadStart(hand, item)
 end)
@@ -97,6 +102,7 @@ mod.on("weapon_drawn", function(hand, item)
     magazines.trackAmmo(item)
     arsenal.apply(item, key)
     magazines.drawn(hand, item)
+    sights.drawn(hand, item)
   end
   arsenal.releaseUnheld()
 end)

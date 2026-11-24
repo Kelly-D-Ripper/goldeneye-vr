@@ -1,13 +1,19 @@
 # GoldenEye Tactical (mod pack)
 
-GoldenEye Tactical's rules as a GoldenEye VR mod pack, written in Lua against
-mod API v1 (`docs/mod-system.md`). It is a `campaign` mod on the retail
-cartridge, with its own saves, and it supports co-op.
+> **This is a partial port, not Tactical.** It carries Tactical's rules
+> (guns, magazines, progression, rosters, reinforcements) through mod API v1.
+> It doesn't have Tactical's models, attachments, optics, physical magazines,
+> guard AI, Workshop, gore, melee weapons or gadgets. Some of those need API
+> calls MrSco is building or has been asked for. The rest need new game
+> features that the mod system's rules currently exclude.
+> **[PARITY.md](PARITY.md) lists every native feature, where the limit is,
+> and what the API needs for parity.** The full game is still the native
+> build ([`tactical/native-0.18.4`](https://github.com/Kelly-D-Ripper/goldeneye-vr/tree/tactical/native-0.18.4)).
 
-This is the port of the native Tactical builds (0.05 to 0.18.4) to the mod
-system. Everything here goes through the API, so it runs on every platform
-the game ships on. The native builds' extra models, attachments and guard AI
-can't be ported until the API can draw them (see **Not in this version**).
+GoldenEye Tactical's rules as a GoldenEye VR mod pack, written in Lua against
+mod API v1 (`docs/mod-system.md`). It's a `campaign` mod on the retail
+cartridge, with its own saves, and it supports co-op. Everything goes through
+the API, so it runs on every platform the game ships on.
 
 ## What it does
 
@@ -40,6 +46,12 @@ both the button reload and the VR belt reload seat real magazines:
 - A round in the chamber stays with the gun (+1).
 - Ammo boxes, looted guns and the mission's starting rounds become loose rounds.
   Loose rounds are packed into empty pouches.
+- With no magazine for that gun in the rig, the reload is declined
+  (`reload_attempt`) by either reload, the button's or the belt's.
+
+**Sights.** A gun with iron sights on the KF7 or AR33 has the game's built-in
+magnifier taken off (`mod.weapon.scope`). The SVD keeps the sniper rifle's
+scope.
 
 **Fire modes.** Semi, burst and auto, per gun. To switch the gun in your gun
 hand, grip with your off hand at your chest, or use the Loadout page. A
@@ -102,26 +114,14 @@ lines. Each one defaults to on.
 
 ## Not in this version
 
-These parts need API calls that don't exist yet. They were requested on
-[MrSco/goldeneye-vr#291](https://github.com/MrSco/goldeneye-vr/pull/291).
-- **Models and attachments.** The Tactical guns look like the cartridge gun
-  they ride on. Optics, muzzles, grips and stocks need a model attached to a
-  gun, hand or body slot.
-- **Magnified scopes.** These need the game's per-hand scope turned on for any
-  gun.
-- **Physical magazines.** Magazines aren't drawn on the rig or in the hand, and a
-  dropped magazine is lost. A mod can't spawn a pickup while a mission is
-  running.
-- **Guard AI.** Squads, cover, pairs and perches aren't ported, because the API
-  can't add new AI behaviour. Vests and helmets need attached models.
-- **Missions.** "Unlock all" covers guns and magazines but not missions, which
-  the game's own save controls. Per-difficulty rewards and daily challenges
-  aren't possible either, because a script can't read the difficulty or the
-  date.
-- **Save folders.** Progress is one file per install. The 0.18.4 build kept
-  one per save folder, but a script can't read which folder is in use.
-- **Reinforcements on enclosed maps.** The API gives no pad positions to
-  choose from, so maps without approach pads get no waves.
+See [PARITY.md](PARITY.md). In short:
+- **Waiting on API calls:** gun and attachment models (in progress), loot on
+  the floor, pickup ids, guard placement, mission facts, an on-screen note,
+  move speed, per-gun handling and sound, and keeping an empty gun in hand.
+- **Needs new game features, outside the current API rules:** the parts
+  renderer, optic reticles and night or thermal views, guard combat AI,
+  physical magazine handling, the Workshop, gore and blade cuts, melee
+  weapons, gadgets and the watch, and Tactical's own items.
 
 ## Testing
 
