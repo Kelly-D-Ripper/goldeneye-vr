@@ -35,6 +35,8 @@ EXTRA = r'''        } else if (!strcmp(cmd, "complete")) {
         } else if (!strcmp(cmd, "setammo") && i + 2 < argc) {
             s_ammo[atoi(argv[i + 1])] = atoi(argv[i + 2]);
             i += 2;
+        } else if (!strcmp(cmd, "withdraw") && i + 1 < argc) {
+            gevrModGameTake(atoi(argv[++i]));
 '''
 FAILS = []
 
@@ -381,6 +383,28 @@ def scenarios(exe, temp):
     check(" 4 " in inv and " 5 " in inv, "a Glock 17 and a looted PPK are both carried (%s)" % inv.strip())
 
 
+def extraction_outcomes(exe, temp):
+    """Two newly looted primaries: the same load awards only what comes back."""
+    save = "mode 1\nloadout -1 1\n"
+    picks = ("start", "prepare", 34, "begin", 34,
+             "own", AK47, "took", "weapon", AK47, "draw", 0, AK47, "frame",
+             "own", M16, "took", "weapon", M16, "draw", 0, M16, "frame")
+    for label, ending, expected in (
+        ("completed", ("complete",), {4, 16}),
+        ("dropped-stowed", ("withdraw", AK47, "frame", "complete"), {16}),
+        ("dropped-held", ("withdraw", M16, "frame", "complete"), {4}),
+        ("left", (), set()),
+        ("died", ("died", 0, "frame"), set()),
+    ):
+        r = Run(exe, temp, "extract-" + label, save=save)
+        out = r(*picks, "inv", *ending, "title")
+        inv = lines(out, "INV")
+        p = r.progress()
+        extracted = {int(key) for key in re.findall(r"^gun (4|16) 1 ", p, re.M)}
+        check(not errors(out) and inv == ["INV 4 8 13 held 13 0"] and extracted == expected,
+              f"two-primary extraction ({label}) awards {sorted(expected)}, got {sorted(extracted)}")
+
+
 def empty_gun(exe, temp):
     r = Run(exe, temp, "empty", save="mode 1\nloadout -1 1\n")
     out = r("start", "prepare", 34, "begin", 34, "draw", 0, WPPK,
@@ -436,6 +460,7 @@ def main():
         temp = Path(t)
         exe = build(temp)
         scenarios(exe, temp)
+        extraction_outcomes(exe, temp)
         if HAS_PICKUP_IDS:
             pickup_identity(exe, temp)
         if "gevrModApiOutOfAmmo(" in (ROOT / "port/include/gevr_modapi.h").read_text():

@@ -63,6 +63,8 @@ end
 mod.on("tick", function(dt)
   state.clock = state.clock + dt
   state.ticks = state.ticks + 1
+  -- Keep extraction's cached inventory current while the mission still owns it.
+  arsenal.refreshCarried()
   for _, hand in ipairs(arsenal.HANDS) do
     local item = util.try(mod.weapon.held, hand)
     if item and catalog.isGunItem(item) and util.try(mod.inventory.has, item) then

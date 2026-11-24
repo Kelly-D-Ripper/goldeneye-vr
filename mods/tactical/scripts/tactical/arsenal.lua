@@ -115,8 +115,11 @@ end
 
 -- Carry: forget guns no longer in the inventory (dropped, taken by the game).
 function arsenal.refreshCarried()
-  for itemId in pairs(state.carried) do
-    if not util.try(mod.inventory.has, itemId) then state.carried[itemId] = nil end
+  for itemId, key in pairs(state.carried) do
+    if util.try(mod.inventory.has, itemId) == false then
+      state.carried[itemId] = nil
+      if key == state.lastPrimary then state.lastPrimary = nil end
+    end
   end
 end
 
