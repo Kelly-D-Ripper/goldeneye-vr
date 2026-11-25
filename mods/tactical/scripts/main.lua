@@ -16,6 +16,8 @@ local looks = require "tactical.looks"
 local util = require "tactical.util"
 
 local CHEST_SWITCH = "chest"   -- the off hand's grip here cycles the gun hand's fire mode
+-- Native Tactical's military guard body rows (gevr_ragdoll.c rdMilitaryGuard).
+local BLOOD = { headBurst = 10, bodies = { 0, 1, 2, 3, 4, 17, 18, 19, 21, 37, 38, 39, 40 } }
 local completed, missionDifficulty = false, nil
 
 progress.selectFolder()
@@ -50,6 +52,7 @@ local function issueKit()
 end
 
 mod.on("mission_start", function(stage)
+  if mod.effect.blood then mod.effect.blood(BLOOD) end
   -- Reapplying a kit can equip a new purchase without changing which guns were
   -- eligible to earn a mastery clear when the mission began.
   for _, def in ipairs(catalog.guns) do

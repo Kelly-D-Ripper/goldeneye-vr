@@ -12,6 +12,7 @@ pass), and docs/mod-system.md's .opaque list gives C10 the same rule.
 When gear/optics is available, stage the native profiles and lens-ready
 housings used by those same parts, including folded housings. Write a Lua
 index for the pack to use on engines that support mod.attach.optic.
+When bloody-combat is available, stage its seven original effect sheets.
 
 The meshes are Tactical's assets and stay out of Git; this tool reads them
 from the native build's folder. It writes files.sha256 for the staged
@@ -25,6 +26,8 @@ from pathlib import Path
 PACK = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PACK / "tools"))
 from validate_pack import build_zip, shipped, validate, write_hashes  # noqa: E402
+
+BLOOD_SHEETS = ("spray", "stream", "splat", "ribbon", "mist", "pool", "drop")
 
 
 def stage_mesh(source, dest, pictures):
@@ -71,6 +74,19 @@ def stage_optics(optics, stage, mesh_names):
     return len(entries)
 
 
+def stage_blood(blood, stage):
+    if not blood.is_dir():
+        return
+    sheets = [blood / f"blood-{role}.png" for role in BLOOD_SHEETS]
+    for sheet in sheets:
+        if not sheet.is_file():
+            raise ValueError(f"missing native blood sheet: {sheet}")
+    assets = stage / "assets" / "effects"
+    assets.mkdir(parents=True, exist_ok=True)
+    for sheet in sheets:
+        shutil.copyfile(sheet, assets / sheet.name)
+
+
 def main():
     meshes, stage = Path(sys.argv[1]), Path(sys.argv[2])
     out = Path(sys.argv[3]) if len(sys.argv) > 3 else None
@@ -92,6 +108,7 @@ def main():
         total += stage_mesh(meshes / name, models / name, int(pictures))
         mesh_names.add(name)
     optics = stage_optics(meshes.parent / "optics", stage, mesh_names)
+    stage_blood(meshes.parent.parent / "bloody-combat", stage)
     print(f"staged {stage}: {len(mesh_names)} standard meshes ({total / 2**20:.0f} MiB), {optics} native optics")
     problems = validate(stage)
     if problems:

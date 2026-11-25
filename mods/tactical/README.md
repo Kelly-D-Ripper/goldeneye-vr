@@ -152,8 +152,9 @@ This checks the pack against the format, writes `files.sha256` and builds the
 zip the launcher installs.
 
 To include the native models and optics, stage from the installed Tactical
-build's `mods/tactical/gear/meshes` folder. The stage has its own
-`files.sha256` and can also be written as a zip.
+build's `mods/tactical/gear/meshes` folder. Staging also copies the seven
+blood effect sheets when the native `bloody-combat` folder is present.
+The stage has its own `files.sha256` and can also be written as a zip.
 
 ```
 python mods/tactical/tools/stage_pack.py <gear/meshes> <stage-dir> <pack.zip>
