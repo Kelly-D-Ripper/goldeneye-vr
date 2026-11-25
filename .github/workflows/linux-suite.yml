@@ -1,0 +1,36 @@
+name: Linux test suite
+# Contributor-side check only: runs every port/tests/test_*.py on Linux for a
+# ci/* branch (a PR head plus this one workflow commit). Not part of any PR.
+on:
+  push:
+    branches: ['ci/**']
+  workflow_dispatch:
+jobs:
+  suite:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q build-essential clang zlib1g-dev p7zip-full python3
+          gcc --version | head -1
+      - name: Every test
+        run: |
+          : > summary.txt
+          for t in port/tests/test_*.py; do
+            n=$(basename "$t" .py); start=$(date +%s)
+            if timeout 1800 python3 "$t" > "logs-$n.txt" 2>&1; then r=PASS; else r="FAIL($?)"; fi
+            echo "$r $n $(( $(date +%s) - start ))s" | tee -a summary.txt
+          done
+          echo "$(grep -c ^PASS summary.txt) pass, $(grep -vc ^PASS summary.txt) fail" | tee -a summary.txt
+          for f in $(grep -v ^PASS summary.txt | awk '{print $2}'); do echo "::group::$f"; tail -60 "logs-$f.txt"; echo "::endgroup::"; done
+          ! grep -q '^FAIL' summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: suite-logs
+          path: |
+            summary.txt
+            logs-*.txt
