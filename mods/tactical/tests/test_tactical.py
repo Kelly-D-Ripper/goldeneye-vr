@@ -23,6 +23,7 @@ PACK = Path(__file__).resolve().parent.parent
 ROOT = Path(os.environ.get("GEVR_TEST_ENGINE", PACK.parent.parent)).resolve()
 sys.path.insert(0, str(PACK / "tools"))
 from validate_pack import validate  # noqa: E402
+from stage_pack import stage_optics  # noqa: E402
 
 LUA = ["lapi", "lcode", "lctype", "ldebug", "ldo", "ldump", "lfunc", "lgc", "llex", "lmem", "lobject", "lopcodes",
        "lparser", "lstate", "lstring", "ltable", "ltm", "lundump", "lvm", "lzio", "lauxlib", "lbaselib", "lcorolib",
@@ -578,6 +579,39 @@ def looks(exe, temp):
           "a progression save draws the stock build until the preset's parts are earned (%s)" % stock)
 
 
+def optic_looks(exe, temp, can_bind):
+    stem = "5c82342f2e221644f31c060e"
+    plain, housing, profile = f"{stem}.bin", f"{stem}-optic.bin", f"{stem}.opt"
+    r = Run(exe, temp, "optic_looks", save=ALL.format(p=7, s=1))
+    pack = r.dir / "mods/tactical"
+    models = pack / "assets/models"
+    models.mkdir(parents=True)
+    optics = temp / "native-optics"
+    optics.mkdir()
+    (optics / plain).write_bytes(b"GEVRWPN2\x02\x00\x00\x00")
+    (optics / profile).write_bytes(b"native profile bytes")
+    check(stage_optics(optics, pack, {plain}) == 1
+          and (models / profile).read_bytes() == (optics / profile).read_bytes()
+          and (models / f"{housing}.opaque").read_text().strip() == "0 1",
+          "staging copies the native lens profile and marks the alternate housing opaque")
+
+    draw_svd = ("start", "prepare", 34, "begin", 34, "draw", 0, 17, "frame")
+    out = r(*draw_svd, "draw", 0, WPPK, "frame")
+    selected = next((l.split() for l in lines(out, "ATTACH ") if f" {housing if can_bind else plain} " in l), [])
+    if can_bind:
+        check(selected and f"OPTIC {selected[1]} {profile} -" in out
+              and f"DETACH {selected[1]}" in out and not errors(out),
+              "the SVD binds the native lens to its housing and detaches it when the gun is swapped")
+        index = pack / "scripts/tactical/optic_assets.lua"
+        index.write_text(index.read_text().replace(profile, "Gno-profile.opt"), encoding="ascii")
+        out = r(*draw_svd)
+        check(any(f" {plain} " in l for l in lines(out, "ATTACH ")) and not errors(out),
+              "a failed native optic bind restores the ordinary housing")
+    else:
+        check(selected and not lines(out, "OPTIC") and not errors(out),
+              "an engine without pack optics still draws the ordinary housing")
+
+
 def handling(exe, temp):
     """Per-build stats on the carrier, as native applies them."""
     # the Glock 18C fires full-auto on the PPK's single-shot carrier
@@ -615,8 +649,10 @@ def main():
             empty_gun(exe, temp)
         if "int gevrModGameFolder(void)" in (ROOT / "port/tests/modapi_native.c").read_text():
             profile_isolation(exe, temp)
-        if "int gevrModGameAttach(" in (ROOT / "port/tests/modapi_native.c").read_text():
+        engine_harness = (ROOT / "port/tests/modapi_native.c").read_text()
+        if "int gevrModGameAttach(" in engine_harness:
             looks(exe, temp)
+            optic_looks(exe, temp, "int gevrModGameOpticBind(" in engine_harness)
         if "show2" in (ROOT / "port/tests/modapi_native.c").read_text():
             handling(exe, temp)
     if FAILS:

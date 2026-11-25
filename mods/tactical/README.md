@@ -150,3 +150,11 @@ python mods/tactical/tools/validate_pack.py --zip tactical-0.19.0.zip
 
 This checks the pack against the format, writes `files.sha256` and builds the
 zip the launcher installs.
+
+To include the native models and optics, stage from the installed Tactical
+build's `mods/tactical/gear/meshes` folder. The stage has its own
+`files.sha256` and can also be written as a zip.
+
+```
+python mods/tactical/tools/stage_pack.py <gear/meshes> <stage-dir> <pack.zip>
+```

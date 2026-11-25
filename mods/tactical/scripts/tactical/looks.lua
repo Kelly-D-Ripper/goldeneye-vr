@@ -12,6 +12,7 @@ local state = require "tactical.state"
 local util = require "tactical.util"
 local assemblies = require "tactical.assemblies"
 local arsenal = require "tactical.arsenal"
+local opticAssets = mod.attach and mod.attach.optic and util.try(require, "tactical.optic_assets") or {}
 
 local looks = {}
 
@@ -23,6 +24,23 @@ local failed = {}
 local function clear(hand)
   for _, id in ipairs(attached[hand]) do util.try(mod.attach.remove, id) end
   attached[hand], magazine[hand], shown[hand] = {}, nil, nil
+end
+
+local function addPart(hand, part)
+  local attachment = { on = "gun", hand = hand, frame = part.frame }
+  local optic = opticAssets[part.model]
+  if optic then
+    attachment.model = optic.model
+    local id = util.try(mod.attach.add, attachment)
+    if id then
+      if util.try(mod.attach.optic, id, { profile = optic.profile, folded = optic.folded }) then return id end
+      util.try(mod.attach.remove, id)
+    end
+    if not failed[optic.profile] then mod.log("couldn't load native optic " .. optic.profile) end
+    failed[optic.profile] = true
+  end
+  attachment.model = part.model
+  return util.try(mod.attach.add, attachment)
 end
 
 -- The build a carried gun has: the loadout's choice for the kit's guns, a
@@ -50,7 +68,7 @@ function looks.drawn(hand, itemId)
   end
   for i = 2, #b.parts do
     local p = b.parts[i]
-    local id = util.try(mod.attach.add, { model = p.model, on = "gun", hand = hand, frame = p.frame })
+    local id = addPart(hand, p)
     if id then
       attached[hand][#attached[hand] + 1] = id
       if p.path:match("mod_magazine$") then magazine[hand] = id end

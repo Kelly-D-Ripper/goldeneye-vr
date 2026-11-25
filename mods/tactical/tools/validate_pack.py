@@ -52,13 +52,18 @@ def validate(pack=PACK):
     return problems
 
 
-def build_zip(out, pack=PACK):
-    files = shipped(pack)
+def write_hashes(pack, files):
     lines = []
     for f in files:
         lines.append(hashlib.sha256(f.read_bytes()).hexdigest() + "  " + f.relative_to(pack).as_posix())
     sums = "\n".join(lines) + "\n"
     (pack / "files.sha256").write_text(sums, encoding="ascii", newline="\n")
+    return sums
+
+
+def build_zip(out, pack=PACK):
+    files = shipped(pack)
+    sums = write_hashes(pack, files)
     m = json.loads((pack / "mod.json").read_text())
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         for f in files:
