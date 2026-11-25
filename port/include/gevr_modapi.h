@@ -50,6 +50,10 @@ int gevrModApiReloadDeclined(int hand, int item, int reserve);
 void gevrModApiReloadStart(int hand, int item);
 /* reload_end: rounds are in (the native reload's ammo move; a magazine seated) */
 void gevrModApiReloadEnd(int hand, int item);
+/* out_of_ammo: a hand's gun and its reserve are empty and the game is about
+ * to switch the hand to its next weapon; 1 when a mod keeps it in hand.
+ * Kept, it isn't asked again until the gun fires, reloads or is drawn */
+int gevrModApiOutOfAmmo(int hand, int item);
 /* weapon_drawn: a switched-to weapon is up and usable (the hand's scope is
  * the game's own again first: mod.weapon.scope) */
 void gevrModApiDrawn(int hand, int item);
@@ -88,12 +92,68 @@ typedef struct GevrModPickup {
     int crate[GEVR_MODAPI_AMMO_TYPES + 1];   /* CRATE: rounds by type, [1] to [13] */
     float armour;       /* ARMOUR: 0 to GEVR_MODAPI_ARMOUR_MAX */
     int none;           /* pickup_spawning's answer: no pickup here */
+    int pickup;         /* item_pickup: the pickup's id (gevrModGamePickupId), -1 none */
 } GevrModPickup;
 
 /* pickup_spawning: each mod's answer in turn into p, the same kind, or none */
 void gevrModApiPickupSpawning(GevrModPickup *p);
 /* item_pickup: the local human player took it */
 void gevrModApiItemPickup(const GevrModPickup *p);
+/* weapon_dropped: a weapon a chr held is dropped to the floor (a dead or
+ * disarmed guard's gun, a player's): its pickup id, its item, and who held
+ * it (a guard's id, GEVR_MODAPI_FROM_PLAYER, or GEVR_MODAPI_FROM_NONE) */
+#define GEVR_MODAPI_FROM_PLAYER (-1)
+#define GEVR_MODAPI_FROM_NONE (-2)
+/* gevrModGameDrop's from for a player's slot n (a shared drop from the host's
+ * player): GEVR_MODAPI_FROM_SLOT0 - n */
+#define GEVR_MODAPI_FROM_SLOT0 (-16)
+void gevrModApiWeaponDropped(int pickup, int item, int from);
+
+/* A pickup's id: the setup record's index (pickup_spawning's) for the
+ * stage's own, below GEVR_MODAPI_PICKUP_RUNTIME. One the game makes while
+ * playing (in a weapon slot or an ammo box slot, pools it recycles) is
+ * numbered from GEVR_MODAPI_PICKUP_RUNTIME as it's first named, and that id
+ * is never given again in the mission. Each headset numbers its own. */
+#define GEVR_MODAPI_PICKUP_RUNTIME 0x10000
+#define GEVR_MODAPI_PICKUP_LAST 0x3FFFFFFF
+/* A shared pickup's (drop's shared): the host's numbering, the same on every
+ * headset, from here up */
+#define GEVR_MODAPI_PICKUP_SHARED 0x40000000
+#define GEVR_MODAPI_PICKUP_HELD 32    /* shared drops and takes waiting for play */
+enum { GEVR_MODAPI_PICKUP_WEAPON, GEVR_MODAPI_PICKUP_BOX, GEVR_MODAPI_PICKUP_ARMOUR, GEVR_MODAPI_PICKUP_KINDS };
+#define GEVR_MODAPI_PICKUP_SLOTS 64   /* a pool's slots at most (the game's: 30 weapons, 20 boxes) */
+#define GEVR_MODAPI_PICKUP_QUEUE 64   /* pickup_removed's waiting for the next frame */
+/* the game's side: a runtime slot's id, named now if it has none (-1 past
+ * the pools or the ids); this headset's player took it (item_pickup); it's
+ * freed: pickup_removed at the next frame in play unless it was taken */
+int gevrModApiPickupSlotId(int kind, int slot);
+void gevrModApiPickupSlotTaken(int kind, int slot);
+void gevrModApiPickupSlotFreed(int kind, int slot);
+void gevrModApiPickupFlush(void);   /* gevr_modscript.c: each frame in play, before tick */
+void gevrModApiPickupClear(void);   /* and as a mission loads: no ids, none waiting */
+/* mod.pickups.drop: the game's own drop (drop_inventory's, a shot crate's box)
+ * of a gun or thrown weapon (item), an ammo box of a type (ammo 1 to 13), or
+ * body armour (armour, more than 0 up to 1, as the stage's own), one of the
+ * three, from the local player (from GEVR_MODAPI_FROM_PLAYER) or a guard (its
+ * id); the new pickup's id, or -1 (no such guard, no free slot). The game
+ * makes no armour while playing: it comes from a pool of the mod API's own,
+ * GEVR_MODAPI_ARMOUR_DROPS at once */
+#define GEVR_MODAPI_ARMOUR_DROPS 8
+int gevrModGameDrop(int item, int ammo, float armour, int from);
+void gevrModGameDropsClear(void);   /* as a mission loads: the armour pool's records free */
+/* A shared pickup another player won, or gone: this headset's copy in that
+ * runtime slot freed, as the game frees one (objFree tells pickup_removed) */
+int gevrModGamePickupRemove(int kind, int slot);
+/* A shared pickup the host awarded this headset's player: taken through the
+ * game's own pickup (propPickupByPlayer), as a walk-over takes it */
+int gevrModGamePickupGrant(int kind, int slot);
+/* propobj.c propPickupByPlayer, before anything changes, for a runtime slot's
+ * pickup (local: this headset's player's): 1 holds it back. A shared one in
+ * a network game goes through the host: a player's sends a claim (again
+ * after GEVR_MODAPI_CLAIM_US) and waits for the award; the host's own is
+ * awarded at once, told to everyone; another player's is theirs to claim */
+#define GEVR_MODAPI_CLAIM_US 500000
+int gevrModApiPickupTry(int kind, int slot, int local);
 
 /* The game's hooks (src/game/gevr_modgame.c) */
 struct PropDefHeaderRecord;
@@ -243,13 +303,26 @@ enum { GEVR_MODAT_PLAYER = 1, GEVR_MODAT_GUARD, GEVR_MODAT_PAD };
 #define GEVR_MODAPI_NET_INBOX 64          /* messages held until play */
 #define GEVR_MODAPI_NET_SENDS 30          /* a mod's sends a second */
 #define GEVR_MODAPI_NET_BYTES 16384       /* and their bytes */
-enum { GEVR_MODNET_DATA = 0, GEVR_MODNET_OFF = 1 };   /* net_protocol.h NET_MOD_* */
+enum {   /* net_protocol.h NET_MOD_* */
+    GEVR_MODNET_DATA = 0, GEVR_MODNET_OFF = 1,
+    GEVR_MODNET_DROP = 2, GEVR_MODNET_CLAIM = 3, GEVR_MODNET_GRANT = 4, GEVR_MODNET_GONE = 5,
+};
+/* a shared pickup's bytes on the wire (little-endian): a drop's u8 stage, u8
+ * item, u8 ammo, u8 0, u32 id, s16 from (a guard's id, or -1 - a player's
+ * slot), u16 armour (65535 the most); a claim's, an award's and a gone's u8
+ * stage, u8 the winner's slot (an award's; else 0), two 0s, u32 id */
+#define GEVR_MODAPI_NET_DROP_BYTES 12
+#define GEVR_MODAPI_NET_PICKUP_BYTES 8
 
 /* net_core.c: a mod's message arrived (from: the sender's slot, -1 a
  * dedicated server); held, and handed to the mod at the next frame in play */
 void gevrModNetReceive(const char *mod, int from, const char *channel, const void *data, int len);
 /* net_core.c: the mod stopped on another player's headset */
 void gevrModNetStopped(const char *mod, int from);
+/* net_core.c: a shared pickup's drop, claim, award or gone (GEVR_MODNET_DROP
+ * to _GONE; from the sender's slot); held, and applied in order at the next
+ * frame in play if it's this mission's */
+void gevrModNetPickup(const char *mod, int from, int kind, const void *data, int len);
 /* net_core.c netReceiveStageReady, the host: a player is in the stage;
  * peer_ready at the next frame in play */
 void gevrModApiPeerReady(int slot);
@@ -331,7 +404,36 @@ typedef struct GevrModWeaponStats {
     int magazine;     /* MagSize */
     int fireRate;     /* AutomaticFiringRate, ticks between shots; -1: not automatic */
     float damage;     /* DestructionAmount */
+    float inaccuracy; /* Inaccuracy: the KF7's 10, the sniper rifle's 0 */
+    float recoilBack; /* RecoilBack: how far the hands pull back at a shot */
+    float recoilUp;   /* RecoilUp: how far the gun kicks up */
+    int sound;        /* Sound: the shot's ROM sound effect (mod.audio's ids) */
+    float loudnessMin;   /* LoudnessMin, LoudnessMax: how far guards hear a shot */
+    float loudnessMax;
+    int automatic;    /* fired automatically while the trigger's held (gunfire.c's firing switch) */
+    /* a thrown weapon or gadget's trigger throw (gun.c gevrThrowTrigger): its
+     * speed (units a tick: the game's 16.7, a knife's 25) and lift upward
+     * (the game's 5), and its guide drawn for the local player; speed 0 for
+     * an item that isn't thrown */
+    float throwSpeed;
+    float throwLift;
+    int throwGuide;
+    /* the guide's look (gunfire.c gevrThrowGuideDraw): its length and width in
+     * world units, colour and whether it fades to nothing at its far end; the
+     * GEVR_MODAPI_GUIDE_* defaults are the game's tracer */
+    float guideLength;
+    float guideWidth;
+    int guideColour[3];
+    int guideFade;
 } GevrModWeaponStats;
+#define GEVR_MODAPI_GUIDE_LENGTH 100.0f
+#define GEVR_MODAPI_GUIDE_WIDTH 6.0f
+#define GEVR_MODAPI_GUIDE_LENGTH_MIN 10.0
+#define GEVR_MODAPI_GUIDE_LENGTH_MAX 500.0
+#define GEVR_MODAPI_GUIDE_WIDTH_MIN 0.5
+#define GEVR_MODAPI_GUIDE_WIDTH_MAX 30.0
+#define GEVR_MODAPI_THROW_SPEED_MAX 100.0
+#define GEVR_MODAPI_THROW_LIFT_MAX 50.0
 
 /* The current player is this machine's human (not a copy, not a bot) */
 int gevrModGameLocal(void);
@@ -350,8 +452,50 @@ void gevrModGameSetStats(int item, const GevrModWeaponStats *in);
  * zoomDeg the angle the lens shows), _NONE none even on a scoped gun */
 void gevrModGameScope(int hand, int mode, int item, const float at[3], float radius, float zoomDeg);
 /* Which models the hand's gun is drawn with: 0 the cartridge's, 1 GoldenEye
- * X's, 2 Bean's (bondview2.c gevrFitLook) */
+ * X's, 2 Bean's (bondview2.c gevrFitLook), 3 a mod's (mod.weapon.model) */
 int gevrModGameLook(int hand);
+/* A mod's model for the gun a hand draws (gun.c gevrModGunModelSet): the
+ * run's mod's assets/models/<name> for item in that hand, or name NULL the
+ * item's own. 0 when the run's mod has no such file (nothing changes) */
+int gevrModGameGunModel(int hand, int item, const char *name, const float frame[4][4]);
+/* every hand's own models back (a mod stopped, a new mission) */
+void gevrModGameGunModelReset(void);
+
+/* mod.attach (src/game/gevr_modattach.c): a pack's model on the local
+ * player's gun, a hand or the body, placed each rendered frame */
+/* Sized from a measured loadout (#291: two rifles of 14 parts each, five
+ * magazines, a sheath and a scabbard: 35 attached and about 20 files for one
+ * player), with room for a second player's rig and guards' gear */
+#define GEVR_MODAPI_ATTACH_MAX 128     /* attached at once, every mod's together */
+#define GEVR_MODAPI_ATTACH_MODELS 64   /* model files loaded in a mission */
+#define GEVR_MODAPI_ATTACH_RANGE 4000.0f   /* at: model units (a gun is about 800 long) */
+#define GEVR_MODAPI_ATTACH_SCALE_MIN 0.01f
+#define GEVR_MODAPI_ATTACH_SCALE_MAX 100.0f
+#define GEVR_MODAPI_ATTACH_NODES 256       /* node: a gun model's matrix, 0 to 255 */
+enum { GEVR_MODATTACH_GUN, GEVR_MODATTACH_HAND, GEVR_MODATTACH_BODY, GEVR_MODATTACH_GUARD };
+/* A guard's body parts, as the game numbers them for hits (bondaicommands.h
+ * HITTARGET, HIT_LEFT_FOOT 1 to HIT_CHEST 15): each part's bounding box in
+ * a character model carries its number (ModelNumber) */
+#define GEVR_MODAPI_GUARD_PARTS 15
+typedef struct GevrModAttach {
+    char model[64];        /* assets/models/<model> */
+    char like[64];         /* the cartridge model file it's built over (a G gun or P prop) */
+    int on;                /* GEVR_MODATTACH_* */
+    int where;             /* the hand (0 right, 1 left), the body slot (the anchors' order), or a guard's id */
+    int node;              /* on the gun: the matrix of its model it rides (0 the root); on a guard: the part */
+    float offset[4][4];    /* in the anchor's frame, its units: rows the model's axes, then its place */
+} GevrModAttach;
+/* attach: its id from 1; 0 when the model won't load (no file, no such like,
+ * a file the like's header doesn't fit) or there's no such guard or part; -1
+ * with all attached */
+int gevrModGameAttach(const GevrModAttach *a);
+int gevrModGameDetach(int id);
+int gevrModGameAttachShow(int id, int shown);
+int gevrModGameAttachPlace(int id, const float offset[4][4]);   /* a new offset, from the next frame */
+void gevrModGameAttachReset(void);   /* none attached (a new mission, a mod stopped) */
+/* gevr_modattach.c: a guard's attachment gone with its body (chr.c
+ * chrpropCleanupForRemoval): its id isn't any mod's now */
+void gevrModApiAttachGone(int id);
 /* A gun or thrown weapon with a model in this cartridge: what a swap or
  * mod.inventory.give/take may use */
 int gevrModGameSwappable(int item);
@@ -405,6 +549,39 @@ int gevrModGameGiveGuardWeapon(int id, int item, int hand);
 int gevrModGamePatrol(int id, int path);
 /* The stage's patrol paths' ids, at most max; how many */
 int gevrModGamePaths(int *ids, int max);
+/* The setup's pads: how many (ids 0 up), and its bound pads (10000 up) */
+int gevrModGamePadCount(int *bound);
+typedef struct GevrModPad {
+    float pos[3];    /* world units, as mod.guards.get's */
+    float look[3];   /* the way it faces */
+    int room;        /* its tile's room, -1 none */
+} GevrModPad;
+/* A pad by id: 1 when the setup has it */
+int gevrModGamePad(int pad, GevrModPad *out);
+/* The guard to a pad (chrGoToPad, as AI_WalkToPad, AI_RunToPad and
+ * AI_SprintToPad: speed 0 walk, 1 run, 2 sprint), or turned to face one
+ * (check_set_actor_standing_still with TARGET_PAD, as AI_TRYFacingTarget):
+ * 1 when the game took it */
+int gevrModGameGoTo(int id, int pad, int speed);
+int gevrModGameFace(int id, int pad);
+/* A hat on a guard that has none, as AI_TRYGiveMeHat (hatCreateForChr):
+ * hat 0 to GEVR_MODAPI_HATS - 1, the cartridge's hats in mod.guards.giveHat's
+ * names' order (PROP_HATFURRY to PROP_HATPEAKED); 1 when it's on */
+#define GEVR_MODAPI_HATS 12
+int gevrModGameGiveHat(int id, int hat);
+
+/* mod.mission: the difficulty chosen (0 Agent to 3 007; -1 none, as in
+ * multiplayer) and the save folder the run plays from (0 to 3, -1 none) */
+int gevrModGameDifficulty(void);
+int gevrModGameFolder(void);
+/* mod.mission.complete: mission (0 Dam to 19 Egypt, the folder screen's
+ * order) marked complete at a difficulty (and those below it) in the run's
+ * save folder, through the game's own fileUnlockStageInFolderAtDifficulty;
+ * seconds its time, or 0 for none. Only in a mod campaign, whose save is its
+ * own file (eeprom-mod-<id>.bin), never the base game's. 1 when written */
+#define GEVR_MODAPI_MISSIONS 20
+#define GEVR_MODAPI_NO_TIME 99999999   /* the game's own "no time" (cheat.c's unlocks) */
+int gevrModGameComplete(int mission, int difficulty, int seconds);
 /* This machine's player's health and armour, 0 to 1; 0 when no player is in a stage */
 int gevrModGamePlayerHealth(float *health, float *armour);
 /* Set them: health more than 0 to 1, armour 0 to 1; 0 when the player is
@@ -413,6 +590,11 @@ int gevrModGameSetPlayerHealth(float health);
 int gevrModGameSetPlayerArmour(float armour);
 /* The sound effects bank's count: ids 1 to it (sndPlaySfx's, 1-based) */
 int gevrModGameSoundCount(void);
+/* mod.player.setSpeed: the local player's walking and strafing speed, times
+ * scale (1 the game's own), until the mission ends or the mod stops */
+#define GEVR_MODAPI_SPEED_MIN 0.25f
+#define GEVR_MODAPI_SPEED_MAX 2.0f
+void gevrModGameSetSpeed(float scale);
 /* Play one in a stage: volume 0 to 1 sets it, -1 keeps its own; pos (world
  * units) places it, heard from there; 0 when it couldn't */
 int gevrModGamePlaySound(int id, float volume, const float *pos);

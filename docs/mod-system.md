@@ -163,7 +163,9 @@ files.sha256        checksum list of every other file
 
 ## Saves and records
 
-- A campaign mod saves to `eeprom-mod-<id>.bin`.
+- A campaign mod saves to `eeprom-mod-<id>.bin`. Its script can mark a
+  mission complete there (`mod.mission.complete`); the base game's save
+  is never written by a mod.
 - Mod settings and data the script stores: `$S/mod-data/<id>/` through the
   API (`mod.save`, `mod.setting`), at most 1 MB. It sits outside the mod's
   install folder, so an update, which replaces that folder, keeps it.
@@ -275,11 +277,32 @@ files.sha256        checksum list of every other file
     `mission_start(stage)`, `mission_end(stage, "complete" | "left")`,
     `tick(dt)` (seconds, at most 0.25). An unknown event is an error.
   - `mod.log(...)`: one log line, `mod <id>: ...`, at most 30 a second.
+  - `mod.note(text)`: a short line on this player's screen, the game's own
+    bottom message as a pickup's is ("Magazine dropped"): 1 to 80
+    printable characters, one line. Shown at the frame's end, the last
+    of the frame; a stopped mod's own note goes first, and one waiting as
+    a mission loads is dropped.
   - `mod.setting(name, default)`: the player's choice for it
     (`settings.txt` in its data folder, `name=value` lines), as the
     default's type, else the default.
   - `mod.capabilities()`: `vr`, `hands`, `headless`, `platform` (`quest`,
     `android`, `pc`, `ios`, `tvos`, `visionos`, `server`).
+  - `mod.mission.difficulty()`: `"agent"`, `"secretagent"`, `"00agent"` or
+    `"007"`, the one chosen (`selected_difficulty`); nil without one, as
+    in multiplayer. `mod.mission.folder()`: the save folder the run plays
+    from, 1 to 4 as the folder screen shows them (`selected_folder_num`),
+    or nil, so a mod can keep its progress per folder in its data.
+    `mod.mission.day()`: today's number, whole days since 1 January 1970
+    (UTC), for daily challenges; each headset reads its own clock, so a
+    co-op mod sends the host's. `mod.mission.complete(mission, difficulty[,
+    seconds])` marks a mission (1 Dam to 20 Egypt, the folder screen's
+    order) complete at that difficulty and those below it, in the run's
+    save folder, through the game's own `fileUnlockStageInFolderAtDifficulty()`
+    (as the unlock cheats write it), with its time if given (else none).
+    Only in a mod campaign, whose save is its own file
+    (`eeprom-mod-<id>.bin`), never the base game's: true when written,
+    false outside one or with no folder chosen. It's this headset's save;
+    in co-op each headset that should have it calls it.
   - `mod.random([m [, n]])`, also `math.random`: seeded each mission, in
     co-op from the seed every headset shares.
   - `mod.save.read/write/remove(name)`: files in its data folder; names are
@@ -332,10 +355,10 @@ is the proposal to refine with mod authors (Tactical first).
 | Lifecycle | `campaign_enter`, `mission_prepare`, `mission_start`, `mission_end`, `tick(dt)` (capped) | `mod.log`, `mod.setting`, `mod.capabilities` |
 | Weapons | `weapon_fire_attempt`, `weapon_fire`, `reload_attempt`, `reload_start/end`, `weapon_drawn`, `weapon_dropped` | read and set loaded ammo, magazine size, fire rate, damage (within limits) |
 | Hands (VR) | `grip`, `release`, `hand_near(anchor)` | hand pose, body anchors (body slots), haptics |
-| Items | `pickup_spawning` (can swap a weapon, ammo or armour pickup at its existing pad), `item_pickup`, `item_spawned` | spawn a pickup, take or give an item |
+| Items | `pickup_spawning` (can swap a weapon, ammo or armour pickup at its existing pad), `item_pickup`, `pickup_removed`, `item_spawned` | spawn a pickup, take or give an item |
 | Guards | `guard_spawning`, `guard_spawned`, `guard_alerted`, `guard_shot`, `guard_killed`, `corpse_retiring` | read state, give a guard's weapon or outfit (from the ROM's bodies), spawn a guard and send it along a patrol path through the game's own spawn and AI commands |
 | Damage and player | `before_damage`, `damage_applied` (a player's too: no separate `player_damaged`), `player_downed`, `player_revived`, `player_died` | health and armour |
-| Assets | — | the pack's model files in the cartridge's place and its textures over the HD pack (no call: they're there); attach a model to a hand, gun or body slot (next); `mod.audio.play` (ROM sound effects only), `mod.effect.play` |
+| Assets | — | the pack's model files in the cartridge's place and its textures over the HD pack (no call: they're there); `mod.weapon.model` (a gun's model per hand), `mod.attach` (a model on the gun, a hand or a body slot); `mod.audio.play` (ROM sound effects only), `mod.effect.play` |
 | UI | `ui_click`, `ui_change` | a page on the in-game screen from a simple layout (text, toggles, choices, sliders, buttons): `mod.ui.page`, `remove`, `open`, `close` |
 | Network | `peer_ready`, `mod.net.on` (includes the sender's player ID) | `mod.net.send`, `mod.net.role`, `mod.net.slot` |
 | Storage | — | read and write in `mods/<id>/save/` |
@@ -410,6 +433,14 @@ in-game screen). We maintain the adapters, not the mods.
     the belt while still in the gun sends its start as it goes in.
     `weapon_drawn` at a switch's end. A hand reload's single rounds
     (`gevrGexRoundTick`) send no `reload_start` or `reload_end` yet.
+  - `out_of_ammo(hand, item)` when a hand's gun and its reserve are both
+    empty and the game is about to switch that hand to its next weapon
+    (`gevrAutoAdvanceHand()` in VR, `autoadvance_on_deplete_all_ammo()`
+    flat, as the trigger is let go). A handler returning false keeps the
+    empty gun in hand; it then waits for a reload, or for the player to put
+    it away. Kept, it isn't asked again until the gun fires, gets rounds
+    (`reload_end`) or is drawn. Leaving the tank isn't asked: its shells go
+    with it.
   - The reserve moves without an event in three places a script that
     keeps magazines itself should know: the native reload and a fresh
     magazine top the gun up from it (loaded becomes the lesser of the
@@ -427,7 +458,45 @@ in-game screen). We maintain the adapters, not the mods.
     rounds)` (0 to the held weapon's magazine), `stats(item)` (`magazine`,
     `fireRate` for an automatic, `damage`) and `setStats(item, t)`:
     magazine 1 to 255, fireRate 1 to 60 ticks (automatics only), damage 0
-    to 10 times the weapon's own; only items with stats of their own.
+    to 10 times the weapon's own; `inaccuracy` (the KF7's 10, the sniper
+    rifle's 0; 0 to 100, or ten times its own), `recoilBack` and
+    `recoilUp` (how far the hands pull back and the gun kicks up; 0 to
+    10, or ten times its own), `sound` (the shot's ROM sound effect,
+    `mod.audio`'s ids) and `loudnessMin` and `loudnessMax` (how far
+    guards hear the shot, a suppressor's lower; 0 to 100, or ten times
+    its own most, min at most max); only items with stats of their own.
+    `automatic` (true or false): the gun fires while the trigger's held
+    at its `fireRate` (an automatic's branch of the firing switch,
+    `gunfire.c`), or a shot a press (a pistol's); the game decides it by
+    the item, and `gevrModFireAs()` sends a mod's choice down the other
+    branch. A gun made automatic needs a `fireRate`, its own or given in
+    the same call; `fireRate` is refused on a gun that isn't automatic.
+    `stats` reads it back. Guards holding that weapon fire it the same
+    way.
+    A thrown weapon or gadget (a grenade, knife, mine, plastique, the bug,
+    the camera, the GoldenEye key) has its trigger throw's `throwSpeed`
+    (1 to 100 units a tick; the game's 16.7, a knife's 25, the key's 6.7),
+    `throwLift` (-50 to 50 upward; the game's 5) and `throwGuide` (true
+    or false). The trigger throw is the game's own: along the hand's aim
+    (the crosshair's, flat), at that speed with that lift, plus the
+    player's own motion (`gun.c` `gevrThrowTrigger`, which the thrown
+    grenades, knives and objects all launch through); the next one
+    readies, or the detonator, as the game does. `throwGuide` draws a
+    short line from where the throw leaves the hand along the way it
+    would leave now, from the same calculation less the item's random
+    spread, as the game draws a tracer (`gunfire.c` `gevrThrowGuideDraw`),
+    for the local player; the base game's Throw guide setting draws it
+    for every thrown item. It shows only while an item is ready in the
+    hand (idle, or the trigger pressed), not while a throw leaves or the
+    next comes up, and not while the grip winds up a motion throw, which
+    is separate. `throwGuide` can also be a look, `{ length, width,
+    colour, fade }`: length 10 to 500 and width 0.5 to 30 in world units,
+    colour `{ r, g, b }` 0 to 255 each, and fade (to nothing at its far
+    end), what's left out the game's tracer's (100 long, 6 wide, white,
+    not fading); the engine still places and draws it, as a tracer with
+    that radius and colour. `stats` reads them back for a thrown item,
+    the look as `throwGuideStyle`; an item that isn't thrown refuses
+    them.
     Stats are per weapon type, guards' too, and go back to the game's own
     at a mission's end and when a mod stops.
   - Scopes (VR): `mod.weapon.scope(hand, t)` puts the game's per-hand
@@ -451,7 +520,81 @@ in-game screen). We maintain the adapters, not the mods.
     The reticle is the game's red sight, with the "Aim: crosshair"
     option, as on the game's own scopes. `mod.weapon.look(hand)` says
     which models the hand's gun is drawn with (`"original"`, `"gex"`,
-    `"bean"`), so a mod can keep an eyepiece for each.
+    `"bean"`, or `"mod"` for a mod's own, below), so a mod can keep an
+    eyepiece for each.
+  - A gun's model per hand: `mod.weapon.model(hand, item, file)` draws
+    the mod's `assets/models/<file>` when that hand holds `item`, in place
+    of the item's cartridge model, so several of a mod's guns can share one
+    of the game's items and each hand can show a different one. The file
+    is built over the item's cartridge model as `assets/models`'
+    replacements are (its header: switch and texture counts, skeleton),
+    and must fit the room the game makes for a hand's gun. It wins over
+    GoldenEye X's and Bean's models for that hand, and takes the original
+    models' fits. A hand holding the item now loads it at once; `nil`
+    gives the item's own back. True when set, false when the mod has no
+    such file (a file that won't load leaves the cartridge's, and the log
+    says why). Every hand's own come back at a mission's start and when a
+    mod stops. The muzzle is the model's own: the flash and the shots
+    start at its flash node (the position node on switch 3, which
+    `gunfire.c` reads from the drawn model, as GoldenEye X's models give
+    theirs), so a longer gun puts its muzzle at its own barrel's end; the
+    item's Gun fit muzzle trim still adds. What stays the item's: its
+    stats, sounds, Gun fit places (the two-handed hold's among them) and
+    hand reload's magazine (a mod's model has none of the cartridge's
+    measured magazines, so its gestures run the game's own reload). `gun.c` keeps the choices as a table, and each tick a hand
+    showing another model than its gun's choice loads it again, so a
+    choice never touches a player mid-load (`gevrModGunReconcile()`).
+  - A self-describing `GEVRWPN1` or `GEVRWPN2` mesh can also be used as
+    `file`; leave the exported bytes unchanged. It draws at the stock
+    gun's root and keeps the stock hand and sleeve: the lists the game
+    shows and hides as the hand (switches 8-13 and 35), less the gun
+    pieces three of GoldenEye's own models file there (the PP7's, the
+    silenced PP7's and the TT-33's, `modelGunHandList()` in `model.c`).
+    The fist's stock model is the hand itself, none of it under those
+    switches, so a mesh for the fist replaces the hand. The stock gun still
+    drives animation, shot origin and reload. To fit the pack body at an
+    authored offset from the carrier root, use `mod.weapon.model` with a
+    fourth argument `{ frame = ... }`, using the same affine rows as
+    `mod.attach`. Use the converted game model basis below. To place a
+    part from a pack body mount, compose the body's fit and that mount
+    when supplying its frame. Changing only the fit for a loaded file
+    takes effect on the next draw. A legacy file refuses the frame.
+    Replacing the gun body
+    hides the stock muzzle flash. This format alone does not add action
+    geometry, an authored muzzle or grip, optics, or remote weapon looks.
+
+    **Pack mesh byte layout.** Integers and IEEE 754 floats are little
+    endian; there is no implicit padding. The same file can be a held
+    model or an attachment, such as a prop or a custom guard helmet.
+
+    | Order | Bytes | Contents |
+    |---|---|---|
+    | Magic | 8 | ASCII `GEVRWPN1` or `GEVRWPN2`, no terminator |
+    | Picture count | 4 | Unsigned count, 1 to 32; the renderer tracks picture passes in a 32-bit mask |
+    | Pictures | repeated | Unsigned 16-bit width and height, then `width * height * 4` bytes of row-major RGBA8 |
+    | Triangle count | 4 | Unsigned, nonzero; exactly three consecutive corners follow for each triangle |
+    | Corner | 28 each | Three float32 position values, two float32 UVs, RGBA8 colour, one zero-based picture index, three reserved bytes (write zero). All three corners of a triangle must use the same picture |
+    | Wrist point (v2 only) | 36 | Nine float32 values: `along[3]`, `normal[3]`, `centre[3]` in the file's own frame. The first two are direction vectors; centre uses the same units as positions. Reserved for a later watch binding; it does not draw a watch |
+
+    Positions are in metres in the file's X-right, Y-forward, Z-up frame.
+    At load, `(x, y, z)` becomes `1000 * (-x, z, y)` in game model units,
+    rounded into the signed 16-bit Fast3D vertex fields. UVs are normalized
+    in picture space and wrap. Each picture dimension is 1 to 512: the
+    renderer uses signed 16-bit 10.5 vertex UVs, with room for a repeated
+    image across a seam, and 10.2 tile bounds. If a picture pixel or a
+    corner using it has alpha below 255, all its triangles use the
+    depth-tested blended pass; other triangles also write depth. If a
+    picture's alpha stores data other than opacity, add
+    `assets/models/<file>.opaque` beside that mesh (for example,
+    `body.bin.opaque`). List its zero-based picture indexes separated by
+    ASCII whitespace, each once, in fewer than 128 bytes. Those pictures
+    keep their RGB and ignore texture alpha; corner alpha still controls
+    blending. Unlisted pictures keep the original behavior, so one mesh
+    can use opaque body pictures and blended glass. The same applies
+    whether the file is held or attached. Invalid lists refuse the mesh.
+    Files with invalid counts, non-finite values, missing bytes or extra
+    bytes are refused and logged; an allocation failure is logged too.
+    Pack geometry currently does not inherit world fog on guards.
   - Known gaps: on a pump gun a lower `setLoaded` reads as a shot (the
     rack, `gevr_rack.h`); in co-op another headset's copy of the player
     still shows a declined shot's fire (the fire bit comes from the
@@ -470,12 +613,73 @@ in-game screen). We maintain the adapters, not the mods.
     models load; armour once its amount is read; a box or a crate before
     `domakedefaultobj()` and the crate's rounds' models. Asked while the
     mission loads (the loading time limit, outside the frame budget).
-  - `item_pickup(kind, id, rounds)` in `propPickupByPlayer()` once the
+  - `item_pickup(kind, id, rounds, pickup)` in `propPickupByPlayer()` once the
     game has taken the pickup, before a freed one is gone, for this
     machine's human player: `"weapon", item`; `"ammo", type, rounds` (a
     crate sends one for each type it held, its 9mm_2 as 9mm, solo's
     multiplier applied); `"armour", amount`; `"key"`; `"object"` for
     anything else (a mission document, say). It reports; it can't refuse.
+    `pickup` is the pickup's id: the setup record's index for the stage's
+    own (`pickup_spawning`'s `index`, below `0x10000`), or for one the
+    game made while playing (a dropped gun, a thrown weapon, a box), an
+    id from `0x10000` up given as it's first named, never given again in
+    the mission. The game recycles its weapon and box slots, so the id is
+    the mod API's, not the slot's. Each headset numbers its own. A gun
+    the player already has still reports: its rounds go to the reserve
+    first.
+  - `pickup_removed(pickup)` when a pickup the game made while playing,
+    one a mod has had an id for, is freed without this headset's player
+    taking it: the game freed the oldest dropped gun for room (its 30
+    weapon slots full), another player took it in multiplayer, a thrown
+    weapon was used up. Told at the next frame in play, before `tick`,
+    never inside the call that freed it (a `mod.pickups.drop` can free
+    the oldest gun); at most 64 a frame (more are logged and dropped).
+    The stage's own pickups keep their ids and aren't told.
+  - `weapon_dropped(pickup, item, from)` when a weapon a chr held is
+    dropped to the floor (`propobjSetDropped()`): a dead or disarmed
+    guard's gun, a player's in multiplayer. `from` is the guard's id,
+    `"player"`, or nil. Each headset drops its own copy of what happens
+    there, so ids are this headset's (never reused in the mission). Not
+    for a mod's own drop.
+  - `mod.pickups.drop{ item = gun }`, `{ ammo = type }` or `{ armour =
+    amount }`, with `from = "player"` or a guard's id (a corpse too): the
+    game's own drop, a gun or thrown weapon as a player's inventory is
+    dropped (`drop_inventory()`), an ammo box of that type as a shot crate
+    drops one, or body armour (more than 0, up to 1, as the stage's own),
+    falling from that chr. Returns the new pickup's id, or nil with no
+    free slot or no such guard. The box carries the type's own rounds,
+    and a gun the game's usual rounds with it. The game makes no armour
+    while playing, so a dropped one is a record of the mod API's own (8
+    at once, freed as they're taken), the stage's body armour model, taken
+    by the game's own armour pickup (only when it's more than the player
+    has) and worn down by shots as the stage's is. A model the stage
+    never placed is loaded first, as the game loads a hat it gives.
+    Without `shared`, placed on this headset only: in co-op, each headset
+    that should have it drops it (from the host's `guard_killed`, say,
+    sent over `mod.net`), and each player can take their own.
+  - `shared = true` (the host, or solo; a player's is refused): one
+    pickup for every headset. Its id comes from `0x40000000` up, the same
+    on every headset. The host's drop goes to the others (`NET_MSG_MOD`'s
+    `NET_MOD_DROP`), and each drops its own copy from the same chr (a
+    guard by its id, or the host's player) with that id, once it's in
+    play and only in the mission it was sent in. **The host decides who
+    takes it.** A player's pickup of it (walking over it, a hand grab) is
+    held back, before the game changes anything, and claimed from the
+    host (`NET_MOD_CLAIM`, again each half second while it's held back).
+    The host awards the first claim it has while its own copy's still
+    there, its own player's pickup the same way, and tells everyone
+    (`NET_MOD_GRANT`): the winner's game takes it through its own pickup,
+    so exactly one inventory changes and one `item_pickup` is told; the
+    other copies are freed, told there as `pickup_removed`. A late or
+    repeated claim gets nothing, and the host answers a claim for one it
+    no longer has with `NET_MOD_GONE`, so the claimer's copy goes. A
+    player's pickup lands a round trip after it walks over it; the host's
+    at once. A shared copy the game frees untaken (its slot recycled for
+    room, say) is sent as `NET_MOD_GONE` (through the host), so every copy
+    goes, and the slot's next pickup has a new id. A headset that can't
+    make it (no such guard there, no free slot) logs it and goes without;
+    a guard's id is 0 to 32767 for a shared drop. Stock pickups and
+    drops that aren't shared are taken as before.
   - Calls: `mod.inventory.has(item)` (any item), `give(item)` and
     `take(item)` (guns and thrown weapons only, the swap list below).
     `give` returns true when the item is new and brings no rounds; remote
@@ -488,8 +692,8 @@ in-game screen). We maintain the adapters, not the mods.
     `9mm_2` (the Klobb's), `rifle`, `shotgun`, `grenade`, `rockets`,
     `remotemine`, `proxmine`, `timedmine`, `knife`, `grenaderound`,
     `magnum`, `goldengun` (1 to 13).
-  - Not built yet: spawning a pickup at run time, `item_spawned`, and a
-    pickup a mod can refuse.
+  - Not built yet: `item_spawned`, a pickup a mod can refuse, dropped
+    armour, and a dropped pickup's own round count.
 - **Hands (VR).** Built (`port/src/gevr_modapi.c` over
   `src/game/gevr_modgame.c`; the hooks in `bondview2.c` and
   `gevr_bodyslots.c`), for this machine's human player in stereo play.
@@ -608,6 +812,30 @@ in-game screen). We maintain the adapters, not the mods.
     - `mod.guards.patrol(id, path)`: `if_actor_able_set_on_path()` along
       the stage's path, as `AI_StartPatrol`; `mod.guards.paths()` lists
       the stage's path ids.
+    - `mod.guards.goTo(id, pad[, speed])`: the guard walks (the default),
+      runs or sprints to the pad by the game's own route (`chrGoToPad()`,
+      as `AI_WalkToPad`, `AI_RunToPad` and `AI_SprintToPad`); true when it
+      set off. The game holds it back while ten or more guards have
+      recently seen the player, as it does for its own scripts.
+      `mod.guards.face(id, pad)`: the guard stands and turns to the pad
+      (`check_set_actor_standing_still()` with `TARGET_PAD`, as
+      `AI_TRYFacingTarget`). Both where the guards run (solo, the co-op
+      host), for a living guard and a pad the setup has; the game's co-op
+      sync carries what they do.
+    - `mod.guards.giveHat(id, hat)`: one of the cartridge's hats on a
+      living guard that has none, as the game's own scripts give one
+      (`AI_TRYGiveMeHat`, `hatCreateForChr()`): `fur`, `furbrown`,
+      `furblack`, `sidecap`, `sidecapbrown`, `helmet`, `helmetgrey`,
+      `moon`, `beret`, `beretblue`, `beretred`, `peaked`. True when it's
+      on. A pack's own model in that hat's file (`assets/models`, the
+      hats' `Phat*Z`) changes how it looks; anything else on a guard's
+      body (a vest) isn't built.
+    - `mod.pads.count()`: the stage's pads (ids from 0) and its bound pads
+      (ids from 10000), as `mod.guards.spawn` and these take them.
+      `mod.pads.get(id)`: `{ x, y, z, room, look = { x, y, z } }` in the
+      game's world units (as `mod.guards.get`), `room` the pad's tile's
+      (left out when it has none), `look` the way the pad faces; nil for
+      no such pad. On every headset: the pads are the setup's.
     - `guard_spawned(id)` for a guard the game spawns in play
       (`AI_TRYSpawningChrAtPad`, `AI_TRYSpawningChrNextToChr`, a
       reinforcement's clone once armed and its id settled), where the
@@ -664,7 +892,11 @@ in-game screen). We maintain the adapters, not the mods.
     goes down instead).
   - Calls: `mod.player.health()` gives health and armour (0 to 1),
     `setHealth(x)` (more than 0, up to 1) and `setArmour(x)` (0 to 1) set
-    them; false while the player is dead or down.
+    them; false while the player is dead or down. `setSpeed(scale)` (0.25
+    to 2; 1 the game's own) scales this machine's player's walking and
+    strafing, where the game applies its own speed boost (`bondview2.c`),
+    until the mission ends or the mod stops; a player's own steps in
+    room-scale VR aren't scaled.
 - **Sound and effects.** `mod.audio.play` uses `sndPlaySfx()` to play
   an existing ROM sound effect by ID. Positional playback uses
   `chrobjSndCreatePostEventDefault()`.
@@ -806,6 +1038,79 @@ in-game screen). We maintain the adapters, not the mods.
     has one. No HD pack needs to be chosen. A mod that can't start shows
     none. They match textures by content, so a mod over Goldfinger 64 or
     Tomorrow Never Dies names that cartridge's own.
+- **Assets, part two: a gun's model per hand and attachments** (Tactical's
+  review, #291). The gun's model per hand is `mod.weapon.model`, in the
+  weapons area above. Attachments: `src/game/gevr_modattach.c`.
+  - `mod.attach.add{ model, like, on, hand, at, turn, scale }` draws the
+    pack's `assets/models/<model>` on the local player's gun, a hand or the
+    body. `like` names the cartridge model file it's built over (a G gun
+    or P prop file, its header: `Gak47Z`, `PcartonZ`), as `assets/models`'
+    replacements keep the cartridge's header. Loaded once a mission
+    through `load_resource`, into a buffer of its own as
+    `gevr_heldgun.c`'s guns are; a file that won't load over that header is
+    refused (nil), never drawn as the cartridge's. At most 64 model files
+    a mission, and 128 attached at once, every mod's together; past those,
+    nil. The limits come from a measured loadout (#291: two rifles of 14
+    parts each, one in hand and one on the back, five magazines, a sheath
+    and a scabbard; 35 attached and about 20 files for one player), with
+    room for a second player's rig and guards' gear. A frame without room
+    left in the game's per-frame buffers skips an attachment rather than
+    overrun them (logged once a mission). Loading reads the file, so
+    attach at `mission_start` or `weapon_drawn`, not every tick.
+  - `on`: `"gun"` with `hand` (`"right"`, `"left"`): on the gun that hand
+    holds, on its model's root as drawn, so it moves with the gun's
+    recoil, reload and switch, and a mirrored left gun's part mirrors with
+    it; flat too. `node` (0 to 255, the gun model's matrix; 0 the root)
+    puts it on a part the game animates instead (a slide, a bolt), and it
+    isn't drawn on a gun model without that matrix. `"hand"` with `hand`: on that controller's grip (VR). A
+    body anchor (`hip_gun`, `hip_off`, `back_gun`, `back_off`, `chest`,
+    `belt`, as `mod.hands.anchor`): on the slot's centre on the torso, kept
+    while a mod runs even with body slots off (VR). `"guard"` with
+    `guard` (a guard's id) and `part`, one of the body parts the game's
+    hits name (`bondaicommands.h` `HITTARGET`): `chest`, `head`,
+    `pelvis`, `left_shoulder`, `right_shoulder`, `left_arm`,
+    `right_arm`, `left_hand`, `right_hand`, `left_thigh`,
+    `right_thigh`, `left_leg`, `right_leg`, `left_foot`, `right_foot`:
+    on that part's matrix as the guard is drawn (the node of the part's
+    bounding box, whose `ModelNumber` is the part), so a vest moves with
+    the chest and a pouch with the thigh. Drawn as the objects stuck to a
+    guard are, fading with the body, in every view the guard is drawn in,
+    flat or VR; kept on the body, alive or dead (after its id retires
+    too), until the body is removed, when it's gone and its id is no
+    mod's. Nil for no such guard, or a body without that part. The frame
+    is the part's own, in the character model's units.
+  - `at` (model units, ±4000), `turn` (degrees about the anchor's X, Y
+    and Z, in that order) and `scale` (0.01 to 100) lay it in the anchor's
+    frame. Every frame is a gun model's units at the player's gun size,
+    with X the holder's left, Y up and Z ahead, as the game's guns are.
+    Instead of those three fields, `add` and `place` accept `frame` with
+    four rows of three numbers: the attachment's X, Y and Z axes in the
+    anchor's coordinates, followed by its origin. The axes must be
+    independent, with components between -100 and 100. Origin components
+    are between -4000 and 4000 in model units. An attachment on a gun
+    node follows that node as it animates, even with an authored frame.
+  - For a self-describing pack mesh use `model = "part.bin"` with `like`
+    omitted. A cartridge-format attachment still needs `like`. See
+    **Pack mesh byte layout** under Weapons for the format and limits
+    used by `mod.weapon.model`. Malformed pack meshes are refused.
+  - The engine places each at its anchor every rendered frame, and a hand's
+    follows its controller between game frames as the guns do; a script
+    only attaches, hides and removes. (A position set from `tick` would
+    trail the hand: scripts tick at 60 Hz, a headset draws at 72 to 120.)
+  - `mod.attach.show(id, shown)` hides or shows one, kept attached;
+    `mod.attach.place(id, { at, turn, scale })` moves it in its anchor's
+    frame from the next frame (a slide locked back after the last shot);
+    `mod.attach.remove(id)`. Each answers true only to the mod that
+    attached it. None stay past a mission, nor past a mod stopping.
+  - Built over a prop (P) file, a model's parts are laid out by its own
+    nodes, as a prop's are. A gun (G) file's joints are posed only by the
+    gun's animation, so a model built over one is drawn rigid at its root,
+    as the body slots draw a gun: build parts over a prop file. Nothing on
+    an attachment moves of itself.
+  - The gun, the hands and the body: the local player's view only;
+    another player sees none, and a guard's gun none. A guard's: on this
+    headset, so in co-op each headset's mod attaches the same (a guard's
+    id is the same on every headset).
 
 ### Pickup swaps
 
@@ -913,7 +1218,8 @@ Every headset runs the swaps at load, so in co-op the choices come from
    network (5), the UI's pages on the in-game screen (the fit on both
    screens in `port/tests/test_ingame_fit.py`). Then assets: the pack's
    files first (`port/tests/test_modassets.py`, the routing in
-   `port/tests/test_romcheck.py`), attachments next.
+   `port/tests/test_romcheck.py`), then a gun's model per hand and
+   attachments (`port/tests/test_modapi.py`).
 5. **Network:** `NET_MSG_MOD`, co-op with mods, the dedicated server.
    `mod.net`, `peer_ready` and a stop told to every headset
    (`port/tests/test_modapi.py`; the routing and checks on the production

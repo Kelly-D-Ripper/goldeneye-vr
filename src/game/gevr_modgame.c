@@ -22,6 +22,10 @@
 #include "music.h"       /* g_musicSfxBufferPtr: the sound effects bank */
 #include "snd.h"
 #include "explosion.h"
+#include "chrai.h"            /* g_WeaponSlots, g_AmmoCrates: the game's runtime pickups */
+#include "loadobjectmodel.h"  /* sizepropdef */
+#include "propobj.h"
+#include "model.h"            /* modelSetScale */
 
 extern bool netIsActive(void);       /* net_core.c */
 extern int netGetLocalSlot(void);
@@ -119,10 +123,34 @@ void gevrModGameScope(int hand, int mode, int item, const float at[3], float rad
     gevrScopeModSet(hand, mode, item, at, radius, zoomDeg);
 }
 
+extern s32 gevrModGunHeld(s32 hand);                                        /* gun.c */
+extern void gevrModGunModelSet(s32 hand, s32 item, const char *name, const float frame[4][4]);
+extern void gevrModGunModelReset(void);
+#include "gevr_modassets.h"
+#include "gevr_modmesh.h"
+
 int gevrModGameLook(int hand)
 {
     if (!gevrModGamePlayerReady() || hand < 0 || hand > 1) return 0;
-    return gevrFitLook(hand);
+    return gevrModGunHeld(hand) ? 3 : gevrFitLook(hand);
+}
+
+int gevrModGameGunModel(int hand, int item, const char *name, const float frame[4][4])
+{
+    const GevrModMesh *mesh;
+    if (name != NULL) {
+        int native;
+        if (!gevrModAssetHasModel(name)) return 0;
+        native = gevrModMeshLoad(name, &mesh);
+        if (native < 0 || (frame != NULL && native != 1)) return 0;
+    }
+    gevrModGunModelSet(hand, item, name, frame);
+    return 1;
+}
+
+void gevrModGameGunModelReset(void)
+{
+    gevrModGunModelReset();
 }
 
 void gevrModGameSetLoaded(int hand, int rounds)
@@ -132,6 +160,69 @@ void gevrModGameSetLoaded(int hand, int rounds)
     if (!gevrModGamePlayerReady()) return;
     localHand(hand, &was)->weapon_ammo_in_magazine = rounds;
     set_cur_player(was);
+}
+
+/* Automatic fire by the item, as gunfire.c's firing switch decides it, and a
+ * mod's say per item (setStats' automatic): 0 the game's own, 1 automatic, 2
+ * a shot a press. Put back with the stats (gevrModApiReset) */
+static s8 s_modFireMode[ITEM_IDS_MAX];
+
+static s32 nativeAutomatic(s32 item)
+{
+    switch (GEVR_ITEM_AS(item))
+    {
+        case ITEM_SKORPION: case ITEM_AK47: case ITEM_UZI: case ITEM_MP5K:
+        case ITEM_MP5KSIL: case ITEM_SPECTRE: case ITEM_M16: case ITEM_FNP90:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+/* A thrown item's trigger throw (setStats' throwSpeed, throwLift and
+ * throwGuide; gun.c gevrThrowTrigger, gunfire.c gevrThrowGuideDraw): a speed
+ * of 0 and no lift set are the game's own. Put back with the stats */
+#define GAME_THROW_LIFT 5.0f   /* gun.c's throws' own */
+extern s32 gevrIsThrowable(s32 item);        /* input.c */
+extern f32 gevrThrowBaseSpeed(s32 item);     /* gun.c */
+static f32 s_modThrowSpeed[ITEM_IDS_MAX], s_modThrowLift[ITEM_IDS_MAX];
+static s8 s_modThrowLiftSet[ITEM_IDS_MAX], s_modThrowGuide[ITEM_IDS_MAX];
+/* and its guide's look, when a mod gave one (else the game's tracer) */
+static s8 s_modGuideStyled[ITEM_IDS_MAX], s_modGuideFade[ITEM_IDS_MAX];
+static f32 s_modGuideLength[ITEM_IDS_MAX], s_modGuideWidth[ITEM_IDS_MAX];
+static u8 s_modGuideColour[ITEM_IDS_MAX][3];
+
+void gevrModThrowStats(s32 item, f32 *speed, f32 *lift)
+{
+    if (item < 0 || item >= ITEM_IDS_MAX) return;
+    if (s_modThrowSpeed[item] > 0.0f) *speed = s_modThrowSpeed[item];
+    if (s_modThrowLiftSet[item]) *lift = s_modThrowLift[item];
+}
+
+s32 gevrModThrowGuide(s32 item)
+{
+    return item >= 0 && item < ITEM_IDS_MAX && s_modThrowGuide[item];
+}
+
+/* gunfire.c gevrThrowGuideDraw: the look a mod gave the item's guide; 0 the game's tracer */
+s32 gevrModThrowGuideLook(s32 item, f32 *length, f32 *width, u8 rgb[3], s32 *fade)
+{
+    if (item < 0 || item >= ITEM_IDS_MAX || !s_modThrowGuide[item] || !s_modGuideStyled[item]) return FALSE;
+    *length = s_modGuideLength[item];
+    *width = s_modGuideWidth[item];
+    rgb[0] = s_modGuideColour[item][0];
+    rgb[1] = s_modGuideColour[item][1];
+    rgb[2] = s_modGuideColour[item][2];
+    *fade = s_modGuideFade[item];
+    return TRUE;
+}
+
+/* gunfire.c: the firing switch's case for the item: an automatic's (the
+ * AK47's) or a shot a press (the PP7's) when a mod chose, else as */
+s32 gevrModFireAs(s32 item, s32 as)
+{
+    if (item < 0 || item >= ITEM_IDS_MAX || s_modFireMode[item] == 0) return as;
+    return s_modFireMode[item] == 1 ? ITEM_AK47 : ITEM_WPPK;
 }
 
 int gevrModGameStats(int item, GevrModWeaponStats *out)
@@ -144,6 +235,35 @@ int gevrModGameStats(int item, GevrModWeaponStats *out)
     out->magazine = st->MagSize;
     out->fireRate = st->AutomaticFiringRate == 0xFF ? -1 : (int)st->AutomaticFiringRate;
     out->damage = st->DestructionAmount;
+    out->inaccuracy = st->Inaccuracy;
+    out->recoilBack = st->RecoilBack;
+    out->recoilUp = st->RecoilUp;
+    out->sound = st->Sound;
+    out->loudnessMin = st->LoudnessMin;
+    out->loudnessMax = st->LoudnessMax;
+    out->automatic = s_modFireMode[item] ? s_modFireMode[item] == 1 : nativeAutomatic(item);
+    if (gevrIsThrowable(item))
+    {
+        out->throwSpeed = s_modThrowSpeed[item] > 0.0f ? s_modThrowSpeed[item] : gevrThrowBaseSpeed(item);
+        out->throwLift = s_modThrowLiftSet[item] ? s_modThrowLift[item] : GAME_THROW_LIFT;
+        out->throwGuide = s_modThrowGuide[item];
+        out->guideLength = s_modGuideStyled[item] ? s_modGuideLength[item] : GEVR_MODAPI_GUIDE_LENGTH;
+        out->guideWidth = s_modGuideStyled[item] ? s_modGuideWidth[item] : GEVR_MODAPI_GUIDE_WIDTH;
+        out->guideColour[0] = s_modGuideStyled[item] ? s_modGuideColour[item][0] : 255;
+        out->guideColour[1] = s_modGuideStyled[item] ? s_modGuideColour[item][1] : 255;
+        out->guideColour[2] = s_modGuideStyled[item] ? s_modGuideColour[item][2] : 255;
+        out->guideFade = s_modGuideStyled[item] ? s_modGuideFade[item] : 0;
+    }
+    else
+    {
+        out->throwSpeed = 0.0f;
+        out->throwLift = 0.0f;
+        out->throwGuide = 0;
+        out->guideLength = 0.0f;
+        out->guideWidth = 0.0f;
+        out->guideColour[0] = out->guideColour[1] = out->guideColour[2] = 0;
+        out->guideFade = 0;
+    }
     return 1;
 }
 
@@ -155,8 +275,44 @@ void gevrModGameSetStats(int item, const GevrModWeaponStats *in)
     st = get_ptr_item_statistics((ITEM_IDS)item);
     if (!st || st == &default_weaponstats) return;
     st->MagSize = (s16)in->magazine;
-    if (in->fireRate >= 0) st->AutomaticFiringRate = (u8)in->fireRate;
+    /* -1 is the game's own "none" (0xFF), so a gun made automatic gets it back */
+    st->AutomaticFiringRate = in->fireRate >= 0 ? (u8)in->fireRate : 0xFF;
+    s_modFireMode[item] = (in->automatic != 0) == (nativeAutomatic(item) != 0) ? 0 : in->automatic ? 1 : 2;
+    if (gevrIsThrowable(item))
+    {
+        s_modThrowSpeed[item] = in->throwSpeed > 0.0f && in->throwSpeed != gevrThrowBaseSpeed(item) ? in->throwSpeed : 0.0f;
+        s_modThrowLiftSet[item] = in->throwLift != GAME_THROW_LIFT;
+        s_modThrowLift[item] = in->throwLift;
+        s_modThrowGuide[item] = in->throwGuide != 0;
+        s_modGuideLength[item] = in->guideLength;
+        s_modGuideWidth[item] = in->guideWidth;
+        s_modGuideColour[item][0] = (u8)in->guideColour[0];
+        s_modGuideColour[item][1] = (u8)in->guideColour[1];
+        s_modGuideColour[item][2] = (u8)in->guideColour[2];
+        s_modGuideFade[item] = in->guideFade != 0;
+        s_modGuideStyled[item] = in->guideLength != GEVR_MODAPI_GUIDE_LENGTH || in->guideWidth != GEVR_MODAPI_GUIDE_WIDTH
+            || in->guideColour[0] != 255 || in->guideColour[1] != 255 || in->guideColour[2] != 255 || in->guideFade;
+    }
     st->DestructionAmount = in->damage;
+    st->Inaccuracy = in->inaccuracy;
+    st->RecoilBack = in->recoilBack;
+    st->RecoilUp = in->recoilUp;
+    st->Sound = (u16)in->sound;
+    st->LoudnessMin = in->loudnessMin;
+    st->LoudnessMax = in->loudnessMax;
+}
+
+/* mod.player.setSpeed's scale (bondview2.c, the local player's walk) */
+static f32 s_modMoveScale = 1.0f;
+
+void gevrModGameSetSpeed(float scale)
+{
+    s_modMoveScale = scale;
+}
+
+f32 gevrModMoveScale(void)
+{
+    return gevrModScriptRunning() && gevrModGameLocal() ? s_modMoveScale : 1.0f;
 }
 
 /* ---- the items area ---- */
@@ -372,13 +528,157 @@ int gevrModPickupSpawn(PropDefHeaderRecord *rec, int index)
     return 0;
 }
 
+typedef char pickupPoolsFit[MAX_WEAPON_SLOTS <= GEVR_MODAPI_PICKUP_SLOTS && MAX_AMMO_CRATES <= GEVR_MODAPI_PICKUP_SLOTS
+                            && GEVR_MODAPI_ARMOUR_DROPS <= GEVR_MODAPI_PICKUP_SLOTS ? 1 : -1];
+
+/* Body armour a mod drops (mod.pickups.drop): the game makes none while
+ * playing, only the stage's own, so the records are the mod API's. A record
+ * is free while it has no prop, as the game's weapon slots are (objFree
+ * clears it when the armour's taken); none kept past a stage. */
+static BodyArmourRecord s_modArmour[GEVR_MODAPI_ARMOUR_DROPS];
+
+void gevrModGameDropsClear(void)
+{
+    memset(s_modArmour, 0, sizeof(s_modArmour));
+}
+
+/* a runtime pickup's record (GEVR_MODAPI_PICKUP_*), or NULL */
+static ObjectRecord *slotObject(int kind, int slot)
+{
+    if (kind == GEVR_MODAPI_PICKUP_WEAPON && slot >= 0 && slot < MAX_WEAPON_SLOTS)
+    {
+        return (ObjectRecord *)&g_WeaponSlots[slot];
+    }
+    if (kind == GEVR_MODAPI_PICKUP_BOX && slot >= 0 && slot < MAX_AMMO_CRATES)
+    {
+        return (ObjectRecord *)&g_AmmoCrates[slot];
+    }
+    if (kind == GEVR_MODAPI_PICKUP_ARMOUR && slot >= 0 && slot < GEVR_MODAPI_ARMOUR_DROPS)
+    {
+        return (ObjectRecord *)&s_modArmour[slot];
+    }
+    return NULL;
+}
+
+/* A shared pickup another player won, or gone (gevr_modapi.c): this
+ * headset's copy freed as the game frees a recycled one, so objFree tells
+ * pickup_removed */
+int gevrModGamePickupRemove(int kind, int slot)
+{
+    ObjectRecord *obj = slotObject(kind, slot);
+
+    if (obj == NULL || obj->prop == NULL)
+    {
+        return 0;
+    }
+    objFreePermanently(obj, TRUE);
+    return 1;
+}
+
+/* A shared pickup the host awarded this headset's player: the game's own
+ * pickup of it, as the local player, then its tick operation (as
+ * AI_BondCollectObject takes one), so item_pickup comes from the game */
+int gevrModGamePickupGrant(int kind, int slot)
+{
+    ObjectRecord *obj = slotObject(kind, slot);
+    PropRecord *prop;
+    s32 was;
+    TICKOP op;
+
+    if (obj == NULL || (prop = obj->prop) == NULL || !gevrModGamePlayerReady())
+    {
+        return 0;
+    }
+    was = get_cur_playernum();
+    set_cur_player(localSlot());
+    op = propPickupByPlayer(prop, TRUE);
+    propExecuteTickOperation(prop, op);
+    set_cur_player(was);
+    return op != TICKOP_NONE;
+}
+
+/* propobj.c propPickupByPlayer, before anything changes: a shared pickup in
+ * a network game goes through the host (gevr_modapi.c gevrModApiPickupTry);
+ * 1 holds this one back */
+s32 gevrModPickupHold(PropRecord *prop)
+{
+    s32 kind, slot;
+
+    if (prop == NULL || prop->obj == NULL || !runtimeSlot(prop->obj, &kind, &slot))
+    {
+        return FALSE;
+    }
+    return gevrModApiPickupTry(kind, slot, gevrModGameLocal());
+}
+
+/* A pickup the game made while playing: its pool (GEVR_MODAPI_PICKUP_*) and
+ * slot, or FALSE for the stage's own */
+static s32 runtimeSlot(ObjectRecord *obj, s32 *kind, s32 *slot)
+{
+    const uintptr_t at = (uintptr_t)obj;
+    const uintptr_t weapons = (uintptr_t)&g_WeaponSlots[0], crates = (uintptr_t)&g_AmmoCrates[0];
+    const uintptr_t vests = (uintptr_t)&s_modArmour[0];
+
+    (void)sizeof(pickupPoolsFit);
+    if (at >= weapons && at < weapons + sizeof(WeaponObjRecord) * MAX_WEAPON_SLOTS
+        && (at - weapons) % sizeof(WeaponObjRecord) == 0)
+    {
+        *kind = GEVR_MODAPI_PICKUP_WEAPON;
+        *slot = (s32)((at - weapons) / sizeof(WeaponObjRecord));
+        return TRUE;
+    }
+    if (at >= crates && at < crates + sizeof(AmmoCrateRecord) * MAX_AMMO_CRATES
+        && (at - crates) % sizeof(AmmoCrateRecord) == 0)
+    {
+        *kind = GEVR_MODAPI_PICKUP_BOX;
+        *slot = (s32)((at - crates) / sizeof(AmmoCrateRecord));
+        return TRUE;
+    }
+    if (at >= vests && at < vests + sizeof(s_modArmour) && (at - vests) % sizeof(BodyArmourRecord) == 0)
+    {
+        *kind = GEVR_MODAPI_PICKUP_ARMOUR;
+        *slot = (s32)((at - vests) / sizeof(BodyArmourRecord));
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* A pickup's id (gevr_modapi.h): the setup record's index for the stage's
+ * own; a runtime one's from the mod API's table, never reused in a mission
+ * (the game's slots are) */
+static int pickupId(ObjectRecord *target)
+{
+    PropDefHeaderRecord *def = g_CurrentSetup.propDefs;
+    s32 kind, slot, index;
+
+    if (target == NULL) return -1;
+    if (runtimeSlot(target, &kind, &slot)) return gevrModApiPickupSlotId(kind, slot);
+    for (index = 0; def != NULL && def->type != PROPDEF_END && index < GEVR_MODAPI_PICKUP_RUNTIME; index++)
+    {
+        if ((ObjectRecord *)def == target) return index;
+        def += sizepropdef(def);
+    }
+    return -1;
+}
+
+/* propobj.c objFree: an object freed; a runtime pickup's id goes with it,
+ * and pickup_removed is told unless this headset's player took it */
+void gevrModPickupFreed(ObjectRecord *obj)
+{
+    s32 kind, slot;
+
+    if (obj != NULL && runtimeSlot(obj, &kind, &slot)) gevrModApiPickupSlotFreed(kind, slot);
+}
+
 void gevrModPickupTaken(PropDefHeaderRecord *rec)
 {
     GevrModPickup got;
-    s32 k;
+    s32 k, pool, slot;
 
     if (!gevrModScriptRunning() || !gevrModGameLocal()) return;
     memset(&got, 0, sizeof(got));
+    got.pickup = pickupId((ObjectRecord *)rec);
+    if (runtimeSlot((ObjectRecord *)rec, &pool, &slot)) gevrModApiPickupSlotTaken(pool, slot);   /* freed next: not removed */
     switch (rec->type)
     {
         case PROPDEF_COLLECTABLE:
@@ -754,6 +1054,140 @@ static ChrRecord *guardById(int id)
     return NULL;
 }
 
+/* gevr_modattach.c: a guard's record by id (alive or dead), for mod.attach */
+ChrRecord *gevrModGameGuardChr(int id)
+{
+    return guardById(id);
+}
+
+/* ---- the pickups a mod drops, and the weapons the game drops ---- */
+
+extern AmmoCrateRecord *ammocrateAllocate(void);   /* propobj.c: a runtime ammo box's slot */
+extern ObjectRecord blank_07_object;               /* propobj.c: a runtime box's blank record */
+
+static s32 s_modDropping;   /* a mod's own drop: its call has the id, so no weapon_dropped */
+
+/* who a chr is, for weapon_dropped and a drop's from */
+static int fromChr(ChrRecord *chr)
+{
+    s32 i;
+
+    if (chr == NULL) return GEVR_MODAPI_FROM_NONE;
+    for (i = 0; i < getPlayerCount(); i++)
+    {
+        if (g_playerPointers[i] != NULL && g_playerPointers[i]->prop != NULL && g_playerPointers[i]->prop->chr == chr)
+        {
+            return GEVR_MODAPI_FROM_PLAYER;
+        }
+    }
+    return isGuard(chr) ? chr->chrnum : GEVR_MODAPI_FROM_NONE;
+}
+
+/* propobj.c propobjSetDropped: a weapon a chr held, dropped */
+void gevrModWeaponDropped(PropRecord *prop)
+{
+    ObjectRecord *obj;
+
+    if (s_modDropping || !gevrModScriptRunning() || prop == NULL || prop->parent == NULL
+        || prop->parent->type != PROP_TYPE_CHR || (obj = prop->obj) == NULL || obj->type != PROPDEF_COLLECTABLE)
+    {
+        return;
+    }
+    gevrModApiWeaponDropped(pickupId(obj), ((WeaponObjRecord *)obj)->weaponnum, fromChr(prop->parent->chr));
+}
+
+int gevrModGameDrop(int item, int ammo, float armour, int from)
+{
+    ChrRecord *chr;
+    PropRecord *prop = NULL;
+    s32 id = -1;
+
+    if (!gevrModGamePlayerReady()) return -1;
+    if (from == GEVR_MODAPI_FROM_PLAYER || from <= GEVR_MODAPI_FROM_SLOT0)
+    {
+        /* this headset's player, or a player's slot (the host's, for its shared drop) */
+        const s32 slot = from == GEVR_MODAPI_FROM_PLAYER ? localSlot() : GEVR_MODAPI_FROM_SLOT0 - from;
+        struct player *who = slot >= 0 && slot < getPlayerCount() ? g_playerPointers[slot] : NULL;
+
+        chr = who != NULL && who->prop != NULL ? who->prop->chr : NULL;
+    }
+    else
+    {
+        chr = guardById(from);
+    }
+    if (chr == NULL || chr->prop == NULL) return -1;
+    s_modDropping = TRUE;
+    if (item > 0)
+    {
+        /* as drop_inventory drops a player's guns: made in the chr's hand, then let fall */
+        const s32 propid = getPropForHeldItem((ITEM_IDS)item);
+
+        if (propid >= 0)
+        {
+            prop = something_with_generating_object(chr, propid, (ITEM_IDS)item, 0x20000000, NULL, NULL);
+        }
+    }
+    else if (ammo >= 1 && ammo <= GEVR_MODAPI_AMMO_TYPES && s_boxLook[ammo] >= 0)
+    {
+        /* as a shot crate drops a box of one type (objDamage): a runtime box on the chr, then let fall */
+        AmmoCrateRecord *crate = ammocrateAllocate();
+
+        if (crate != NULL)
+        {
+            *(ObjectRecord *)crate = blank_07_object;
+            crate->obj = s_boxLook[ammo];
+            crate->ammoType = ammo;
+            modelLoad(crate->obj);   /* a box the stage never placed: its file, as a hat's is loaded (hatCreateForChr) */
+            if (objInitWithModelDef((ObjectRecord *)crate, PitemZ_entries[crate->obj].header) != NULL)
+            {
+                modelSetScale(crate->model, crate->model->scale);
+                chrpropReparent(crate->prop, chr->prop);
+                prop = crate->prop;
+            }
+        }
+    }
+    else if (armour > 0.0f && armour <= 1.0f)
+    {
+        /* as the stage's own armour (PROPDEF_ARMOUR, the body armour model), in a
+         * record of the mod API's pool, then let fall as the box is: taken
+         * by the game's own armour pickup, worn down by shots as the stage's */
+        BodyArmourRecord *vest = NULL;
+        s32 i;
+
+        for (i = 0; i < GEVR_MODAPI_ARMOUR_DROPS && vest == NULL; i++)
+        {
+            if (s_modArmour[i].prop == NULL) vest = &s_modArmour[i];
+        }
+        if (vest != NULL)
+        {
+            *(ObjectRecord *)vest = blank_07_object;
+            vest->type = PROPDEF_ARMOUR;
+            vest->obj = PROP_BODYARMOUR;
+            vest->initialamount = armour;
+            vest->amount = armour;
+            modelLoad(PROP_BODYARMOUR);
+            if (objInitWithModelDef((ObjectRecord *)vest, PitemZ_entries[PROP_BODYARMOUR].header) != NULL)
+            {
+                modelSetScale(vest->model, vest->model->scale);
+                chrpropReparent(vest->prop, chr->prop);
+                prop = vest->prop;
+            }
+            else
+            {
+                vest->prop = NULL;   /* free again */
+            }
+        }
+    }
+    if (prop != NULL && prop->obj != NULL)
+    {
+        id = pickupId(prop->obj);
+        propobjSetDropped(prop, DROPTYPE_DEFAULT);
+        objDrop(prop);
+    }
+    s_modDropping = FALSE;
+    return id;
+}
+
 /* As the game's own scripts give a spawned guard its guns (AI_TRYGiveMeItem) */
 static int armGuard(ChrRecord *chr, int item, int hand)
 {
@@ -827,6 +1261,103 @@ int gevrModGamePaths(int *ids, int max)
         ids[n++] = g_CurrentSetup.patrolpaths[i].ID;
     }
     return n;
+}
+
+/* ---- the stage's pads, and guards sent to them ---- */
+
+extern bool chrGoToPad(ChrRecord *self, s32 padid, SPEED speed);                                 /* chraction.c */
+extern bool check_set_actor_standing_still(ChrRecord *self, s32 faceentitytype, s32 faceentityid);
+
+int gevrModGamePadCount(int *bound)
+{
+    s32 n = 0, b = 0;
+
+    while (g_CurrentSetup.pads != NULL && g_CurrentSetup.pads[n].plink != NULL) n++;
+    while (g_CurrentSetup.boundpads != NULL && g_CurrentSetup.boundpads[b].plink != NULL) b++;
+    if (bound != NULL) *bound = b;
+    return n;
+}
+
+int gevrModGamePad(int pad, GevrModPad *out)
+{
+    PadRecord *p;
+
+    if (!padOk(pad)) return 0;
+    /* a bound pad begins as a pad does (chrGoToPad reads it so) */
+    p = pad >= 10000 ? (PadRecord *)&g_CurrentSetup.boundpads[pad - 10000] : &g_CurrentSetup.pads[pad];
+    out->pos[0] = p->pos.x;
+    out->pos[1] = p->pos.y;
+    out->pos[2] = p->pos.z;
+    out->look[0] = p->look.x;
+    out->look[1] = p->look.y;
+    out->look[2] = p->look.z;
+    out->room = p->stan != NULL ? p->stan->room : -1;
+    return 1;
+}
+
+int gevrModGameGoTo(int id, int pad, int speed)
+{
+    ChrRecord *chr = guardById(id);
+
+    if (!gevrModGameRunsGuards() || chr == NULL || guardDying(chr) || !padOk(pad)) return 0;
+    return chrGoToPad(chr, pad, speed == 2 ? SPEED_SPRINT : speed == 1 ? SPEED_RUN : SPEED_WALK);
+}
+
+extern s32 selected_folder_num;          /* front.c: the folder the run plays from */
+extern DIFFICULTY selected_difficulty;   /* front.c */
+
+int gevrModGameDifficulty(void)
+{
+    return selected_difficulty >= DIFFICULTY_AGENT && selected_difficulty <= DIFFICULTY_007 ? (int)selected_difficulty : -1;
+}
+
+int gevrModGameFolder(void)
+{
+    return selected_folder_num >= 0 && selected_folder_num < 4 ? selected_folder_num : -1;
+}
+
+#include "gevr_modpack.h"   /* gevrModActive: the run's mod campaign */
+extern void fileUnlockStageInFolderAtDifficulty(s32 foldernum, LEVEL_SOLO_SEQUENCE stage, DIFFICULTY difficulty, s32 newtime);
+typedef char missionsAreTwenty[SP_LEVEL_MAX == GEVR_MODAPI_MISSIONS ? 1 : -1];
+
+int gevrModGameComplete(int mission, int difficulty, int seconds)
+{
+    (void)sizeof(missionsAreTwenty);
+    /* a mod campaign's save is its own file (libultra.c osEepromSetPath): the base game's is never written */
+    if (gevrModActive() == NULL || gevrModGameFolder() < 0 || mission < SP_LEVEL_DAM || mission >= SP_LEVEL_MAX
+        || difficulty < DIFFICULTY_AGENT || difficulty > DIFFICULTY_007)
+    {
+        return 0;
+    }
+    fileUnlockStageInFolderAtDifficulty(selected_folder_num, (LEVEL_SOLO_SEQUENCE)mission, (DIFFICULTY)difficulty,
+                                        seconds > 0 ? seconds : GEVR_MODAPI_NO_TIME);
+    return 1;
+}
+
+extern PropRecord *hatCreateForChr(ChrRecord *chr, s32 modelnum, u32 flags);   /* propobj.c */
+
+/* the hats in mod.guards.giveHat's order */
+typedef char hatsAreTwelve[PROP_HATPEAKED - PROP_HATFURRY + 1 == GEVR_MODAPI_HATS ? 1 : -1];
+
+int gevrModGameGiveHat(int id, int hat)
+{
+    ChrRecord *chr = guardById(id);
+
+    (void)sizeof(hatsAreTwelve);
+    if (!gevrModGameRunsGuards() || chr == NULL || guardDying(chr) || hat < 0 || hat >= GEVR_MODAPI_HATS
+        || chr->prop == NULL || chr->model == NULL || chr->handle_positiondata_hat != NULL)
+    {
+        return 0;   /* one hat a guard: the game's own never stacks them */
+    }
+    return hatCreateForChr(chr, PROP_HATFURRY + hat, 0) != NULL;
+}
+
+int gevrModGameFace(int id, int pad)
+{
+    ChrRecord *chr = guardById(id);
+
+    if (!gevrModGameRunsGuards() || chr == NULL || guardDying(chr) || !padOk(pad)) return 0;
+    return check_set_actor_standing_still(chr, TARGET_PAD, pad);
 }
 
 /* ---- the damage and player area ---- */

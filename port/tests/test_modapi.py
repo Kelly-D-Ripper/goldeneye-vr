@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -100,6 +101,124 @@ def placement():
           and "gevrModApiReloadEnd(hand, getCurrentPlayerWeaponId(hand));   /* reload_end: a magazine seated" in view,
           "a hand reload's magazine out and in")
     reload_placement(gun, view)
+    empty_placement(gun, view)
+    speed_placement(view)
+    automatic_placement(gun)
+    throws_placement((ROOT / "src/game/gun.c").read_bytes().decode(), gun)
+
+
+def automatic_placement(gun):
+    """the firing switch asks gevrModFireAs for the item's branch"""
+    fire = gun.index("if (handptr->weapon_action_state == GUN_ANIM_STATE_FIRE)")
+    ask = gun.index("switch (gevrModFireAs(var_s1, GEVR_ITEM_AS(var_s1)))", fire)
+    check(ask < gun.index("case ITEM_CAMERA:", ask) < gun.index("case ITEM_SKORPION:", ask) < ask + 4000,
+          "the firing switch's branch is the mod's choice, else the item's")
+    game = (ROOT / "src/game/gevr_modgame.c").read_bytes().decode()
+    check("s_modFireMode[item] == 1 ? ITEM_AK47 : ITEM_WPPK" in function(game, "s32 gevrModFireAs(s32 item, s32 as)")
+          and "in->fireRate >= 0 ? (u8)in->fireRate : 0xFF" in function(game, "void gevrModGameSetStats("),
+          "an automatic's branch or a pistol's; a rate of none put back as the game's 0xFF")
+
+
+def throws(exe, temp):
+    """setStats' throwSpeed, throwLift and throwGuide for a thrown item, read back, refused elsewhere, put back"""
+    lua = r"""
+mod.on("mission_start", function()
+  local w = mod.weapon
+  local g = w.stats("grenade")
+  print("own", string.format("%.2f", g.throwSpeed), g.throwLift, g.throwGuide, w.stats("ak47").throwSpeed)
+  local bad = 0
+  for _, t in ipairs({ { throwSpeed = 0 }, { throwSpeed = 101 }, { throwLift = 51 }, { throwLift = -51 },
+                       { throwGuide = 1 }, { throwSpeed = "x" } }) do
+    if not pcall(w.setStats, "grenade", t) then bad = bad + 1 end
+  end
+  print("bad", bad, (pcall(w.setStats, "ak47", { throwSpeed = 10 })), (pcall(w.setStats, "ak47", { throwGuide = true })))
+  assert(w.setStats("grenade", { throwSpeed = 30, throwLift = -2.5, throwGuide = true }))
+  g = w.stats("grenade")
+  print("now", g.throwSpeed, g.throwLift, g.throwGuide, g.throwGuideStyle.length, g.throwGuideStyle.fade)
+  local looks = 0
+  for _, t in ipairs({ { length = 5 }, { length = 501 }, { width = 0.4 }, { width = 31 }, { colour = { 256, 0, 0 } },
+                       { colour = { 1, 2 } }, { colour = { 1, 2, 3.5 } }, { colour = "cyan" }, { fade = 1 } }) do
+    if not pcall(w.setStats, "grenade", { throwGuide = t }) then looks = looks + 1 end
+  end
+  print("looks", looks, (pcall(w.setStats, "grenade", { throwGuide = "cyan" })))
+  assert(w.setStats("grenade", { throwGuide = { length = 60, width = 1.5, colour = { 0, 255, 255 }, fade = true } }))
+  local s = w.stats("grenade").throwGuideStyle
+  print("look", w.stats("grenade").throwGuide, s.length, s.width, s.colour[1], s.colour[2], s.colour[3], s.fade)
+end)
+"""
+    out = run(exe, temp, "throws", lua, "start", "prepare", 9, "begin", 9, "show3", 26, "title", "show3", 26)
+    check(logs(out) == ["own 16.67 5.0 false nil", "bad 6 false false", "now 30.0 -2.5 true 100.0 false",
+                        "looks 9 false", "look true 60.0 1.5 0 255 255 true"],
+          "a grenade's throw, the refusals, an AK47's none; a guide's look, its refusals, read back: " + str(logs(out)))
+    check(answers(out, "STATS3") == ["STATS3 30.00 -2.50 1 60.0 1.5 0 255 255 1",
+                                     "STATS3 16.67 5.00 0 100.0 6.0 255 255 255 0"],
+          "set, then the game's own at the mission's end: " + str(answers(out, "STATS3")))
+
+
+def throws_placement(gun, fire):
+    """the three throws launch through the shared helpers; the guide draws from them, without spread"""
+    for name, speed in (("void generate_player_thrown_grenade(s32 hand)", "base_velocity = 16.666666f;"),
+                        ("void generate_player_thrown_knife(s32 hand)", "base_velocity = 25.0f;"),
+                        ("void generate_player_thrown_object(s32 hand)", "base_velocity = 6.6666665f;")):
+        body = function(gun, name)
+        check(speed in body and body.index("gevrThrowTrigger(hand, base_velocity, &base_speed_vec, &throw_speed_vec);")
+              < body.index("gevrThrowAddMotion(&throw_speed_vec);")
+              < body.index("throw_item_pos_related.m[3][0]"), name + ": launched through the shared helpers")
+    base = function(gun, "f32 gevrThrowBaseSpeed(s32 item)")
+    check("return 25.0f;" in base and "return 6.6666665f;" in base and "return 16.666666f;" in base,
+          "the guide's base speeds are the throws' own")
+    trigger = function(gun, "void gevrThrowTrigger(")
+    check("f32 lift = 5.0f;" in trigger and "(aim->f[1] * speed) + lift" in trigger
+          and "gevrModThrowStats(getCurrentPlayerWeaponId(hand), &speed, &lift);" in trigger,
+          "the game's formula, a mod's speed and lift for the item")
+    aim = function(fire, "static void gevrAimNoSpread(")
+    check("RANDOM" not in aim and "randomGetNext" not in aim and "gevrStereoShotFromEye(hand, &crosspos, origin, dir)" in aim,
+          "the guide's aim draws no random numbers")
+    guide = function(fire, "Gfx *gevrThrowGuideDraw(Gfx *gdl, s32 hand, s32 item)")
+    check(guide.index("gevrAimNoSpread(&origin, &aim, hand);") < guide.index("gevrThrowTrigger(hand, gevrThrowBaseSpeed(item), &aim, &v);")
+          < guide.index("gevrThrowAddMotion(&v);") < guide.index("gdl = sub_GAME_7F061E18(gdl, &guide, 0);")
+          and "gevrMotionThrowOwnsHand(hand)" in guide and "VrThrowGuide || gevrModThrowGuide(item)" in guide,
+          "the guide: the throw's own calculation, drawn as a tracer, by the setting or a mod, not in a motion throw")
+    check(guide.index("weapon_action_state != GUN_ANIM_STATE_IDLE") < guide.index("gevrAimNoSpread(&origin, &aim, hand);")
+          and "weapon_action_state != GUN_ANIM_STATE_TRIGGER_PRESS" in guide,
+          "only while an item's ready in the hand")
+    check(guide.index("s_gevrBeamStyle = styled ? &style : NULL;") < guide.index("gdl = sub_GAME_7F061E18(gdl, &guide, 0);")
+          < guide.index("s_gevrBeamStyle = NULL;") and "style.radius = width * 5.0f;" in guide,
+          "a pack's look for this one beam only")
+    beam = function(fire, "Gfx *sub_GAME_7F061E18(Gfx *gdl, BeamRecord *flash, s32 arg2)")
+    check(beam.index("radius = 30.0f;") < beam.index("radius = s_gevrBeamStyle->radius;")
+          < beam.index("vtx[3].v.tc[1] = image->height << 5;") < beam.index("vtx[2].v.cn[3] = 0;")
+          < beam.index("gSPVertex("), "the beam's radius and colour, and its far end's fade, before it's drawn")
+    render = function(fire, "void gunRenderFirstPersonGunModels(Gfx **gdlptr)")
+    check(render.index("gdl = sub_GAME_7F061E18(gdl, &handptr->weapon_beam, 0);")
+          < render.index("gdl = gevrThrowGuideDraw(gdl, handnum, item);"), "drawn with the hand, after its beam")
+    settings = (ROOT / "port/src/gevr_settings.c").read_bytes().decode()
+    ini = (ROOT / "port/vr/vr_settings.cpp").read_bytes().decode()
+    check('TOGGLE(GEVR_SEC_WEAPONS, "Throw guide", VrThrowGuide,' in settings
+          and 'iniPrintf(f, "ThrowGuide=%d\\n", VrThrowGuide ? 1 : 0);' in ini
+          and 'strcmp(key, "ThrowGuide") == 0' in ini,
+          "the base game's Throw guide: flat and VR, kept in the ini")
+
+
+def speed_placement(view):
+    """setSpeed where the game applies its own speed boost, both ways of moving"""
+    boost = view.index("g_CurrentPlayer->speedforwards *= g_CurrentPlayer->speedboost;")
+    scale = view.index("const f32 k = gevrModMoveScale();", boost)
+    check(scale < boost + 300 and view.index("g_CurrentPlayer->speedsideways *= k;", scale) < scale + 200,
+          "the mod's speed scale beside the game's speed boost, forward and sideways")
+    game = (ROOT / "src/game/gevr_modgame.c").read_bytes().decode()
+    check("gevrModScriptRunning() && gevrModGameLocal() ? s_modMoveScale : 1.0f" in function(game, "f32 gevrModMoveScale(void)"),
+          "only while a mod runs, and only the local player's")
+
+
+def empty_placement(gun, view):
+    """out_of_ammo asked where the game switches an empty gun away, after its own reasons not to"""
+    switch = function(view, "void gevrAutoAdvanceHand(s32 hand)")
+    check(switch.index("item == ITEM_TANKSHELLS") < switch.index("gevrGexMinesHold(hand)")
+          < switch.index("if (gevrModApiOutOfAmmo(hand, item))") < switch.index("gevrCycleHandWeaponInternal(hand, 1, TRUE);\n    }"),
+          "VR: asked after the tank's own switch and the hand's reasons to stay, before the switch")
+    flat = gun.index("if (!gevrModApiOutOfAmmo(hand, var_s1))")
+    check(flat < gun.index("autoadvance_on_deplete_all_ammo();", flat) < flat + 200, "flat: asked before the switch")
 
 
 def reload_placement(gun, view):
@@ -139,6 +258,205 @@ def reload_placement(gun, view):
           "a magazine out opens the reload")
     check("s_gevrGexReloadOpen[hand] = FALSE;   /* a gun drawn" in body(view, "s32 gevrReloadDraw(s32 hand)"),
           "a drawn gun closes the last one's reload")
+
+
+def armour_placement():
+    """armour dropped from the mod API's own records, as the stage's armour; a box's or armour's model loaded first"""
+    game = (ROOT / "src/game/gevr_modgame.c").read_bytes().decode()
+    drop = function(game, "int gevrModGameDrop(int item, int ammo, float armour, int from)")
+    check(drop.index("modelLoad(crate->obj);") < drop.index("objInitWithModelDef((ObjectRecord *)crate")
+          and drop.index("modelLoad(PROP_BODYARMOUR);") < drop.index("objInitWithModelDef((ObjectRecord *)vest"),
+          "a model the stage never placed is loaded before its prop is made")
+    check(drop.index("if (s_modArmour[i].prop == NULL) vest = &s_modArmour[i];") < drop.index("vest->type = PROPDEF_ARMOUR;")
+          < drop.index("vest->obj = PROP_BODYARMOUR;") < drop.index("vest->amount = armour;")
+          < drop.index("chrpropReparent(vest->prop, chr->prop);"),
+          "a free record (no prop), made the stage's armour with the amount, on the chr to fall")
+    slots = function(game, "static s32 runtimeSlot(ObjectRecord *obj, s32 *kind, s32 *slot)")
+    check("*kind = GEVR_MODAPI_PICKUP_ARMOUR;" in slots, "a dropped armour has a runtime id and pickup_removed")
+    api = (ROOT / "port/src/gevr_modapi.c").read_bytes().decode()
+    check("gevrModGameDropsClear();" in function(api, "void gevrModApiPickupClear(void)"),
+          "the pool's records free as a mission loads")
+    obj = (ROOT / "src/game/propobj.c").read_bytes().decode()
+    check("case PROPDEF_ARMOUR:" in function(obj, "bool objIsCollectable(PropDefHeaderRecord *obj)"),
+          "the game collects armour by its type, so a record of the mod API's is taken as the stage's")
+
+
+def pickup_ids(exe, temp):
+    """runtime pickups' ids never given twice in a mission; pickup_removed for one freed untaken, at the next
+    frame in play and only then; a new mission's ids afresh"""
+    lua = r"""
+mod.on("pickup_removed", function(pickup) print("removed", pickup, math.type(pickup)) end)
+mod.on("tick", function() print("tick") end)
+"""
+    play = ("start", "prepare", 9, "begin", 9)
+    out = run(exe, temp, "pickupids", lua, *play,
+              "slotid", 0, 3, "slotid", 0, 3, "slotid", 1, 3,
+              "slotfreed", 0, 3, "slotid", 0, 3,
+              "slotid", 1, 5, "slottaken", 1, 5, "slotfreed", 1, 5,
+              "slotfreed", 0, 9, "slotid", 0, 64, "slotid", 9, 0, "slotid", -1, 0,
+              "frame", "slotfreed", 1, 3, "frame", "frame",
+              "prepare", 10, "begin", 10, "slotid", 0, 3)
+    check(answers(out, "SLOTID") == ["SLOTID 65536", "SLOTID 65536", "SLOTID 65537", "SLOTID 65538", "SLOTID 65539",
+                                     "SLOTID -1", "SLOTID -1", "SLOTID -1", "SLOTID 65536"],
+          "a slot keeps its id until freed, then its next pickup a new one; none past the pools; afresh next mission: "
+          + str(answers(out, "SLOTID")))
+    check(logs(out) == ["removed 65536 integer", "tick", "removed 65537 integer", "tick", "tick"],
+          "freed untaken: told at the next frame before tick; taken, or never named: not told: " + str(logs(out)))
+    out = run(exe, temp, "pickupwait", lua, "start", "prepare", 9, "slotid", 0, 1, "slotfreed", 0, 1,
+              "begin", 9, "slotid", 0, 2, "slotfreed", 0, 2)
+    check(logs(out) == [], "none told outside play, nor before the next frame: " + str(logs(out)))
+    many = []
+    for slot in range(40):
+        many += ["slotid", 0, slot, "slotid", 1, slot]
+    for slot in range(40):
+        many += ["slotfreed", 0, slot, "slotfreed", 1, slot]
+    lua = r"""
+local n = 0
+mod.on("pickup_removed", function() n = n + 1 end)
+mod.on("tick", function() print("count", n) end)
+"""
+    out = run(exe, temp, "pickupmany", lua, *play, *many, "frame", "frame")
+    check(logs(out) == ["count 64", "count 64"] and "mods: 16 pickup_removed dropped: more than 64 in a frame" in out,
+          "at most 64 a frame, the rest logged: " + str(logs(out)))
+    script = (ROOT / "port/src/gevr_modscript.c").read_bytes().decode()
+    frame = function(script, "void gevrModScriptFrame(int ticks)")
+    check(frame.index("gevrModApiPickupFlush();") < frame.index('fire("tick", &a, 1, 0, 0);'), "told before tick")
+    check(script.index("gevrModApiUiClear();    /* and its clicks") < script.index("gevrModApiPickupClear();"),
+          "a mission's load clears the last one's ids")
+
+
+def shared_drops(exe, temp):
+    """drop's shared: the host's id from 0x40000000, sent; a player's refused; the host's drop made on a player's
+    headset from the same chr with that id; the host deciding who takes it; a recycled one gone everywhere"""
+    play = ("start", "prepare", 9, "begin", 9)
+    lua = r"""
+mod.on("mission_start", function()
+  print("solo", mod.pickups.drop({ item = "ak47", from = "player", shared = true }),
+        mod.pickups.drop({ item = "ak47", from = "player" }),
+        (pcall(mod.pickups.drop, { item = "ak47", from = "player", shared = 1 })))
+end)
+"""
+    out = run(exe, temp, "sharedsolo", lua, *play)
+    check(logs(out) == ["solo 1073741824 65536 false"] and not answers(out, "NETSEND"),
+          "solo: a shared id, nothing sent; shared is a boolean: " + str(logs(out)))
+
+    lua = r"""
+mod.on("mission_start", function()
+  print("host", mod.pickups.drop({ item = "ak47", from = 1005, shared = true }),
+        mod.pickups.drop({ armour = 0.5, from = "player", shared = true }),
+        mod.pickups.drop({ ammo = "rifle", from = "player" }),
+        mod.pickups.drop({ item = "ak47", from = "player", shared = true }),
+        (pcall(mod.pickups.drop, { item = "ak47", from = 40000, shared = true })))
+end)
+mod.on("pickup_removed", function(p) print("removed", p) end)
+"""
+    # the host: another player's pickup held back, its own awarded at once and told; two claims for the armour in
+    # one frame (the first wins, the second and a late claim for the gun get gone); a shared gun recycled
+    out = run(exe, temp, "sharedhost", lua, "online", 1, 1, 0, 0, *play,
+              "pickuptry", 0, 1, 0, "pickuptry", 0, 0, 1, "slottaken", 0, 0, "slotfreed", 0, 0, "pickuptry", 1, 0, 1,
+              "netpickup", "tactical", 1, 3, "0900000001000040", "netpickup", "tactical", 3, 3, "0900000001000040",
+              "netpickup", "tactical", 3, 3, "0900000000000040", "frame",
+              "slotfreed", 0, 1, "frame", "slotid", 0, 1)
+    check(logs(out) == ["host 1073741824 1073741825 65536 1073741826 false", "removed 1073741825", "removed 1073741826"],
+          "the host: shared ids, a local one beside them; the armour awarded away and the recycled gun gone here: "
+          + str(logs(out)))
+    check(answers(out, "TRY") == ["TRY 1", "TRY 0", "TRY 0"],
+          "another player's pickup of a shared one held back here; the host's own and a box not: "
+          + str(answers(out, "TRY")))
+    check(answers(out, "NETSEND") == ["NETSEND 2 255 tactical - 12 09 08 00 00 00 00 00 40 ed 03 00 00",
+                                      "NETSEND 2 255 tactical - 12 09 00 00 00 01 00 00 40 ff ff 00 80",
+                                      "NETSEND 2 255 tactical - 12 09 08 00 00 02 00 00 40 ff ff 00 00",
+                                      "NETSEND 4 255 tactical - 8 09 00 00 00 00 00 00 40",
+                                      "NETSEND 4 255 tactical - 8 09 01 00 00 01 00 00 40",
+                                      "NETSEND 5 3 tactical - 8 09 00 00 00 01 00 00 40",
+                                      "NETSEND 5 3 tactical - 8 09 00 00 00 00 00 00 40",
+                                      "NETSEND 5 255 tactical - 8 09 00 00 00 02 00 00 40"],
+          "sent: three drops (the box isn't shared); the gun awarded to the host's player (slot 0) as it walked over "
+          "it; the armour to slot 1's claim; slot 3's claim for it, and its late one for the gun, answered gone; the "
+          "recycled gun gone everywhere: " + str(answers(out, "NETSEND")))
+    check(answers(out, "REMOVE") == ["REMOVE 2 0"] and answers(out, "SLOTID") == ["SLOTID 65537"],
+          "the armour's copy freed here once; the recycled slot's next pickup a new id: "
+          + str(answers(out, "REMOVE", "SLOTID")))
+
+    lua = r"""
+mod.on("mission_start", function()
+  print("client", (pcall(mod.pickups.drop, { item = "ak47", from = "player", shared = true })))
+end)
+mod.on("pickup_removed", function(p) print("removed", p) end)
+"""
+    # a player (slot 2): the host's drops made here; its walk-over claims once (not again within half a second),
+    # another's held back; the gun awarded to it taken through the game's pickup, the armour awarded to slot 3
+    # removed; a shared gun recycled here sent gone; a gone for none, and a claim, ignored
+    out = run(exe, temp, "sharedclient", lua, "online", 1, 0, 0, 2, *play,
+              "netpickup", "tactical", 0, 2, "0908000000000040ffff0000",
+              "netpickup", "tactical", 0, 2, "0708000009000040ffff0000",
+              "netpickup", "tactical", 0, 2, "0908000003000040ffff00",
+              "netpickup", "tactical", 0, 2, "0900000001000040ed030040",
+              "netpickup", "tactical", 0, 2, "0908000002000040ffff0000",
+              "frame",
+              "slotid", 0, 0, "slotid", 2, 0, "slotid", 0, 1,
+              "pickuptry", 0, 0, 1, "pickuptry", 0, 0, 1, "pickuptry", 2, 0, 0,
+              "netpickup", "tactical", 0, 4, "0902000000000040", "netpickup", "tactical", 0, 4, "0903000001000040",
+              "frame", "slotfreed", 0, 1,
+              "netpickup", "tactical", 0, 5, "0900000007000040", "netpickup", "tactical", 0, 3, "0900000002000040",
+              "frame")
+    check(logs(out) == ["client false", "removed 1073741825", "removed 1073741826"],
+          "a player's shared drop refused; the armour another won and the recycled gun removed here: "
+          + str(logs(out)))
+    check(answers(out, "DROP") == ["DROP 8 0 0.00 -16", "DROP 0 0 0.25 1005", "DROP 8 0 0.00 -16"],
+          "the host's drops made here at the next frame, from the host's player (slot 0) and the guard; another "
+          "mission's and a short one not: " + str(answers(out, "DROP")))
+    check(answers(out, "SLOTID") == ["SLOTID 1073741824", "SLOTID 1073741825", "SLOTID 1073741826"],
+          "bound to the host's ids: " + str(answers(out, "SLOTID")))
+    check(answers(out, "TRY") == ["TRY 1", "TRY 1", "TRY 1"]
+          and answers(out, "NETSEND") == ["NETSEND 3 0 tactical - 8 09 00 00 00 00 00 00 40",
+                                          "NETSEND 5 255 tactical - 8 09 00 00 00 02 00 00 40"],
+          "held back for the host: one claim to it; the recycled gun sent gone: "
+          + str(answers(out, "TRY", "NETSEND")))
+    check(answers(out, "GRANTED") == ["GRANTED 0 0 0"] and answers(out, "REMOVE") == ["REMOVE 2 0"],
+          "the award taken through the game's own pickup, not held back; another's award removes the copy: "
+          + str(answers(out, "GRANTED", "REMOVE")))
+    game = (ROOT / "src/game/gevr_modgame.c").read_bytes().decode()
+    grant = function(game, "int gevrModGamePickupGrant(int kind, int slot)")
+    check(grant.index("set_cur_player(localSlot());") < grant.index("op = propPickupByPlayer(prop, TRUE);")
+          < grant.index("propExecuteTickOperation(prop, op);") < grant.index("set_cur_player(was);"),
+          "an award taken by the game's own pickup, as the local player, as AI_BondCollectObject takes one")
+    obj = (ROOT / "src/game/propobj.c").read_bytes().decode().replace("\r\n", "\n")
+    pick = obj[obj.index("TICKOP propPickupByPlayer(PropRecord *prop, bool showstring)"):]
+    check(pick.index("if (g_CurrentPlayer->bonddead || g_ClockTimer == 0)") < pick.index("if (gevrModPickupHold(prop))")
+          < pick.index("switch (obj->type)"), "held back before the pickup changes anything")
+
+def drops_placement():
+    """weapon_dropped at the game's drop; a mod's drop through the game's own; ids as co-op numbers them"""
+    obj = (ROOT / "src/game/propobj.c").read_bytes().decode().replace("\r\n", "\n")
+    setdropped = function(obj, "void propobjSetDropped(PropRecord *prop, DROPTYPE droptype)")
+    check(setdropped.index("gevrModWeaponDropped(prop);") < setdropped.index("sub_GAME_7F03FDA8(prop);"),
+          "weapon_dropped as a held weapon is set to fall, still in its chr's hand")
+    game = (ROOT / "src/game/gevr_modgame.c").read_bytes().decode()
+    ids = function(game, "static int pickupId(ObjectRecord *target)")
+    check(ids.index("if (runtimeSlot(target, &kind, &slot)) return gevrModApiPickupSlotId(kind, slot);")
+          < ids.index("sizepropdef(def)"),
+          "a runtime pickup's id from the mod API's table, the stage's own by its setup index")
+    slots = function(game, "static s32 runtimeSlot(ObjectRecord *obj, s32 *kind, s32 *slot)")
+    check("sizeof(WeaponObjRecord) * MAX_WEAPON_SLOTS" in slots and "sizeof(AmmoCrateRecord) * MAX_AMMO_CRATES" in slots,
+          "the game's two runtime pools")
+    taken = function(game, "void gevrModPickupTaken(")
+    check(taken.index("got.pickup = pickupId((ObjectRecord *)rec);") < taken.index("gevrModApiPickupSlotTaken(pool, slot);"),
+          "item_pickup carries the pickup's id, and a runtime one is marked taken before it's freed")
+    check("gevrModApiPickupSlotFreed(kind, slot);" in function(game, "void gevrModPickupFreed(ObjectRecord *obj)"),
+          "a freed runtime pickup's id goes")
+    free = function(obj, "void objFree(ObjectRecord* obj, s32 freeprop, s32 canregen)")
+    check(free.index("gevrModPickupFreed(obj);") < free.index("if (obj->type == PROPDEF_AUTOGUN)"),
+          "every free of an object asks first, while it's whole")
+    drop = function(game, "int gevrModGameDrop(int item, int ammo, float armour, int from)")
+    check(drop.index("s_modDropping = TRUE;") < drop.index("something_with_generating_object(chr, propid, (ITEM_IDS)item, 0x20000000")
+          < drop.index("ammocrateAllocate()") < drop.index("chrpropReparent(crate->prop, chr->prop);")
+          < drop.index("vest->type = PROPDEF_ARMOUR;")
+          < drop.index("propobjSetDropped(prop, DROPTYPE_DEFAULT);") < drop.index("objDrop(prop);")
+          < drop.index("s_modDropping = FALSE;"),
+          "a mod's drop: drop_inventory's gun, a shot crate's box, then the game's fall; no weapon_dropped for it")
+    check("if (s_modDropping" in function(game, "void gevrModWeaponDropped(PropRecord *prop)"),
+          "a mod's own drop isn't told back to it")
 
 
 def items_placement():
@@ -255,13 +573,45 @@ mod.on("pickup_spawning", function(p) print("third", p.index) end)
               "%s answered %s: refused (%s), the mod stopped, the pickups the level's: %s" % (kind, answer, why, out[-700:]))
 
     # ---- item_pickup: what the local player took ----
-    lua = 'mod.on("item_pickup", function(kind, id, rounds) print("took", kind, id, rounds) end)'
+    lua = 'mod.on("item_pickup", function(kind, id, rounds, pickup) print("took", kind, id, rounds, pickup) end)'
     out = run(exe, temp, "took", lua, "start", "prepare", 9, "took", "weapon", 8, "begin", 9, "took", "weapon", 8,
               "took", "ammo", 3, 10, "took", "crate", "3:20,4:5", "took", "armour", 0.5, "took", "key", "took", "object",
               "local", 0, "took", "weapon", 4)
-    check(logs(out) == ["took weapon 8 nil", "took ammo 3 10", "took ammo 3 20", "took ammo 4 5", "took armour 0.5 nil",
-                        "took key nil nil", "took object nil nil"],
+    check(logs(out) == ["took weapon 8 nil 77", "took ammo 3 10 77", "took ammo 3 20 77", "took ammo 4 5 77",
+                        "took armour 0.5 nil 77", "took key nil nil 77", "took object nil nil 77"],
           "item_pickup in play, a crate as its types, never a copy's or a bot's: " + str(logs(out)))
+
+    # ---- mod.pickups.drop and weapon_dropped ----
+    lua = r"""
+mod.on("mission_start", function()
+  local bad = 0
+  local function try(t) if not pcall(mod.pickups.drop, t) then bad = bad + 1 end end
+  try({ from = "player" })
+  try({ item = "ak47", ammo = "rifle", from = "player" })
+  try({ item = "watchlaser", from = "player" })
+  try({ item = "ak47" })
+  try({ item = "ak47", from = "guard" })
+  try({ item = "ak47", from = -3 })
+  try({ ammo = 99, from = "player" })
+  try({ armour = 0, from = "player" })
+  try({ armour = 1.5, from = "player" })
+  try({ armour = "full", from = "player" })
+  try({ armour = 0.5, ammo = "rifle", from = "player" })
+  print("bad", bad)
+  print("drops", mod.pickups.drop({ item = "ak47", from = "player" }), mod.pickups.drop({ ammo = "rifle", from = 1005 }),
+        mod.pickups.drop({ item = 8, from = 999 }), mod.pickups.drop({ armour = 0.5, from = 1005 }))
+end)
+mod.on("weapon_dropped", function(pickup, item, from) print("dropped", pickup, item, from) end)
+"""
+    out = run(exe, temp, "drop", lua, "start", "prepare", 9, "dropped", 32770, 8, 1005, "begin", 9,
+              "dropped", 32770, 8, 1005, "dropped", -1, 4, -1, "dropped", 5, 26, -2)
+    check(logs(out) == ["bad 11", "drops 65536 65537 nil 65538", "dropped 32770 8 1005", "dropped nil 4 player",
+                        "dropped 5 26 nil"],
+          "drop's answers and refusals; weapon_dropped's id, item and who (a guard, a player, none), in play: "
+          + str(logs(out)))
+    check(answers(out, "DROP") == ["DROP 8 0 0.00 -1", "DROP 0 3 0.00 1005", "DROP 8 0 0.00 999", "DROP 0 0 0.50 1005"],
+          "the game side: a gun from the player, a rifle box from a guard, none from a guard that isn't, half armour: "
+          + str(answers(out, "DROP")))
 
     # ---- mod.inventory and mod.ammo ----
     lua = r"""
@@ -667,6 +1017,91 @@ def guards2_placement():
     check("isBGAIListID(id)" in function(game, "int gevrModGameAiListOk("), "a level script's list isn't a guard's")
 
 
+def pads_placement():
+    """goTo and face on the AI's own commands, where the guards run, for a living guard and a pad"""
+    game = (ROOT / "src/game/gevr_modgame.c").read_bytes().decode()
+    goto = function(game, "int gevrModGameGoTo(int id, int pad, int speed)")
+    face = function(game, "int gevrModGameFace(int id, int pad)")
+    for name, text in (("goTo", goto), ("face", face)):
+        check("!gevrModGameRunsGuards() || chr == NULL || guardDying(chr) || !padOk(pad)" in text,
+              name + ": where the guards run, a living guard, a pad the setup has")
+    check("chrGoToPad(chr, pad, speed == 2 ? SPEED_SPRINT : speed == 1 ? SPEED_RUN : SPEED_WALK)" in goto,
+          "goTo: chrGoToPad at the speed asked")
+    check("check_set_actor_standing_still(chr, TARGET_PAD, pad)" in face, "face: as AI_TRYFacingTarget at a pad")
+    hat = function(game, "int gevrModGameGiveHat(int id, int hat)")
+    check("chr->handle_positiondata_hat != NULL" in hat and "hatCreateForChr(chr, PROP_HATFURRY + hat, 0)" in hat
+          and "!gevrModGameRunsGuards()" in hat, "giveHat: as AI_TRYGiveMeHat, one hat a guard, where the guards run")
+    pad = function(game, "int gevrModGamePad(int pad, GevrModPad *out)")
+    check("if (!padOk(pad)) return 0;" in pad and "g_CurrentSetup.boundpads[pad - 10000]" in pad
+          and "p->stan != NULL ? p->stan->room : -1" in pad, "a pad by id, bound pads from 10000, its tile's room")
+
+
+def mission(exe, temp):
+    """mod.mission's difficulty, folder and day"""
+    lua = 'mod.on("mission_start", function() print("mission", mod.mission.difficulty(), mod.mission.folder(), mod.mission.day()) end)'
+    before = int(time.time() // 86400)
+    out = run(exe, temp, "mission", lua, "start", "prepare", 9, "begin", 9)
+    after = int(time.time() // 86400)
+    got = logs(out)
+    check(len(got) == 1 and got[0].split()[:3] == ["mission", "00agent", "4"]
+          and before <= int(got[0].split()[3]) <= after, "difficulty's name, the folder from 1, today's number: " + str(got))
+    lua = r"""
+mod.on("mission_start", function()
+  local bad = 0
+  for _, a in ipairs({ { 0, "agent" }, { 21, "agent" }, { 1, "hard" }, { 1, "agent", -5 }, { 1.5, "agent" },
+                       { 1, "agent", 99999999 } }) do
+    if not pcall(mod.mission.complete, a[1], a[2], a[3]) then bad = bad + 1 end
+  end
+  print("complete", bad, mod.mission.complete(1, "agent"), mod.mission.complete(20, "007", 300))
+end)
+"""
+    out = run(exe, temp, "complete", lua, "start", "prepare", 9, "begin", 9)
+    check(logs(out) == ["complete 6 true true"] and answers(out, "COMPLETE") == ["COMPLETE 0 0 0", "COMPLETE 19 3 300"],
+          "complete: 6 refused; Dam at Agent with no time, Egypt at 007 in 300 s: " + str(logs(out)) + str(answers(out, "COMPLETE")))
+    out = run(exe, temp, "completebase", lua, "campaign", 0, "start", "prepare", 9, "begin", 9)
+    check(logs(out) == ["complete 6 false false"], "outside a mod campaign: false: " + str(logs(out)))
+    game = (ROOT / "src/game/gevr_modgame.c").read_bytes().decode()
+    done = function(game, "int gevrModGameComplete(int mission, int difficulty, int seconds)")
+    check(done.index("gevrModActive() == NULL") < done.index("fileUnlockStageInFolderAtDifficulty(selected_folder_num"),
+          "the save is written only in a mod campaign (its own file), through the game's own unlock")
+    check("selected_difficulty <= DIFFICULTY_007" in function(game, "int gevrModGameDifficulty(void)")
+          and "selected_folder_num < 4" in function(game, "int gevrModGameFolder(void)"),
+          "the game's own chosen difficulty and folder, none outside their ranges")
+
+
+def pads(exe, temp):
+    """mod.pads' counts and reads; mod.guards.goTo and face"""
+    lua = r"""
+mod.on("mission_start", function()
+  local n, bound = mod.pads.count()
+  print("count", n, bound)
+  local p = mod.pads.get(2)
+  print("pad", p.x, p.y, p.z, p.room, p.look[3])
+  local b = mod.pads.get(10000)
+  print("bound", b.x, b.room, mod.pads.get(3), mod.pads.get(-1))
+  print("goto", mod.guards.goTo(5000, 1), mod.guards.goTo(5000, 10000, "sprint"), mod.guards.goTo(5000, 7, "run"),
+        mod.guards.goTo(99, 1))
+  print("face", mod.guards.face(5000, 2), mod.guards.face(99, 2))
+  print("badspeed", (pcall(mod.guards.goTo, 5000, 1, "crawl")))
+  print("hat", mod.guards.giveHat(5000, "helmet"), mod.guards.giveHat(99, "peaked"),
+        (pcall(mod.guards.giveHat, 5000, "crown")))
+end)
+"""
+    out = run(exe, temp, "pads", lua, "addguard", 5000, 2, 47, 1, 8, -1, 75, 100, 0, 0, 0, "start", "prepare", 9,
+              "begin", 9)
+    check(logs(out) == ["count 3 1", "pad 200.0 0.0 -20.0 7 1.0", "bound 999.0 nil nil nil",
+                        "goto true true false false", "face true false", "badspeed false", "hat true false false"],
+          "pads read; goTo and face answered: " + str(logs(out)))
+    check(answers(out, "GOTO", "FACE", "HAT") == ["GOTO 5000 1 0", "GOTO 5000 10000 2", "GOTO 5000 7 1", "GOTO 99 1 0",
+                                                 "FACE 5000 2", "FACE 99 2", "HAT 5000 5", "HAT 99 11"],
+          "the game side: walk, sprint, run; face: " + str(answers(out, "GOTO", "FACE")))
+    out = run(exe, temp, "padsclient", lua, "addguard", 5000, 2, 47, 1, 8, -1, 75, 100, 0, 0, 0, "runs", 0,
+              "start", "prepare", 9, "begin", 9)
+    check("goto false false false false" in logs(out) and "face false false" in logs(out)
+          and "hat false false false" in logs(out) and not answers(out, "GOTO", "FACE", "HAT"),
+          "a co-op client sends no guard anywhere, and hats none: " + str(logs(out)))
+
+
 def guards2(exe, temp):
     play = ("start", "prepare", 9, "begin", 9)
     lua = r"""
@@ -1041,6 +1476,351 @@ end)
     check(scopes[:2] == ["SCOPE 0 0 0", "SCOPE 1 0 0"], "a mission's reset gives both hands the game's own: " + str(scopes))
 
 
+def gunmodel_placement():
+    """A hand's gun loads the mod's file in GoldenEye X's place; ob.c names it; the fits are the original's"""
+    gun = (ROOT / "src/game/gun.c").read_bytes().decode()
+    load = function(gun, "void used_to_load_1st_person_model_on_demand(GUNHAND hand)")
+    check(load.index("gevrModGunReconcile(hand);") < load.index("item             = g_CurrentPlayer->field_2A44[hand];"),
+          "each tick a hand showing another model than its choice loads again, before the load")
+    regular = load[load.rindex("texInitPool(", 0, load.index("gevrModTried = gevrModGunModelFor(hand, item);")):]
+    check(regular.index("gevrModAssetPendingName = packModel == 0 ? gevrModTried : NULL;") < regular.index("if (gevrModTried == NULL)")
+          < regular.index("gevrGexGunPrepare(") < regular.index("load_object_fill_header(")
+          < regular.index("gevrModUsed = gevrMesh != NULL || (gevrModTried != NULL && gevrModAssetPendingUsed);")
+          < regular.index("gevrModAssetPendingName = NULL;"),
+          "the regular gun's load: the mod's file named around it, GoldenEye X's only without one")
+    check(load.count("gevrModAssetPendingName = packModel == 0 ? gevrModTried : NULL;") == 1, "only the regular gun's load (not the watch's or the suit's)")
+    tail = load[load.index("g_CurrentPlayer->hand_item[hand]      = item;"):]
+    check("s_gevrModGunShown[p][hand].owner = g_CurrentPlayer;" in tail and "gevrModTried != NULL ? gevrModTried" in tail,
+          "what the hand shows: the name tried, so a broken file isn't tried each tick")
+    reconcile = function(gun, "static void gevrModGunReconcile(s32 hand)")
+    check("hand_invisible[hand] < 0" in reconcile and "lock_hand_model[hand]" in reconcile
+          and "hand_invisible[hand] = -3;" in reconcile, "a reload only of a hand held as it is, as the club's replacement")
+    for name in ("void gevrModGunModelSet(", "void gevrModGunModelReset(void)"):
+        check("g_CurrentPlayer" not in function(gun, name), name + " is only the table: no player that may be gone")
+    check("(netIsActive() && get_cur_playernum() != netGetLocalSlot())" in function(gun, "static const char *gevrModGunModelFor("),
+          "the local human's hands only")
+    ob = (ROOT / "src/game/ob.c").read_bytes().decode()
+    check("gevrModAssetPendingName != NULL ? gevrModAssetPendingName : srcfile->filename" in ob
+          and "gevrModAssetPendingUsed = converted != 0 && gevrModAssetPendingName != NULL;" in ob,
+          "load_resource takes the hand's file's name, and says whether it loaded")
+    view = (ROOT / "src/game/bondview2.c").read_bytes().decode()
+    check("gevrBeanIsEnabled() && !gevrModGunHeld(hand) ? 2 : 0" in function(view, "int gevrFitLook(int hand)"),
+          "a mod's model takes the original models' fits")
+    api = (ROOT / "port/src/gevr_modapi.c").read_bytes().decode()
+    check("gevrModGameGunModelReset();" in function(api, "void gevrModApiReset(void)"), "a reset gives the hands' own back")
+
+
+def gunmodel(exe, temp):
+    """mod.weapon.model: set, missing, cleared, refused; reset; look's "mod\""""
+    play = ("start", "prepare", 9, "begin", 9)
+    lua = r"""
+mod.on("mission_start", function()
+  local bad = 0
+  local function try(...) if not pcall(mod.weapon.model, ...) then bad = bad + 1 end end
+  try("right", "ak47", "")
+  try("right", "ak47", "a/b")
+  try("right", "ak47", string.rep("a", 64))
+  try("right", "fist", "GtacZ")
+  try("right", "watchlaser", "GtacZ")
+  try("middle", "ak47", "GtacZ")
+  try("right", "nothing", "GtacZ")
+  print("bad", bad)
+  print("set", mod.weapon.model("right", "ak47", "GtacAk74Z"))
+  print("missing", mod.weapon.model("left", 8, "GnoneZ"))
+  print("clear", mod.weapon.model("right", "ak47"))
+  print("look", mod.weapon.look("left"))
+end)
+"""
+    out = run(exe, temp, "gunmodel", lua, "start", "prepare", 9, "look", 1, 3, "begin", 9)
+    check(logs(out) == ["bad 7", "set true", "missing false", "clear true", "look mod"],
+          "model's answers and refusals; look's mod: " + str(logs(out)))
+    check(answers(out, "GUNMODEL") == ["GUNMODEL reset", "GUNMODEL 0 8 GtacAk74Z", "GUNMODEL 1 8 GnoneZ", "GUNMODEL 0 8 -"],
+          "the game side: a mission's reset, then each call: " + str(answers(out, "GUNMODEL")))
+
+def gunmodel_fit(exe, temp):
+    """A fitted body keeps the same affine rows as an attachment and requires a mesh."""
+    lua = r"""
+mod.on("mission_start", function()
+  local frame = {{-1,0,0},{0,0,1},{0,1,0},{4,12,-8}}
+  print("fit", mod.weapon.model("right", "ak47", "pack-body.bin", {frame=frame}))
+  print("legacy", mod.weapon.model("left", "ak47", "GtacAk74Z", {frame=frame}))
+  print("clear with fit", (pcall(mod.weapon.model, "right", "ak47", nil, {frame=frame})))
+  print("wrong shape", (pcall(mod.weapon.model, "right", "ak47", "pack-body.bin", {frame={{0,0,0}}})))
+  print("unfitted", mod.weapon.model("right", "ak47", "pack-body.bin"))
+end)
+"""
+    out = run(exe, temp, "gunmodel_fit", lua, "start", "prepare", 9, "begin", 9)
+    check(logs(out) == ["fit true", "legacy false", "clear with fit false", "wrong shape false", "unfitted true"],
+          "fitted gun model results: " + str(logs(out)))
+    check(answers(out, "GUNFRAME") == ["GUNFRAME 0 -1.0 1.0 1.0 12.0 1.0", "GUNFRAME 1 -1.0 1.0 1.0 12.0 1.0"],
+          "only well-formed fit requests reach the game with the authored frame: " + str(answers(out, "GUNFRAME")))
+
+
+def pack_names(exe, temp):
+    """The Lua binding forwards flat pack filenames and an omitted legacy header."""
+    lua = r"""
+mod.on("mission_start", function()
+  print("held", mod.weapon.model("right", "ak47", "pack-body.bin"))
+  print("attached", mod.attach.add({ model = "pack-part.bin", on = "gun", hand = "right" }))
+  print("legacy", mod.attach.add({ model = "legacy.bin", on = "gun", hand = "right" }))
+  print("header", mod.attach.add({ model = "legacy.bin", like = "PcartonZ", on = "gun", hand = "right" }))
+  local ok = pcall(mod.attach.add, { model = "part/pack-part.bin", on = "gun", hand = "right" })
+  print("nested", ok)
+end)
+"""
+    out = run(exe, temp, "packnames", lua, "start", "prepare", 9, "begin", 9)
+    check(logs(out) == ["held true", "attached 1", "legacy nil", "header 2", "nested false"],
+          "flat .bin and hyphenated names, with and without a cartridge header: " + str(logs(out)))
+
+
+def attach_placement():
+    """Each attachment drawn at its anchor as drawn: the gun's root after the gun, the hands and body with the body"""
+    gun = (ROOT / "src/game/gunfire.c").read_bytes().decode()
+    draw = gun.index("subdraw(&renderdata, &handptr->weaponModel);")
+    att = gun.index("renderdata.gdl = gevrModAttachDrawGun(renderdata.gdl, &renderdata, handnum, &handptr->weaponModel);")
+    check(draw < gun.index("renderdata.gdl = gevrBeanMagDraw(renderdata.gdl, &renderdata, handnum);") < att
+          < gun.index("gdl = renderdata.gdl;", att) < gun.index("VR_CULL_MIRROR_END", att),
+          "the gun's after the gun and its own extras, before the mirrored left gun's culling ends")
+    body = (ROOT / "src/game/gevr_bodyslots.c").read_bytes().decode()
+    slots = function(body, "Gfx *gevrBodySlotsDraw(Gfx *gdl)")
+    check(slots.index("gdl = gevrModAttachDrawBody(gdl);") < slots.index("if (!s_bodyLive || !s_bodyFrameValid || !VrBodySlotShow"),
+          "the hands' and the body's before the body slots' own early return (with body slots off too)")
+    frame = function(body, "s32 gevrBodySlotFrame(s32 slot, Mtxf *root)")
+    view = (ROOT / "src/game/bondview2.c").read_bytes().decode()
+    hand = function(view, "s32 gevrModAttachHandFrame(s32 hand, Mtxf *root)")
+    for name, text in (("the body's", frame), ("a hand's", hand)):
+        check("k = 0.085f * D_800364CC * gevrGunSizeNow(&setting, &online);" in text,
+              name + " frame at a gun model's units and the player's gun size")
+    check("!s_bodyFrameValid" in frame and "gevrGripAxesRaw(hand == GUNRIGHT ? 1 : 0" in hand,
+          "frames only while kept: the torso's, the controller's raw grip")
+    mine = (ROOT / "src/game/gevr_modattach.c").read_bytes().decode()
+    load = function(mine, "static AttachFile *attachLoad(const char *model, const char *like)")
+    check(load.index("gevrModAssetPendingName = model;") < load.index("load_object_fill_header(")
+          < load.index("used = gevrModAssetPendingUsed;") < load.index("gevrModAssetPendingName = NULL;")
+          < load.index("if (!used)"), "a model loads under its own name, and the cartridge's in its place is refused")
+    one = function(mine, "static Gfx *attachDraw(")
+    check(one.index("matrix_4x4_multiply(anchor, &a->offset, &pose);") < one.index("mtx[i] = pose;")
+          < one.index("if (a->file->rigid)") < one.index("instcalcmatrices(&rd, &a->model);")
+          < one.index("subdraw(&rd, &a->model);"),
+          "laid in the anchor's frame: a prop file's nodes from there, an animated one's every matrix the pose")
+    check("(node->Opcode & 0xff) == MODELNODE_OPCODE_GROUP" in function(mine, "static s32 attachHasJoints(")
+          and "f->rigid = attachHasJoints(f->header.RootNode);" in load,
+          "a model with joints only an animation poses is found as it loads")
+    drawgun = function(mine, "Gfx *gevrModAttachDrawGun(")
+    check("node = ((Mtxf *) gun->render_pos)[a->node];" in drawgun and "a->node < gun->obj->numMatrices" in drawgun
+          and "attachLocal()" in drawgun, "the gun model's matrix it rides as drawn, none past the model's; local")
+    drawbody = function(mine, "Gfx *gevrModAttachDrawBody(Gfx *gdl)")
+    check("g_gevrExtraPass" in drawbody and "0x565F0000 | (u32) (a->on == GEVR_MODATTACH_HAND ? (a->where == GUNRIGHT ? 2 : 1) : 3)" in drawbody
+          and drawbody.count("matrix_4x4_7F058C64();") == 1,
+          "a hand's follows its controller between frames, the body's the body; bracketed as the body slots' guns")
+    check("g_CurrentPlayer" not in function(mine, "void gevrModGameAttachReset(void)"), "the reset is only tables")
+    api = (ROOT / "port/src/gevr_modapi.c").read_bytes().decode()
+    check("gevrModGameAttachReset();" in function(api, "void gevrModApiReset(void)"), "a reset detaches everything")
+
+
+def attach_loadout(exe, temp):
+    """mod.attach at a measured loadout's size (#291) with no pack's files: two rifles of 14 parts (17 files
+    between them), five magazines, a sheath and a scabbard; twice over for a second rig; then the limits"""
+    lua = r"""
+mod.on("mission_start", function()
+  local function rifle(on, hand, finish, extra)
+    local parts = { "PlBaseZ", finish }
+    for i = 1, 9 do parts[#parts + 1] = "PlPart" .. i .. "Z" end
+    for _, p in ipairs(extra) do parts[#parts + 1] = p end
+    local got = 0
+    for _, p in ipairs(parts) do
+      if mod.attach.add({ model = p, like = "PcartonZ", on = on, hand = hand }) then got = got + 1 end
+    end
+    return got
+  end
+  local function rig()
+    local got = rifle("gun", "right", "PlFinishAZ", { "PlRailZ", "PlSightZ", "PlMagZ" })
+      + rifle("back_gun", nil, "PlFinishBZ", { "PlCanZ", "PlSightBZ", "PlMagZ" })
+    for _, on in ipairs({ "chest", "chest", "belt", "hip_off", "hip_off" }) do
+      if mod.attach.add({ model = on == "hip_off" and "PlPistolMagZ" or "PlMagZ", like = "PcartonZ", on = on }) then
+        got = got + 1
+      end
+    end
+    for _, m in ipairs({ "PlSheathZ", "PlScabbardZ" }) do
+      if mod.attach.add({ model = m, like = "PcartonZ", on = "back_off" }) then got = got + 1 end
+    end
+    return got
+  end
+  print("rig", rig(), rig())
+  local more = 0
+  for i = 1, 60 do
+    if mod.attach.add({ model = "PlMagZ", like = "PcartonZ", on = "belt" }) then more = more + 1 end
+  end
+  print("full", more, mod.attach.add({ model = "PlMagZ", like = "PcartonZ", on = "belt" }))
+end)
+"""
+    out = run(exe, temp, "attachloadout", lua, "start", "prepare", 9, "begin", 9)
+    check(logs(out) == ["rig 35 35", "full 58 nil"],
+          "a rig of 35 twice (70 attached, 20 files), then up to 128 attached and none past: " + str(logs(out)))
+    lua = r"""
+mod.on("mission_start", function()
+  local files = 0
+  for i = 1, 64 do
+    if mod.attach.add({ model = "PlFile" .. i .. "Z", like = "PcartonZ", on = "belt" }) then files = files + 1 end
+  end
+  print("files", files, mod.attach.add({ model = "PlFile65Z", like = "PcartonZ", on = "belt" }),
+        mod.attach.add({ model = "PlFile1Z", like = "PcartonZ", on = "chest" }))
+end)
+"""
+    out = run(exe, temp, "attachfiles", lua, "start", "prepare", 9, "begin", 9)
+    check(logs(out) == ["files 64 nil 65"], "64 model files a mission, none past; a loaded one again: " + str(logs(out)))
+    mine = (ROOT / "src/game/gevr_modattach.c").read_bytes().decode()
+    one = function(mine, "static Gfx *attachDraw(")
+    check(one.index("if (!gevrDynRoom(gdl, a->file->nodes * 8 + 64, h->numMatrices * (s32) sizeof(Mtxf) + 0x400))")
+          < one.index("mtx = dynAllocate(h->numMatrices * sizeof(Mtxf));") and "return gdl;" in one,
+          "an attachment without room left this frame is skipped before anything's allocated")
+    dyn = (ROOT / "src/game/dyn.c").read_bytes().decode()
+    room = function(dyn, "s32 gevrDynRoom(Gfx *gdl, s32 gfx, s32 bytes)")
+    check("(end - pos) / sizeof(Gfx) < (uintptr_t)gfx" in room and "vtxEnd - vtx >= (uintptr_t)bytes" in room,
+          "the room: the master list's commands after gdl and dynAllocate's bytes")
+
+
+def attach_authored_frame(exe, temp):
+    """An authored mirrored frame survives both placement calls with the node intact."""
+    lua = r"""
+mod.on("mission_start", function()
+  local frame = {{0, 0, 2}, {0, 1, 0}, {1, 0, 0}, {9, 11, 13}}
+  local id = assert(mod.attach.add{on="gun", hand="right", node=7, model="pack-part.bin", frame=frame})
+  frame[4] = {-2, -3, -5}
+  assert(mod.attach.place(id, {frame=frame}))
+  local invalid = {
+    {frame=frame, at={0, 0, 0}}, {frame=frame, turn={0, 0, 0}}, {frame=frame, scale=1},
+    {frame={{1,0,0},{1,0,0},{0,0,1},{0,0,0}}},
+    {frame={{1,0,0},{0,1,0},{0,0,1},{0,0,4001}}},
+    {frame={{0/0,0,0},{0,1,0},{0,0,1},{0,0,0}}},
+    {frame={{1,0,0},{0,1},{0,0,1},{0,0,0}}},
+  }
+  for _, placement in ipairs(invalid) do assert(not pcall(mod.attach.place, id, placement)) end
+  mod.log("authored frame accepted; invalid frames rejected")
+end)
+"""
+    out = run(exe, temp, "attach_authored_frame", lua, "start", "prepare", 9, "begin", 9)
+    check("authored frame accepted; invalid frames rejected" in logs(out), "authored frame validation: " + out)
+    check(answers(out, "ATTACH 1", "ATTACHPLACE") == [
+          "ATTACH 1 0 0 7 pack-part.bin  |0 0 2 0 |0 1 0 0 |1 0 0 0 |9 11 13 1",
+          "ATTACHPLACE 1 |0 0 2 0 |0 1 0 0 |1 0 0 0 |-2 -3 -5 1"],
+          "authored and moved frames reach the game unchanged: " + str(answers(out, "ATTACH")))
+
+
+def attach(exe, temp):
+    """mod.attach: add on the gun, a hand and the body; the offset; refusals; show and remove, the owner's only"""
+    play = ("start", "prepare", 9, "begin", 9)
+    lua = r"""
+mod.on("mission_start", function()
+  local bad = 0
+  local function try(t) if not pcall(mod.attach.add, t) then bad = bad + 1 end end
+  try({ like = "Gak47Z", on = "gun", hand = "right" })
+  try({ model = "GtacAcogZ", like = false, on = "gun", hand = "right" })
+  try({ model = "a/b", like = "Gak47Z", on = "gun", hand = "right" })
+  try({ model = "GtacAcogZ", like = "Gak47Z", on = "elbow" })
+  try({ model = "GtacAcogZ", like = "Gak47Z", on = "gun" })
+  try({ model = "GtacAcogZ", like = "Gak47Z", on = "hand", hand = "middle" })
+  try({ model = "GtacAcogZ", like = "Gak47Z", on = "chest", at = { 1, 2 } })
+  try({ model = "GtacAcogZ", like = "Gak47Z", on = "chest", at = { 1, 2, 4001 } })
+  try({ model = "GtacAcogZ", like = "Gak47Z", on = "chest", turn = { 0, 0, 361 } })
+  try({ model = "GtacAcogZ", like = "Gak47Z", on = "chest", scale = 0 })
+  try({ model = "GtacAcogZ", like = "Gak47Z", on = "chest", scale = 101 })
+  try("x")
+  try({ model = "GtacAcogZ", like = "Gak47Z", on = "hip_gun", node = 1 })
+  try({ model = "GtacAcogZ", like = "Gak47Z", on = "gun", hand = "right", node = 256 })
+  try({ model = "GtacAcogZ", like = "Gak47Z", on = "gun", hand = "right", node = 1.5 })
+  print("bad", bad)
+  local optic = mod.attach.add({ model = "GtacAcogZ", like = "Gak47Z", on = "gun", hand = "right", at = { 0, 90, -20 } })
+  local mag = mod.attach.add({ model = "GtacMagZ", like = "PcartonZ", on = "hand", hand = "left", turn = { 0, 90, 0 }, scale = 2 })
+  local sheath = mod.attach.add({ model = "GtacSheathZ", like = "GknifeZ", on = "hip_off", turn = { 90, 0, 0 } })
+  print("ids", optic, mag, sheath)
+  print("missing", mod.attach.add({ model = "GnoneZ", like = "Gak47Z", on = "belt" }))
+  print("slide", mod.attach.add({ model = "GtacSlideZ", like = "PcartonZ", on = "gun", hand = "left", node = 3 }))
+  print("place", mod.attach.place(optic, { at = { 0, 0, 10 } }), mod.attach.place(99, {}))
+  print("badplace", (pcall(mod.attach.place, optic, { turn = { 0, 0, 400 } })))
+  print("show", mod.attach.show(mag, false), mod.attach.show(99, true))
+  print("remove", mod.attach.remove(sheath), mod.attach.remove(sheath))
+end)
+"""
+    out = run(exe, temp, "attach", lua, *play)
+    check(logs(out) == ["bad 15", "ids 1 2 3", "missing nil", "slide 4", "place true false", "badplace false",
+                        "show true false", "remove true false"],
+          "attach's answers and refusals: " + str(logs(out)))
+    check(answers(out, "ATTACH", "DETACH") == [
+        "ATTACH reset",
+        "ATTACH 1 0 0 0 GtacAcogZ Gak47Z |1 0 0 0 |0 1 0 0 |0 0 1 0 |0 90 -20 1",
+        "ATTACH 2 1 1 0 GtacMagZ PcartonZ |0 0 -2 0 |0 2 0 0 |2 0 0 0 |0 0 0 1",
+        "ATTACH 3 2 1 0 GtacSheathZ GknifeZ |1 0 0 0 |0 0 1 0 |0 -1 0 0 |0 0 0 1",
+        "ATTACH 0 2 5 0 GnoneZ Gak47Z |1 0 0 0 |0 1 0 0 |0 0 1 0 |0 0 0 1",
+        "ATTACH 4 0 1 3 GtacSlideZ PcartonZ |1 0 0 0 |0 1 0 0 |0 0 1 0 |0 0 0 1",
+        "ATTACHPLACE 1 |1 0 0 0 |0 1 0 0 |0 0 1 0 |0 0 10 1",
+        "ATTACHSHOW 2 0",
+        "DETACH 3"],
+        "the game side: on the gun, the left hand, the off hip, a gun model's node; turned about Y (X to -Z) and X "
+        "(Y to Z), scaled; a model that won't load; placed again; show and remove once: "
+        + str(answers(out, "ATTACH", "DETACH")))
+
+    # on a guard's body part
+    lua = r"""
+mod.on("mission_start", function()
+  local bad = 0
+  local function try(t) if not pcall(mod.attach.add, t) then bad = bad + 1 end end
+  try({ model = "PvestZ", like = "PcartonZ", on = "guard", part = "chest" })
+  try({ model = "PvestZ", like = "PcartonZ", on = "guard", guard = 5000 })
+  try({ model = "PvestZ", like = "PcartonZ", on = "guard", guard = 5000, part = "tail" })
+  try({ model = "PvestZ", like = "PcartonZ", on = "guard", guard = -1, part = "chest" })
+  try({ model = "PvestZ", like = "PcartonZ", on = "guard", guard = 1.5, part = "chest" })
+  try({ model = "PvestZ", like = "PcartonZ", on = "guard", guard = 5000, part = "chest", node = 2 })
+  print("bad", bad)
+  local vest = mod.attach.add({ model = "PvestZ", like = "PcartonZ", on = "guard", guard = 5000, part = "chest",
+                                at = { 0, 0, 30 } })
+  local pouch = mod.attach.add({ model = "PpouchZ", like = "PcartonZ", on = "guard", guard = 5000, part = "left_foot" })
+  print("guard", vest, pouch, mod.attach.add({ model = "PvestZ", like = "PcartonZ", on = "guard", guard = 99,
+                                                part = "head" }))
+end)
+mod.on("tick", function() print("tick", mod.attach.show(1, false), mod.attach.remove(2)) end)
+"""
+    out = run(exe, temp, "attachguard", lua, *play, "attachgone", 1, "frame")
+    check(logs(out) == ["bad 6", "guard 1 2 nil", "tick false true"],
+          "a guard's part: refusals, ids, none for a guard that isn't there; one gone with its body is no "
+          "mod's: " + str(logs(out)))
+    check(answers(out, "ATTACH")[1:4] == ["ATTACH 1 3 5000 15 PvestZ PcartonZ |1 0 0 0 |0 1 0 0 |0 0 1 0 |0 0 30 1",
+                                         "ATTACH 2 3 5000 1 PpouchZ PcartonZ |1 0 0 0 |0 1 0 0 |0 0 1 0 |0 0 0 1",
+                                         "ATTACH 0 3 99 8 PvestZ PcartonZ |1 0 0 0 |0 1 0 0 |0 0 1 0 |0 0 0 1"],
+          "the game side: on guard 5000's chest (15) and left foot (1), the game's hit parts: "
+          + str(answers(out, "ATTACH")))
+    mine = (ROOT / "src/game/gevr_modattach.c").read_bytes().decode()
+    part = function(mine, "static s32 attachPartMtx(ModelFileHeader *h, s32 part)")
+    check("MODELNODE_OPCODE_BBOX" in part and "BoundingBox.ModelNumber == part" in part
+          and "modelFindNodeMtxIndex(node, 0)" in part, "a part's matrix: its bounding box's node, as hits name it")
+    guard = function(mine, "Gfx *gevrModAttachDrawGuard(")
+    check("a->chr != chr" in guard and "node = ((Mtxf *) chr->model->render_pos)[a->partMtx];" in guard
+          and "objdata.PropType = fadealpha < 0xFF ? 5 : 9;" in guard and "chr->prop->type != PROP_TYPE_CHR" in guard,
+          "drawn on that guard's record at its part's matrix as drawn, as stuck objects are; never a player's body")
+    gone = function(mine, "void gevrModAttachChrGone(ChrRecord *chr)")
+    check("gevrModApiAttachGone(s_attach[i].id);" in gone, "gone with the body, and no mod's")
+    chr = (ROOT / "src/game/chr.c").read_bytes().decode()
+    render = function(chr, "Gfx *chrRenderProp(PropRecord *prop, Gfx *gdl, s32 withalpha)")
+    check(render.index("drawjointlist(&mrData, chr->field_20);")
+          < render.index("mrData.gdl = gevrChrEmbeddedRender(chr, &mrData, chrfadealpha, withalpha);")
+          < render.index("mrData.gdl = gevrModAttachDrawGuard(chr, &mrData, chrfadealpha, mrData.gdl);")
+          < render.index("bondviewTransformManyPosToViewMatrix(chr->model->render_pos, chr->model->obj->numMatrices);"),
+          "after the body and what's stuck to it, while its matrices are still floats")
+    cleanup = function(chr, "void chrpropCleanupForRemoval(PropRecord *prop)")
+    check(cleanup.index("gevrModAttachChrGone(chr);") < cleanup.index("chr->model = NULL;"),
+          "a body's removal takes its attachments")
+
+    # another mod's attachment isn't this one's to hide or remove
+    lua = r"""
+mod.on("mission_start", function()
+  print("other", mod.attach.show(1, false), mod.attach.remove(1), mod.attach.place(1, {}))
+end)
+"""
+    out = run(exe, temp, "attachother", lua, *play)
+    check(logs(out) == ["other false false false"] and not answers(out, "DETACH", "ATTACHSHOW", "ATTACHPLACE"),
+          "an id this mod didn't attach: false, nothing touched")
+
+
 def ui(exe, temp):
     play = ("start", "prepare", 9, "begin", 9)
     lua = r"""
@@ -1161,14 +1941,19 @@ bad = true
 def main():
     placement()
     items_placement()
+    drops_placement()
+    armour_placement()
     hands_placement()
     guards_placement()
     guards2_placement()
+    pads_placement()
     damage_placement()
     effects_placement()
     net_placement()
     ui_placement()
     scope_placement()
+    gunmodel_placement()
+    attach_placement()
     with tempfile.TemporaryDirectory(prefix="gevr-modapi-") as temp:
         temp = Path(temp)
         exe = build(temp)
@@ -1199,6 +1984,20 @@ mod.on("weapon_drawn", function(hand, item) print("drawn", hand, item, mod.weapo
               + str(answers(out, "FIRED", "DECLINED", "LOADED")))
         out = run(exe, temp, "outside", lua, "start", "fire", 0, "prepare", 9, "fire", 0)
         check(logs(out) == [] and answers(out, "FIRED") == ["FIRED 6", "FIRED 5"], "nothing asked outside play")
+
+        # ---- out_of_ammo: an empty gun kept in hand until it has rounds or is drawn ----
+        lua = """
+local keep = true
+mod.on("out_of_ammo", function(hand, item) print("out_of_ammo", hand, item); return not keep end)
+"""
+        out = run(exe, temp, "empty", lua, *play, "hold", 0, 8, 0, "empty", 0, "empty", 0, "fire", 0, "empty", 0,
+                  "reload", 0, 5, "empty", 0, "draw", 0, 8, "empty", 0, "local", 0, "empty", 0)
+        check(logs(out) == ["out_of_ammo right 8", "out_of_ammo right 8", "out_of_ammo right 8", "out_of_ammo right 8"],
+              "asked once while kept, again after a shot, a reload and a draw: " + str(logs(out)))
+        check(answers(out, "KEPT", "SWITCH") == ["KEPT", "KEPT", "KEPT", "KEPT", "KEPT", "SWITCH"],
+              "kept each time; a copy's switch isn't asked: " + str(answers(out, "KEPT", "SWITCH")))
+        out = run(exe, temp, "emptyno", 'mod.on("out_of_ammo", function() end)', *play, "hold", 0, 8, 0, "empty", 0)
+        check(answers(out, "KEPT", "SWITCH") == ["SWITCH"], "a handler returning nothing lets the game switch")
 
         # ---- reload_attempt: a reload declined takes nothing; the automatic one waits ----
         lua = """
@@ -1258,6 +2057,41 @@ end)
         check(answers(out, "STATS") == ["STATS 8 45 2 15.00", "STATS 4 12 -1 1.00", "STATS 8 30 3 1.50", "STATS 4 7 -1 1.00"],
               "stats changed, then the game's own again at the mission's end: " + str(answers(out, "STATS")))
 
+        # ---- the handling stats, and the player's speed ----
+        lua = r"""
+mod.on("mission_start", function()
+  local w = mod.weapon
+  local s = w.stats("ak47")
+  print("own", s.inaccuracy, s.recoilBack, s.sound, s.loudnessMax)
+  assert(w.setStats("ak47", { inaccuracy = 2.5, recoilBack = 4, recoilUp = 1, sound = 12, loudnessMin = 1, loudnessMax = 5 }))
+  local bad = 0
+  for _, t in ipairs({ { inaccuracy = 101 }, { recoilUp = -1 }, { sound = 120 }, { sound = 1.5 }, { loudnessMin = 6 },
+                       { loudnessMax = "x" } }) do
+    if not pcall(w.setStats, "ak47", t) then bad = bad + 1 end
+  end
+  print("bad", bad, w.stats("ak47").sound)
+  print("speed", (pcall(mod.player.setSpeed, 0.1)), (pcall(mod.player.setSpeed, 2.5)))
+  mod.player.setSpeed(0.8)
+  print("auto", w.stats("wppk").automatic, w.stats("ak47").automatic, (pcall(w.setStats, "wppk", { automatic = true })),
+        (pcall(w.setStats, "wppk", { automatic = 1 })))
+  assert(w.setStats("wppk", { automatic = true, fireRate = 2 }))
+  assert(w.setStats("ak47", { automatic = false }))
+  print("now", w.stats("wppk").automatic, w.stats("wppk").fireRate, w.stats("ak47").automatic,
+        (pcall(w.setStats, "ak47", { fireRate = 4 })))
+end)
+"""
+        out = run(exe, temp, "handling", lua, *play, "show2", 8, "show2", 4, "title", "show2", 8, "show2", 4)
+        check(logs(out) == ["own 0.0 0.0 0 0.0", "bad 6 12", "speed false false", "auto false true false false",
+                            "now true 2 false false"], "handling: " + str(logs(out)))
+        check(answers(out, "STATS2") == ["STATS2 2.50 4.00 1.00 12 1.00 5.00 0 3", "STATS2 0.00 0.00 0.00 0 0.00 0.00 1 2",
+                                         "STATS2 0.00 0.00 0.00 0 0.00 0.00 1 3", "STATS2 0.00 0.00 0.00 0 0.00 0.00 0 -1"],
+              "accuracy, recoil, sound and loudness set; the PP7 automatic at 2 ticks, the KF7 a shot a press; then the "
+          "game's own again at the mission's end: "
+              + str(answers(out, "STATS2")))
+        check(answers(out, "SPEED")[-3:] == ["SPEED 1.00", "SPEED 0.80", "SPEED 1.00"],
+              "the speed: the game's own at the mission's start, the mod's, the game's own after: "
+              + str(answers(out, "SPEED")))
+
         # ---- an error puts the stats back at once ----
         lua = """
 mod.on("mission_start", function() mod.weapon.setStats("ak47", { magazine = 99 }) end)
@@ -1268,32 +2102,48 @@ mod.on("weapon_fire_attempt", function() error("jam") end)
               "an error: the shot happens, the mod stops, its stats go back: " + str(answers(out, "STATS", "FIRED", "DECLINED")))
 
         items(exe, temp)
+        pickup_ids(exe, temp)
+        throws(exe, temp)
+        shared_drops(exe, temp)
         hands(exe, temp)
         guards(exe, temp)
         guards2(exe, temp)
+        pads(exe, temp)
+        mission(exe, temp)
         damage(exe, temp)
         effects(exe, temp)
         net(exe, temp)
         ui(exe, temp)
         scope(exe, temp)
+        gunmodel(exe, temp)
+        gunmodel_fit(exe, temp)
+        attach(exe, temp)
+        attach_authored_frame(exe, temp)
+        pack_names(exe, temp)
+        attach_loadout(exe, temp)
         guards_told(temp)
 
     if FAILS:
         print(f"{len(FAILS)} check(s) failed")
         sys.exit(1)
-    print("PASS: mods' weapons area: fire attempts declined or not, weapon_fire, reloads asked and declined, draws, the local player only, "
+    print("PASS: mods' weapons area: fire attempts declined or not, weapon_fire, reloads asked and declined, an "
+          "empty gun kept in hand, draws, the local player only, "
           "mod.weapon's calls and limits, mod.items, the stats put back; the hooks' places in the gun code. "
-          "Items area: pickup_spawning's swaps, turns and refusals, item_pickup, mod.inventory, mod.ammo; "
+          "Items area: pickup_spawning's swaps, turns and refusals, item_pickup with its pickup id, ids never reused and pickup_removed, mod.pickups.drop (armour too, and shared, the host deciding who takes one), "
+          "weapon_dropped, mod.inventory, mod.ammo; "
           "the hooks' places in the stage's setup and the pickup. Hands area: grip, release, hand_near, "
           "mod.hands' positions, anchors and pulses; the hooks' places. Guards area: guard_spawning's body, head and gun, "
           "refusals, alerts, kills and corpses told once on the host, mod.guards' reads; the hooks' places. Guards, part 2: "
-          "spawn, giveWeapon, patrol, paths, guard_spawned, guard_killed's player. Damage and player: before_damage's "
+          "spawn, giveWeapon, patrol, paths, goTo, face, giveHat, mod.pads, mod.mission (and complete in a mod campaign's own save), guard_spawned, guard_killed's player. Damage and player: before_damage's "
           "answers and refusals, damage_applied, downed, revived, died, mod.player's health and armour; the hooks' places. "
           "Sound and smoke: mod.audio's ids, volumes and places, mod.effect's smokes and places. Network: mod.net's sends, "
           "limits and rate, held messages by channel and mod, peer_ready, a stop told to the others and taken from them. "
           "UI: mod.ui's pages and limits, the screen's clicks and changes, open and close, a stopped mod's pages hidden. "
           "Scopes: mod.weapon.scope's lens, none and the game's own, its limits, a draw's reset; mod.weapon.look; "
-          "the hand's scope wherever the game read the item's")
+          "the hand's scope wherever the game read the item's. Gun models: mod.weapon.model's choices, refusals "
+          "and reset; the hand's load, load_resource's name and the fits. Attachments: mod.attach on the gun, a hand "
+          "and the body or a gun model's node or a guard's body part, its offset, refusals, place, show and remove (the owner's only), one gone with its guard's body; the "
+          "draws, frames and load; a measured loadout's size twice over, the limits, and a frame without room skipping one")
 
 
 if __name__ == "__main__":

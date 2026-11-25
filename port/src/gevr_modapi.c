@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "gevr_modapi.h"
 #include "gevr_modscript.h"
@@ -36,6 +37,7 @@ extern bool netIsActive(void);
 extern bool netIsHost(void);
 extern bool netIsDedicated(void);
 extern int netGetLocalSlot(void);
+extern int netGetHostSlot(void);
 extern int netSendModMessage(int kind, int to, const char *mod, const char *channel, const void *data, int len);
 
 /* ITEM_IDS from ITEM_UNARMED (0): mod.items, and a name for an item argument */
@@ -66,6 +68,13 @@ static const char *const s_ammoNames[GEVR_MODAPI_AMMO_TYPES + 1] = {
  * the hand whose side it's on, gun or off */
 static const char *const s_anchorNames[GEVR_MODAPI_ANCHORS] = {
     "hip_gun", "hip_off", "back_gun", "back_off", "chest", "belt",
+};
+
+/* A guard's parts for mod.attach, in the game's hit part order (HIT_LEFT_FOOT 1
+ * to HIT_CHEST 15, bondaicommands.h) */
+static const char *const s_bodyPartNames[GEVR_MODAPI_GUARD_PARTS + 1] = {
+    "left_foot", "left_leg", "left_thigh", "right_foot", "right_leg", "right_thigh", "pelvis", "head",
+    "left_hand", "left_arm", "left_shoulder", "right_hand", "right_arm", "right_shoulder", "chest", NULL,
 };
 
 /* GEVR_MODALERT_*, GEVR_MODKILL_*: guard_alerted's how, guard_killed's */
@@ -217,9 +226,71 @@ static int l_stats(lua_State *L)
         lua_pushinteger(L, st.fireRate);
         lua_setfield(L, -2, "fireRate");
     }
+    lua_pushboolean(L, st.automatic);
+    lua_setfield(L, -2, "automatic");
     lua_pushnumber(L, st.damage);
     lua_setfield(L, -2, "damage");
+    lua_pushnumber(L, st.inaccuracy);
+    lua_setfield(L, -2, "inaccuracy");
+    lua_pushnumber(L, st.recoilBack);
+    lua_setfield(L, -2, "recoilBack");
+    lua_pushnumber(L, st.recoilUp);
+    lua_setfield(L, -2, "recoilUp");
+    lua_pushinteger(L, st.sound);
+    lua_setfield(L, -2, "sound");
+    lua_pushnumber(L, st.loudnessMin);
+    lua_setfield(L, -2, "loudnessMin");
+    lua_pushnumber(L, st.loudnessMax);
+    lua_setfield(L, -2, "loudnessMax");
+    if (st.throwSpeed > 0.0f) {
+        lua_pushnumber(L, st.throwSpeed);
+        lua_setfield(L, -2, "throwSpeed");
+        lua_pushnumber(L, st.throwLift);
+        lua_setfield(L, -2, "throwLift");
+        lua_pushboolean(L, st.throwGuide);
+        lua_setfield(L, -2, "throwGuide");
+        lua_createtable(L, 0, 4);   /* its look */
+        lua_pushnumber(L, st.guideLength);
+        lua_setfield(L, -2, "length");
+        lua_pushnumber(L, st.guideWidth);
+        lua_setfield(L, -2, "width");
+        lua_createtable(L, 3, 0);
+        for (int c = 0; c < 3; c++) {
+            lua_pushinteger(L, st.guideColour[c]);
+            lua_rawseti(L, -2, c + 1);
+        }
+        lua_setfield(L, -2, "colour");
+        lua_pushboolean(L, st.guideFade);
+        lua_setfield(L, -2, "fade");
+        lua_setfield(L, -2, "throwGuideStyle");
+    }
     return 1;
+}
+
+/* a number field from 0 to most, kept when absent; a script error past it */
+static void statNumber(lua_State *L, const char *key, double most, float *out)
+{
+    double v = 0.0;
+
+    if (lua_getfield(L, 2, key) != LUA_TNIL) {
+        if (!lua_isnumber(L, -1) || (v = lua_tonumber(L, -1)) < 0 || v > most) {
+            char cap[48];   /* Lua's own formats have no %g */
+
+            snprintf(cap, sizeof(cap), "%.3g", most);
+            luaL_error(L, "mod.weapon.setStats: %s is 0 to %s", key, cap);
+        }
+        *out = (float)v;
+    }
+    lua_pop(L, 1);
+}
+
+/* the most a stat may be: ten times the weapon's own, or 10 (100 for
+ * inaccuracy and loudness) where its own is less */
+static double statMost(float own, double floor)
+{
+    const double ten = own * 10.0;
+
+    return ten > floor ? ten : floor;
 }
 
 /* setStats(item, {magazine=, fireRate=, damage=}): any of them, within the
@@ -247,11 +318,17 @@ static int l_setStats(lua_State *L)
         next.magazine = (int)v;
     }
     lua_pop(L, 1);
+    if (lua_getfield(L, 2, "automatic") != LUA_TNIL) {
+        if (!lua_isboolean(L, -1)) return luaL_error(L, "mod.weapon.setStats: automatic is true or false");
+        next.automatic = lua_toboolean(L, -1);
+    }
+    lua_pop(L, 1);
     if (lua_getfield(L, 2, "fireRate") != LUA_TNIL) {
         lua_Integer v;
 
-        if (own.fireRate < 0) {
-            return luaL_error(L, "mod.weapon.setStats: %s isn't automatic; it has no fireRate", s_itemNames[item]);
+        if (!next.automatic) {
+            return luaL_error(L, "mod.weapon.setStats: %s isn't automatic; it has no fireRate (automatic = true gives it one)",
+                              s_itemNames[item]);
         }
         if (!lua_isinteger(L, -1) || (v = lua_tointeger(L, -1)) < GEVR_MODAPI_RATE_MIN || v > GEVR_MODAPI_RATE_MAX) {
             return luaL_error(L, "mod.weapon.setStats: fireRate is ticks between shots, %d to %d", GEVR_MODAPI_RATE_MIN,
@@ -260,6 +337,9 @@ static int l_setStats(lua_State *L)
         next.fireRate = (int)v;
     }
     lua_pop(L, 1);
+    if (next.automatic && next.fireRate < 0) {
+        return luaL_error(L, "mod.weapon.setStats: %s has no fireRate of its own; an automatic needs one", s_itemNames[item]);
+    }
     if (lua_getfield(L, 2, "damage") != LUA_TNIL) {
         const double cap = own.damage > 0 ? own.damage * GEVR_MODAPI_DAMAGE_SCALE : 0.0;
         double v;
@@ -274,6 +354,109 @@ static int l_setStats(lua_State *L)
         next.damage = (float)v;
     }
     lua_pop(L, 1);
+    statNumber(L, "inaccuracy", statMost(own.inaccuracy, 100.0), &next.inaccuracy);
+    statNumber(L, "recoilBack", statMost(own.recoilBack, 10.0), &next.recoilBack);
+    statNumber(L, "recoilUp", statMost(own.recoilUp, 10.0), &next.recoilUp);
+    statNumber(L, "loudnessMin", statMost(own.loudnessMax, 100.0), &next.loudnessMin);
+    statNumber(L, "loudnessMax", statMost(own.loudnessMax, 100.0), &next.loudnessMax);
+    if (next.loudnessMin > next.loudnessMax) {
+        return luaL_error(L, "mod.weapon.setStats: loudnessMin is at most loudnessMax");
+    }
+    if (lua_getfield(L, 2, "sound") != LUA_TNIL) {
+        lua_Integer v;
+
+        if (!lua_isinteger(L, -1) || (v = lua_tointeger(L, -1)) < 0 || v >= gevrModGameSoundCount()) {
+            return luaL_error(L, "mod.weapon.setStats: sound is a ROM sound effect's id, 0 to %d",
+                              gevrModGameSoundCount() - 1);
+        }
+        next.sound = (int)v;
+    }
+    lua_pop(L, 1);
+    {
+        /* a thrown weapon or gadget's trigger throw: its speed, lift and guide */
+        static const char *const throws[] = { "throwSpeed", "throwLift", "throwGuide" };
+        int k;
+
+        for (k = 0; k < 3; k++) {
+            const int there = lua_getfield(L, 2, throws[k]) != LUA_TNIL;
+            lua_Number v = 0;
+            int ok = 0;
+
+            if (there && cur.throwSpeed <= 0.0f) {
+                return luaL_error(L, "mod.weapon.setStats: %s isn't thrown; it has no %s", s_itemNames[item], throws[k]);
+            }
+            if (there && k == 0) {
+                v = lua_tonumberx(L, -1, &ok);
+                if (!ok || !(v >= 1.0 && v <= GEVR_MODAPI_THROW_SPEED_MAX)) {
+                    return luaL_error(L, "mod.weapon.setStats: throwSpeed is 1 to %d", (int)GEVR_MODAPI_THROW_SPEED_MAX);
+                }
+                next.throwSpeed = (float)v;
+            } else if (there && k == 1) {
+                v = lua_tonumberx(L, -1, &ok);
+                if (!ok || !(v >= -GEVR_MODAPI_THROW_LIFT_MAX && v <= GEVR_MODAPI_THROW_LIFT_MAX)) {
+                    return luaL_error(L, "mod.weapon.setStats: throwLift is -%d to %d", (int)GEVR_MODAPI_THROW_LIFT_MAX,
+                                      (int)GEVR_MODAPI_THROW_LIFT_MAX);
+                }
+                next.throwLift = (float)v;
+            } else if (there && lua_isboolean(L, -1)) {
+                next.throwGuide = lua_toboolean(L, -1);
+            } else if (there && lua_istable(L, -1)) {
+                /* on, in a look of the pack's: what it leaves out is the game's tracer's */
+                const int t = lua_gettop(L);
+
+                next.throwGuide = 1;
+                next.guideLength = GEVR_MODAPI_GUIDE_LENGTH;
+                next.guideWidth = GEVR_MODAPI_GUIDE_WIDTH;
+                next.guideColour[0] = next.guideColour[1] = next.guideColour[2] = 255;
+                next.guideFade = 0;
+                if (lua_getfield(L, t, "length") != LUA_TNIL) {
+                    v = lua_tonumberx(L, -1, &ok);
+                    if (!ok || !(v >= GEVR_MODAPI_GUIDE_LENGTH_MIN && v <= GEVR_MODAPI_GUIDE_LENGTH_MAX)) {
+                        return luaL_error(L, "mod.weapon.setStats: throwGuide's length is %d to %d", (int)GEVR_MODAPI_GUIDE_LENGTH_MIN,
+                                          (int)GEVR_MODAPI_GUIDE_LENGTH_MAX);
+                    }
+                    next.guideLength = (float)v;
+                }
+                lua_pop(L, 1);
+                if (lua_getfield(L, t, "width") != LUA_TNIL) {
+                    v = lua_tonumberx(L, -1, &ok);
+                    if (!ok || !(v >= GEVR_MODAPI_GUIDE_WIDTH_MIN && v <= GEVR_MODAPI_GUIDE_WIDTH_MAX)) {
+                        return luaL_error(L, "mod.weapon.setStats: throwGuide's width is 0.5 to %d", (int)GEVR_MODAPI_GUIDE_WIDTH_MAX);
+                    }
+                    next.guideWidth = (float)v;
+                }
+                lua_pop(L, 1);
+                if (lua_getfield(L, t, "colour") != LUA_TNIL) {
+                    int c;
+
+                    if (!lua_istable(L, -1) || lua_rawlen(L, -1) != 3) {
+                        return luaL_error(L, "mod.weapon.setStats: throwGuide's colour is { r, g, b }, 0 to 255 each");
+                    }
+                    for (c = 0; c < 3; c++) {
+                        int whole;
+                        lua_Integer n;
+
+                        lua_rawgeti(L, -1, c + 1);
+                        n = lua_tointegerx(L, -1, &whole);
+                        lua_pop(L, 1);
+                        if (!whole || n < 0 || n > 255) {
+                            return luaL_error(L, "mod.weapon.setStats: throwGuide's colour is { r, g, b }, 0 to 255 each");
+                        }
+                        next.guideColour[c] = (int)n;
+                    }
+                }
+                lua_pop(L, 1);
+                if (lua_getfield(L, t, "fade") != LUA_TNIL) {
+                    if (!lua_isboolean(L, -1)) return luaL_error(L, "mod.weapon.setStats: throwGuide's fade is true or false");
+                    next.guideFade = lua_toboolean(L, -1);
+                }
+                lua_pop(L, 1);
+            } else if (there) {
+                return luaL_error(L, "mod.weapon.setStats: throwGuide is true, false or a look { length, width, colour, fade }");
+            }
+            lua_pop(L, 1);
+        }
+    }
     if (i == s_savedCount && s_savedCount < GEVR_MODAPI_ITEMS) {
         s_saved[s_savedCount].item = item;
         s_saved[s_savedCount].own = cur;
@@ -353,13 +536,110 @@ static int l_scope(lua_State *L)
 /* look(hand): the models the hand's gun is drawn with, for scope's at */
 static int l_look(lua_State *L)
 {
-    static const char *const s_looks[] = { "original", "gex", "bean" };
+    static const char *const s_looks[] = { "original", "gex", "bean", "mod" };
     const int hand = handArg(L, 1);
     int look;
 
     needPlayer(L, "mod.weapon.look");
     look = gevrModGameLook(hand);
-    lua_pushstring(L, s_looks[look >= 0 && look <= 2 ? look : 0]);
+    lua_pushstring(L, s_looks[look >= 0 && look <= 3 ? look : 0]);
+    return 1;
+}
+
+/* A pack model's name: a cartridge file's (letters, digits, _), 1 to 63 */
+static int modelNameOk(const char *s, size_t n)
+{
+    size_t i;
+
+    if (n < 1 || n > 63) return 0;
+    if (n > 4 && !memcmp(s + n - 4, ".bin", 4)) n -= 4;
+    for (i = 0; i < n; i++) {
+        const char c = s[i];
+
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return 0;
+    }
+    return 1;
+}
+
+/* Four affine rows in the same convention as attachOffset: the model's
+ * local axes in anchor coordinates, followed by its origin in model units.
+ * Do not decompose the supplied frame; nested mounts can include scale and
+ * reflection. The model still follows the anchor's engine animation. */
+static int authoredFrame(lua_State *L, int t, const char *call, float out[4][4])
+{
+    if (lua_getfield(L, t, "frame") == LUA_TNIL) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    if (!lua_istable(L, -1) || lua_rawlen(L, -1) != 4) {
+        return luaL_error(L, "%s: frame needs four 3-number rows (axes, then origin)", call);
+    }
+    for (int row = 0; row < 4; ++row) {
+        const double limit = row == 3 ? GEVR_MODAPI_ATTACH_RANGE : GEVR_MODAPI_ATTACH_SCALE_MAX;
+        lua_rawgeti(L, -1, row + 1);
+        if (!lua_istable(L, -1) || lua_rawlen(L, -1) != 3) {
+            return luaL_error(L, "%s: frame needs four 3-number rows (axes, then origin)", call);
+        }
+        for (int col = 0; col < 3; ++col) {
+            if (lua_rawgeti(L, -1, col + 1) != LUA_TNUMBER) {
+                return luaL_error(L, "%s: frame needs four 3-number rows (axes, then origin)", call);
+            }
+            const double n = lua_tonumber(L, -1);
+            if (!(n >= -limit && n <= limit)) {
+                return luaL_error(L, "%s: frame component outside its limit", call);
+            }
+            out[row][col] = (float)n;
+            lua_pop(L, 1);
+        }
+        out[row][3] = row == 3;
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    const double a = out[0][0], b = out[0][1], c = out[0][2];
+    const double d = out[1][0], e = out[1][1], f = out[1][2];
+    const double g = out[2][0], h = out[2][1], i = out[2][2];
+    if (fabs(a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)) < 1e-8) {
+        return luaL_error(L, "%s: frame needs independent axes", call);
+    }
+    return 1;
+}
+
+/*
+ * model(hand, item, file | nil [, { frame }]): when the hand draws item, the mod's
+ * assets/models/<file> in place of the item's cartridge model, built over
+ * that model's header (its switch and texture counts, its skeleton); nil, the
+ * item's own. A hand holding item now loads it at once. True when set; false
+ * when the mod has no such file. Every hand's own come back at a mission's
+ * start and when a mod stops.
+ */
+static int l_gunModel(lua_State *L)
+{
+    const int hand = handArg(L, 1);
+    const int item = itemArg(L, 2);
+    const char *name = NULL;
+
+    if (!lua_isnoneornil(L, 3)) {
+        size_t n;
+
+        name = luaL_checklstring(L, 3, &n);
+        if (!modelNameOk(name, n)) {
+            return luaL_argerror(L, 3, "a flat model file name (assets/models/<file>)");
+        }
+    }
+    if (!gevrModGameSwappable(item)) {
+        return luaL_argerror(L, 2, "a gun or thrown weapon with a model in this cartridge");
+    }
+    float frame[4][4];
+    const float (*fit)[4] = NULL;
+    if (!lua_isnoneornil(L, 4)) {
+        luaL_checktype(L, 4, LUA_TTABLE);
+        if (name == NULL || !authoredFrame(L, 4, "mod.weapon.model", frame)) {
+            return luaL_argerror(L, 4, "{ frame = ... } with a pack mesh file");
+        }
+        fit = frame;
+    }
+    needPlayer(L, "mod.weapon.model");
+    lua_pushboolean(L, gevrModGameGunModel(hand, item, name, fit));
     return 1;
 }
 
@@ -371,6 +651,7 @@ static const luaL_Reg s_weaponFuncs[] = {
     { "setStats", l_setStats },
     { "scope", l_scope },
     { "look", l_look },
+    { "model", l_gunModel },
     { NULL, NULL },
 };
 
@@ -452,6 +733,395 @@ static const luaL_Reg s_ammoFuncs[] = {
     { "get", l_ammoGet },
     { "set", l_ammoSet },
     { "max", l_ammoMax },
+    { NULL, NULL },
+};
+
+/* ---- mod.pickups ---- */
+
+/*
+ * Runtime pickups' ids (gevr_modapi.h): the game recycles its weapon and ammo
+ * box slots (and frees the oldest dropped gun when the weapon slots are full),
+ * so a slot's number names a different pickup over a mission. Each is given
+ * the next id as it's first named (item_pickup, weapon_dropped, drop) and
+ * keeps it until its slot is freed; the id is never given again this mission.
+ * One freed that this headset's player didn't take is told as pickup_removed
+ * at the next frame in play, outside whatever call freed it.
+ */
+static int s_pickupId[GEVR_MODAPI_PICKUP_KINDS][GEVR_MODAPI_PICKUP_SLOTS];
+static unsigned char s_pickupTaken[GEVR_MODAPI_PICKUP_KINDS][GEVR_MODAPI_PICKUP_SLOTS];
+static int s_pickupNext = GEVR_MODAPI_PICKUP_RUNTIME;
+static int s_removed[GEVR_MODAPI_PICKUP_QUEUE], s_removedQueued, s_removedDropped;
+
+/*
+ * Shared pickups (drop's shared): the host's drop is given the next id from
+ * GEVR_MODAPI_PICKUP_SHARED and sent (NET_MOD_DROP); each other headset drops
+ * its own copy from the same chr and binds it that id. The host decides who
+ * takes one: a player's pickup is held back and claimed (NET_MOD_CLAIM); the
+ * host awards the first claim it has, its own pickup the same way, while it
+ * still has its copy (NET_MOD_GRANT): the winner's game takes it, the others
+ * free theirs (told there as pickup_removed). A claim for one the host no
+ * longer has gets NET_MOD_GONE back, and a copy the game frees untaken (a
+ * recycled slot) is sent as NET_MOD_GONE, so every copy goes. s_pickupMod:
+ * the mod that dropped it, which the messages carry; empty for a pickup that
+ * isn't shared.
+ */
+static int s_pickupBind;   /* the next id named: a shared drop's own */
+static int s_sharedNext = GEVR_MODAPI_PICKUP_SHARED;
+static char s_pickupMod[GEVR_MODAPI_PICKUP_KINDS][GEVR_MODAPI_PICKUP_SLOTS][64];
+static unsigned long long s_claimAt[GEVR_MODAPI_PICKUP_KINDS][GEVR_MODAPI_PICKUP_SLOTS];
+static int s_pickupRemoving;   /* a copy freed for a message: nothing to tell */
+static int s_pickupGranting;   /* the host's award being taken: not held back */
+typedef struct {
+    int kind, stage, id, item, ammo, from, winner, sender;
+    float armour;
+    char mod[64];
+} HeldPickup;
+static HeldPickup s_heldPickup[GEVR_MODAPI_PICKUP_HELD];
+static int s_heldPickups, s_heldPickupsDropped;
+
+static int pickupSlotOk(int kind, int slot)
+{
+    return kind >= 0 && kind < GEVR_MODAPI_PICKUP_KINDS && slot >= 0 && slot < GEVR_MODAPI_PICKUP_SLOTS;
+}
+
+/* the runtime slot holding a pickup with that id now */
+static int pickupSlotOf(int id, int *kind, int *slot)
+{
+    int k, s;
+
+    for (k = 0; id != 0 && k < GEVR_MODAPI_PICKUP_KINDS; k++) {
+        for (s = 0; s < GEVR_MODAPI_PICKUP_SLOTS; s++) {
+            if (s_pickupId[k][s] == id) {
+                *kind = k;
+                *slot = s;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static void put32(unsigned char *p, unsigned v)
+{
+    p[0] = (unsigned char)v;
+    p[1] = (unsigned char)(v >> 8);
+    p[2] = (unsigned char)(v >> 16);
+    p[3] = (unsigned char)(v >> 24);
+}
+
+static unsigned get32(const unsigned char *p)
+{
+    return (unsigned)p[0] | (unsigned)p[1] << 8 | (unsigned)p[2] << 16 | (unsigned)p[3] << 24;
+}
+
+int gevrModApiPickupSlotId(int kind, int slot)
+{
+    if (!pickupSlotOk(kind, slot)) return -1;
+    if (s_pickupId[kind][slot] == 0) {
+        if (s_pickupBind) {
+            s_pickupId[kind][slot] = s_pickupBind;   /* a shared drop's: the host's id */
+            s_pickupBind = 0;
+        } else {
+            if (s_pickupNext > GEVR_MODAPI_PICKUP_LAST) return -1;
+            s_pickupId[kind][slot] = s_pickupNext++;
+        }
+        s_pickupTaken[kind][slot] = 0;
+        s_pickupMod[kind][slot][0] = '\0';
+    }
+    return s_pickupId[kind][slot];
+}
+
+void gevrModApiPickupSlotTaken(int kind, int slot)
+{
+    if (pickupSlotOk(kind, slot) && s_pickupId[kind][slot] != 0) s_pickupTaken[kind][slot] = 1;
+}
+
+/* a shared pickup's claim, award or gone: its stage, the winner, its id */
+static void sendPickup(int kind, int to, const char *mod, int winner, int id)
+{
+    unsigned char b[GEVR_MODAPI_NET_PICKUP_BYTES] = { 0 };
+
+    b[0] = (unsigned char)gevrModScriptStage();
+    b[1] = (unsigned char)winner;
+    put32(b + 4, (unsigned)id);
+    netSendModMessage(kind, to, mod, NULL, b, (int)sizeof(b));
+}
+
+/* this headset's copy freed for a message (another won it, or it's gone) */
+static void removeCopy(int kind, int slot)
+{
+    s_pickupRemoving = 1;
+    gevrModGamePickupRemove(kind, slot);
+    s_pickupRemoving = 0;
+}
+
+int gevrModApiPickupTry(int kind, int slot, int local)
+{
+    unsigned long long now;
+    int id;
+
+    if (!pickupSlotOk(kind, slot) || (id = s_pickupId[kind][slot]) < GEVR_MODAPI_PICKUP_SHARED
+        || !s_pickupMod[kind][slot][0] || !netIsActive() || s_pickupGranting) {
+        return 0;   /* not shared, not a network game, or the award itself */
+    }
+    if (!local) return 1;   /* another player's: claimed from their headset */
+    if (netIsHost()) {
+        /* the host's own: awarded at once, as a claim would be, and told */
+        sendPickup(GEVR_MODNET_GRANT, 0xFF, s_pickupMod[kind][slot], netGetLocalSlot(), id);
+        return 0;
+    }
+    now = sysGetMicroseconds();
+    if (s_claimAt[kind][slot] == 0 || now - s_claimAt[kind][slot] >= GEVR_MODAPI_CLAIM_US) {
+        s_claimAt[kind][slot] = now ? now : 1;
+        sendPickup(GEVR_MODNET_CLAIM, netGetHostSlot(), s_pickupMod[kind][slot], 0, id);
+    }
+    return 1;   /* held back for the host's award */
+}
+
+void gevrModApiPickupSlotFreed(int kind, int slot)
+{
+    int id;
+
+    if (!pickupSlotOk(kind, slot) || (id = s_pickupId[kind][slot]) == 0) return;
+    if (id >= GEVR_MODAPI_PICKUP_SHARED && s_pickupMod[kind][slot][0] && !s_pickupTaken[kind][slot]
+        && !s_pickupRemoving && netIsActive() && gevrModGamePlayerReady()) {
+        /* the game freed a shared copy untaken (its slot recycled, say): every copy goes */
+        sendPickup(GEVR_MODNET_GONE, 0xFF, s_pickupMod[kind][slot], 0, id);
+    }
+    s_pickupId[kind][slot] = 0;
+    s_pickupMod[kind][slot][0] = '\0';
+    s_claimAt[kind][slot] = 0;
+    if (!s_pickupTaken[kind][slot] && gevrModScriptRunning()) {
+        if (s_removedQueued < GEVR_MODAPI_PICKUP_QUEUE) s_removed[s_removedQueued++] = id;
+        else s_removedDropped++;
+    }
+    s_pickupTaken[kind][slot] = 0;
+}
+
+void gevrModNetPickup(const char *mod, int from, int kind, const void *data, int len)
+{
+    const unsigned char *b = (const unsigned char *)data;
+    HeldPickup *h;
+
+    if (!gevrModScriptRunning() || !mod || !b || strlen(mod) >= sizeof(h->mod) || kind < GEVR_MODNET_DROP
+        || kind > GEVR_MODNET_GONE
+        || len != (kind == GEVR_MODNET_DROP ? GEVR_MODAPI_NET_DROP_BYTES : GEVR_MODAPI_NET_PICKUP_BYTES)) {
+        return;
+    }
+    if (s_heldPickups == GEVR_MODAPI_PICKUP_HELD) {
+        s_heldPickupsDropped++;   /* logged as the frame applies them */
+        return;
+    }
+    h = &s_heldPickup[s_heldPickups++];
+    memset(h, 0, sizeof(*h));
+    snprintf(h->mod, sizeof(h->mod), "%s", mod);
+    h->kind = kind;
+    h->sender = from;
+    h->stage = b[0];
+    h->winner = b[1];
+    h->id = (int)get32(b + 4);
+    if (kind == GEVR_MODNET_DROP) {
+        const int raw = b[8] | b[9] << 8;
+        const int who = raw >= 0x8000 ? raw - 0x10000 : raw;
+
+        h->item = b[1];
+        h->ammo = b[2];
+        h->armour = (float)(b[10] | b[11] << 8) / 65535.0f;
+        h->from = who >= 0 ? who : GEVR_MODAPI_FROM_SLOT0 - (-1 - who);   /* a guard, or a player's slot */
+    }
+}
+
+/* the shared drops and takes that came, in order, if they're this mission's */
+static void pickupApplyHeld(void)
+{
+    const int stage = gevrModScriptStage() & 0xFF;
+    int q, n = s_heldPickups;
+    static HeldPickup taken[GEVR_MODAPI_PICKUP_HELD];
+
+    if (s_heldPickupsDropped) {
+        sysLogPrintf(LOG_WARNING, "mods: %d shared pickup message(s) dropped: more than %d waited", s_heldPickupsDropped,
+                     GEVR_MODAPI_PICKUP_HELD);
+        s_heldPickupsDropped = 0;
+    }
+    memcpy(taken, s_heldPickup, sizeof(taken[0]) * (size_t)n);
+    s_heldPickups = 0;
+    for (q = 0; q < n; q++) {
+        const HeldPickup *h = &taken[q];
+        int kind, slot;
+
+        if (h->stage != stage || h->id < GEVR_MODAPI_PICKUP_SHARED) continue;   /* another mission's */
+        if (h->kind == GEVR_MODNET_DROP) {
+            if (pickupSlotOf(h->id, &kind, &slot)
+                || (h->item != 0) + (h->ammo != 0) + (h->armour > 0.0f) != 1
+                || (h->item != 0 && !gevrModGameSwappable(h->item)) || h->ammo > GEVR_MODAPI_AMMO_TYPES) {
+                continue;   /* here already, or not one a drop makes */
+            }
+            s_pickupBind = h->id;
+            if (gevrModGameDrop(h->item, h->ammo, h->armour, h->from) >= 0 && pickupSlotOf(h->id, &kind, &slot)) {
+                snprintf(s_pickupMod[kind][slot], sizeof(s_pickupMod[kind][slot]), "%s", h->mod);
+            } else {
+                sysLogPrintf(LOG_WARNING, "mods: %s: the host's shared pickup %d isn't here (no such guard or "
+                             "player, or no free slot)", h->mod, h->id);
+            }
+            s_pickupBind = 0;
+        } else if (h->kind == GEVR_MODNET_CLAIM) {
+            /* the host: the first claim while its copy's here wins, as its own pickup would */
+            if (!netIsHost() || h->sender < 0) continue;
+            if (pickupSlotOf(h->id, &kind, &slot)) {
+                sendPickup(GEVR_MODNET_GRANT, 0xFF, h->mod, h->sender, h->id);
+                removeCopy(kind, slot);
+            } else {
+                sendPickup(GEVR_MODNET_GONE, h->sender, h->mod, 0, h->id);   /* late, or gone: nothing */
+            }
+        } else if (pickupSlotOf(h->id, &kind, &slot)) {
+            if (h->kind == GEVR_MODNET_GRANT && h->winner == netGetLocalSlot()) {
+                s_pickupGranting = 1;   /* this player's: taken through the game's own pickup */
+                gevrModGamePickupGrant(kind, slot);
+                s_pickupGranting = 0;
+            } else {
+                removeCopy(kind, slot);   /* another's, or gone: pickup_removed here */
+            }
+        }
+    }
+}
+
+void gevrModApiPickupFlush(void)
+{
+    int q, n;
+    int taken[GEVR_MODAPI_PICKUP_QUEUE];
+
+    pickupApplyHeld();
+    n = s_removedQueued;
+
+    if (s_removedDropped) {
+        sysLogPrintf(LOG_WARNING, "mods: %d pickup_removed dropped: more than %d in a frame", s_removedDropped,
+                     GEVR_MODAPI_PICKUP_QUEUE);
+        s_removedDropped = 0;
+    }
+    /* taken first: a handler's own calls can free more, told next frame */
+    memcpy(taken, s_removed, sizeof(taken[0]) * (size_t)n);
+    s_removedQueued = 0;
+    for (q = 0; q < n; q++) {
+        GevrModArg a[1];
+
+        a[0].kind = GEVR_MODARG_INTEGER;
+        a[0].n = taken[q];
+        gevrModScriptEvent("pickup_removed", a, 1, 0);
+    }
+}
+
+void gevrModApiPickupClear(void)
+{
+    memset(s_pickupId, 0, sizeof(s_pickupId));
+    memset(s_pickupTaken, 0, sizeof(s_pickupTaken));
+    s_pickupNext = GEVR_MODAPI_PICKUP_RUNTIME;
+    s_removedQueued = 0;
+    s_removedDropped = 0;
+    s_pickupBind = 0;
+    s_sharedNext = GEVR_MODAPI_PICKUP_SHARED;
+    memset(s_pickupMod, 0, sizeof(s_pickupMod));
+    s_heldPickups = 0;
+    s_heldPickupsDropped = 0;
+    memset(s_claimAt, 0, sizeof(s_claimAt));
+    s_pickupRemoving = 0;
+    s_pickupGranting = 0;
+    gevrModGameDropsClear();   /* and the armour pool: the last stage's props are gone */
+}
+
+/*
+ * drop{ item = gun, from = "player" | guard }, drop{ ammo = type, from = ... }
+ * or drop{ armour = amount, from = ... }: the game's own drop of a gun or
+ * thrown weapon (as a player's inventory is dropped, drop_inventory), of an
+ * ammo box of that type (as a shot crate drops one), or of body armour (more
+ * than 0, up to 1, as the stage's own), falling from the player or a guard (a
+ * mod.guards id, a corpse too). The new pickup's id (as item_pickup and
+ * weapon_dropped give it), or nil when there's no free slot or no such guard.
+ * Placed on this headset only: in co-op, every headset that should have it
+ * drops it. shared = true (the host, or solo): one pickup for every headset,
+ * one id (from GEVR_MODAPI_PICKUP_SHARED), each other headset dropping its
+ * copy from the same chr, and the host deciding who takes it.
+ */
+static int l_drop(lua_State *L)
+{
+    int item = 0, ammo = 0, from, id, shared = 0;
+    float armour = 0.0f;
+
+    luaL_checktype(L, 1, LUA_TTABLE);
+    if (lua_getfield(L, 1, "item") != LUA_TNIL) item = itemArg(L, lua_gettop(L));
+    lua_pop(L, 1);
+    if (lua_getfield(L, 1, "ammo") != LUA_TNIL) ammo = ammoArg(L, lua_gettop(L));
+    lua_pop(L, 1);
+    if (lua_getfield(L, 1, "armour") != LUA_TNIL) {
+        const lua_Number a = lua_type(L, -1) == LUA_TNUMBER ? lua_tonumber(L, -1) : -1.0;
+
+        if (!(a > 0.0 && a <= 1.0)) return luaL_error(L, "mod.pickups.drop: armour is more than 0, up to 1");
+        armour = (float)a;
+    }
+    lua_pop(L, 1);
+    if ((item != 0) + (ammo != 0) + (armour > 0.0f) != 1) {
+        return luaL_error(L, "mod.pickups.drop: one of item, ammo or armour");
+    }
+    if (item != 0 && !gevrModGameSwappable(item)) {
+        return luaL_error(L, "mod.pickups.drop: the item is a gun or thrown weapon with a model in this cartridge");
+    }
+    lua_getfield(L, 1, "from");
+    if (lua_type(L, -1) == LUA_TSTRING && !strcmp(lua_tostring(L, -1), "player")) {
+        from = GEVR_MODAPI_FROM_PLAYER;
+    } else {
+        int whole;
+        const lua_Integer g = lua_tointegerx(L, -1, &whole);
+
+        if (!whole || g < 0 || g > 0x7fffffff) return luaL_error(L, "mod.pickups.drop: from is \"player\" or a guard's id");
+        from = (int)g;
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, 1, "shared");
+    if (!lua_isnil(L, -1) && !lua_isboolean(L, -1)) return luaL_error(L, "mod.pickups.drop: shared is true or false");
+    shared = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    if (shared && netIsActive() && !netIsHost()) return luaL_error(L, "mod.pickups.drop: a shared drop is the host's");
+    if (shared && from != GEVR_MODAPI_FROM_PLAYER && from > 32767) {
+        return luaL_error(L, "mod.pickups.drop: a shared drop's guard is 0 to 32767");
+    }
+    needPlayer(L, "mod.pickups.drop");
+    if (shared) {
+        if (s_sharedNext == 0x7FFFFFFF) {
+            lua_pushnil(L);   /* the mission's shared ids used up */
+            return 1;
+        }
+        s_pickupBind = s_sharedNext++;
+    }
+    id = gevrModGameDrop(item, ammo, armour, from);
+    s_pickupBind = 0;
+    if (id >= 0 && shared) {
+        int kind, slot;
+
+        if (pickupSlotOf(id, &kind, &slot)) {
+            snprintf(s_pickupMod[kind][slot], sizeof(s_pickupMod[kind][slot]), "%s", gevrModScriptIdOf(L));
+        }
+        if (netIsActive()) {
+            unsigned char b[GEVR_MODAPI_NET_DROP_BYTES] = { 0 };
+            const int who = from == GEVR_MODAPI_FROM_PLAYER ? -1 - netGetLocalSlot() : from;
+            const unsigned amount = (unsigned)(armour * 65535.0f + 0.5f);
+
+            b[0] = (unsigned char)gevrModScriptStage();
+            b[1] = (unsigned char)item;
+            b[2] = (unsigned char)ammo;
+            put32(b + 4, (unsigned)id);
+            b[8] = (unsigned char)(who & 0xFF);
+            b[9] = (unsigned char)((who >> 8) & 0xFF);
+            b[10] = (unsigned char)(amount & 0xFF);
+            b[11] = (unsigned char)(amount >> 8);
+            netSendModMessage(GEVR_MODNET_DROP, 0xFF, gevrModScriptIdOf(L), NULL, b, (int)sizeof(b));
+        }
+    }
+    if (id < 0) lua_pushnil(L);
+    else lua_pushinteger(L, id);
+    return 1;
+}
+
+static const luaL_Reg s_pickupFuncs[] = {
+    { "drop", l_drop },
     { NULL, NULL },
 };
 
@@ -714,6 +1384,49 @@ static int l_guardPaths(lua_State *L)
     return 1;
 }
 
+/* goTo(id, pad[, speed]): the guard walks ("walk", the default), runs or
+ * sprints to the pad by the game's own route (chrGoToPad); true when it set
+ * off. Where the guards run (solo, the co-op host) */
+static int l_guardGoTo(lua_State *L)
+{
+    static const char *const speeds[] = { "walk", "run", "sprint", NULL };
+    const lua_Integer id = luaL_checkinteger(L, 1);
+    const lua_Integer pad = luaL_checkinteger(L, 2);
+    const int speed = luaL_checkoption(L, 3, "walk", speeds);
+
+    lua_pushboolean(L, id >= -32768 && id <= 32767 && pad >= 0 && pad <= 0x7fffffff && gevrModGameRunsGuards()
+                           && gevrModGameGoTo((int)id, (int)pad, speed));
+    return 1;
+}
+
+/* face(id, pad): the guard stands and turns to face the pad (as
+ * AI_TRYFacingTarget); true when it did */
+static int l_guardFace(lua_State *L)
+{
+    const lua_Integer id = luaL_checkinteger(L, 1);
+    const lua_Integer pad = luaL_checkinteger(L, 2);
+
+    lua_pushboolean(L, id >= -32768 && id <= 32767 && pad >= 0 && pad <= 0x7fffffff && gevrModGameRunsGuards()
+                           && gevrModGameFace((int)id, (int)pad));
+    return 1;
+}
+
+/* giveHat(id, hat): one of the cartridge's hats on a living guard that has
+ * none, as the game's own scripts give one (AI_TRYGiveMeHat); true when
+ * it's on. A pack's model in the hat's place (assets/models) changes its look */
+static int l_guardGiveHat(lua_State *L)
+{
+    static const char *const hats[GEVR_MODAPI_HATS + 1] = {
+        "fur", "furbrown", "furblack", "sidecap", "sidecapbrown", "helmet", "helmetgrey", "moon",
+        "beret", "beretblue", "beretred", "peaked", NULL,
+    };
+    const lua_Integer id = luaL_checkinteger(L, 1);
+    const int hat = luaL_checkoption(L, 2, NULL, hats);
+
+    lua_pushboolean(L, id >= -32768 && id <= 32767 && gevrModGameRunsGuards() && gevrModGameGiveHat((int)id, hat));
+    return 1;
+}
+
 static const luaL_Reg s_guardFuncs[] = {
     { "list", l_guardList },
     { "get", l_guardGet },
@@ -721,6 +1434,125 @@ static const luaL_Reg s_guardFuncs[] = {
     { "giveWeapon", l_guardGiveWeapon },
     { "patrol", l_guardPatrol },
     { "paths", l_guardPaths },
+    { "goTo", l_guardGoTo },
+    { "face", l_guardFace },
+    { "giveHat", l_guardGiveHat },
+    { NULL, NULL },
+};
+
+/* ---- mod.pads ---- */
+
+/* count(): the stage's pads (ids 0 up) and its bound pads (ids 10000 up) */
+static int l_padCount(lua_State *L)
+{
+    int bound = 0;
+    const int n = gevrModGamePadCount(&bound);
+
+    lua_pushinteger(L, n);
+    lua_pushinteger(L, bound);
+    return 2;
+}
+
+/* get(id): { x, y, z, room, look = { x, y, z } } in world units, or nil */
+static int l_padGet(lua_State *L)
+{
+    const lua_Integer id = luaL_checkinteger(L, 1);
+    GevrModPad p;
+    int i;
+
+    if (id < 0 || id > 0x7fffffff || !gevrModGamePad((int)id, &p)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    lua_createtable(L, 0, 5);
+    lua_pushnumber(L, p.pos[0]);
+    lua_setfield(L, -2, "x");
+    lua_pushnumber(L, p.pos[1]);
+    lua_setfield(L, -2, "y");
+    lua_pushnumber(L, p.pos[2]);
+    lua_setfield(L, -2, "z");
+    if (p.room >= 0) {
+        lua_pushinteger(L, p.room);
+        lua_setfield(L, -2, "room");
+    }
+    lua_createtable(L, 3, 0);
+    for (i = 0; i < 3; i++) {
+        lua_pushnumber(L, p.look[i]);
+        lua_rawseti(L, -2, i + 1);
+    }
+    lua_setfield(L, -2, "look");
+    return 1;
+}
+
+/* ---- mod.mission ---- */
+
+/* difficulty(): "agent", "secretagent", "00agent" or "007"; nil without one
+ * (multiplayer) */
+static int l_missionDifficulty(lua_State *L)
+{
+    static const char *const names[] = { "agent", "secretagent", "00agent", "007" };
+    const int d = gevrModGameDifficulty();
+
+    if (d < 0 || d > 3) lua_pushnil(L);
+    else lua_pushstring(L, names[d]);
+    return 1;
+}
+
+/* folder(): the save folder the run plays from, 1 to 4 as the folder screen
+ * shows them, or nil */
+static int l_missionFolder(lua_State *L)
+{
+    const int f = gevrModGameFolder();
+
+    if (f < 0 || f > 3) lua_pushnil(L);
+    else lua_pushinteger(L, f + 1);
+    return 1;
+}
+
+/* day(): today's number, whole days since 1 January 1970 (UTC), for daily
+ * challenges; each headset reads its own clock */
+static int l_missionDay(lua_State *L)
+{
+    const time_t now = time(NULL);
+
+    lua_pushinteger(L, now > 0 ? (lua_Integer)(now / 86400) : 0);
+    return 1;
+}
+
+/*
+ * complete(mission, difficulty[, seconds]): the mission (1 Dam to 20 Egypt, the
+ * folder screen's order) marked complete at that difficulty, and those below
+ * it, in the run's save folder, with its time in seconds if given. Only in a
+ * mod campaign, which saves to its own file, never the base game's; true when
+ * written, false outside one or with no folder chosen.
+ */
+static int l_missionComplete(lua_State *L)
+{
+    static const char *const names[] = { "agent", "secretagent", "00agent", "007", NULL };
+    const lua_Integer mission = luaL_checkinteger(L, 1);
+    const int difficulty = luaL_checkoption(L, 2, NULL, names);
+    lua_Integer seconds = 0;
+
+    if (mission < 1 || mission > GEVR_MODAPI_MISSIONS) return luaL_argerror(L, 1, "a mission is 1 (Dam) to 20 (Egypt)");
+    if (!lua_isnoneornil(L, 3)) {
+        seconds = luaL_checkinteger(L, 3);
+        if (seconds < 1 || seconds >= GEVR_MODAPI_NO_TIME) return luaL_argerror(L, 3, "a time is 1 to 99999998 seconds");
+    }
+    lua_pushboolean(L, gevrModGameComplete((int)mission - 1, difficulty, (int)seconds));
+    return 1;
+}
+
+static const luaL_Reg s_missionFuncs[] = {
+    { "difficulty", l_missionDifficulty },
+    { "folder", l_missionFolder },
+    { "day", l_missionDay },
+    { "complete", l_missionComplete },
+    { NULL, NULL },
+};
+
+static const luaL_Reg s_padFuncs[] = {
+    { "count", l_padCount },
+    { "get", l_padGet },
     { NULL, NULL },
 };
 
@@ -760,10 +1592,24 @@ static int l_playerSetArmour(lua_State *L)
     return 1;
 }
 
+/* setSpeed(scale): the local player's walking and strafing, times scale
+ * (0.25 to 2; 1 the game's own), until the mission ends or the mod stops */
+static int l_playerSetSpeed(lua_State *L)
+{
+    const lua_Number v = luaL_checknumber(L, 1);
+
+    if (!(v >= GEVR_MODAPI_SPEED_MIN && v <= GEVR_MODAPI_SPEED_MAX)) {
+        return luaL_argerror(L, 1, "a speed is 0.25 to 2 times the game's own");
+    }
+    gevrModGameSetSpeed((float)v);
+    return 0;
+}
+
 static const luaL_Reg s_playerFuncs[] = {
     { "health", l_playerHealth },
     { "setHealth", l_playerSetHealth },
     { "setArmour", l_playerSetArmour },
+    { "setSpeed", l_playerSetSpeed },
     { NULL, NULL },
 };
 
@@ -1248,6 +2094,264 @@ static int l_uiClose(lua_State *L)
     return 0;
 }
 
+/* ---- mod.attach ---- */
+
+/* which mod attached each (remove and show answer only to it), as ids come back */
+static struct { int id; char mod[64]; } s_attachOwners[GEVR_MODAPI_ATTACH_MAX];
+
+static void attachName(lua_State *L, const char *key, char *out, size_t cap, int optional)
+{
+    size_t n;
+    const char *s;
+
+    const int type = lua_getfield(L, 1, key);
+    if (optional && type == LUA_TNIL) {
+        lua_pop(L, 1);
+        return;
+    }
+    if (type != LUA_TSTRING) luaL_error(L, "mod.attach.add: %s is a model file's name", key);
+    s = lua_tolstring(L, -1, &n);
+    if (!modelNameOk(s, n)) luaL_error(L, "mod.attach.add: %s requires a flat model file name", key);
+    snprintf(out, cap, "%s", s);
+    lua_pop(L, 1);
+}
+
+/* an optional { a, b, c } field of table t within [lo, hi] */
+static void attachTriple(lua_State *L, int t, const char *call, const char *key, float out[3], float lo, float hi,
+                         const char *what)
+{
+    int i;
+
+    if (lua_getfield(L, t, key) == LUA_TNIL) {
+        lua_pop(L, 1);
+        return;
+    }
+    if (!lua_istable(L, -1) || lua_rawlen(L, -1) != 3) luaL_error(L, "%s: %s", call, what);
+    for (i = 0; i < 3; i++) {
+        int ok;
+        lua_Number v;
+
+        lua_rawgeti(L, -1, i + 1);
+        v = lua_tonumberx(L, -1, &ok);
+        lua_pop(L, 1);
+        if (!ok || !(v >= lo && v <= hi)) luaL_error(L, "%s: %s", call, what);
+        out[i] = (float)v;
+    }
+    lua_pop(L, 1);
+}
+
+/* The offset as the game lays a model in a frame (Mtxf rows: the model's X, Y
+ * and Z axes, then its place): turned about the anchor's X, then Y, then Z,
+ * scaled, at at */
+static void attachOffset(float out[4][4], const float at[3], const float turn[3], float scale)
+{
+    const double r = 3.14159265358979 / 180.0;
+    const double cx = cos(turn[0] * r), sx = sin(turn[0] * r), cy = cos(turn[1] * r), sy = sin(turn[1] * r);
+    const double cz = cos(turn[2] * r), sz = sin(turn[2] * r);
+    /* M = Rz Ry Rx: an axis e_i goes to M's column i */
+    const double m[3][3] = {
+        { cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx },
+        { sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx },
+        { -sy, cy * sx, cy * cx },
+    };
+    int i, j;
+
+    for (i = 0; i < 3; i++) {
+        for (j = 0; j < 3; j++) out[i][j] = (float)(m[j][i] * scale);
+        out[i][3] = 0.0f;
+        out[3][i] = at[i];
+    }
+    out[3][3] = 1.0f;
+}
+
+/* table t's at, turn and scale (each optional) as the offset in the anchor's frame */
+static void attachPlacement(lua_State *L, int t, const char *call, float offset[4][4])
+{
+    float at[3] = { 0.0f, 0.0f, 0.0f }, turn[3] = { 0.0f, 0.0f, 0.0f }, scale = 1.0f;
+
+    if (authoredFrame(L, t, call, offset)) {
+        const char *const keys[] = { "at", "turn", "scale" };
+        for (int n = 0; n < 3; ++n) {
+            if (lua_getfield(L, t, keys[n]) != LUA_TNIL) {
+                luaL_error(L, "%s: frame cannot be combined with %s", call, keys[n]);
+            }
+            lua_pop(L, 1);
+        }
+        return;
+    }
+    attachTriple(L, t, call, "at", at, -GEVR_MODAPI_ATTACH_RANGE, GEVR_MODAPI_ATTACH_RANGE, "at is { x, y, z }, -4000 to 4000");
+    attachTriple(L, t, call, "turn", turn, -360.0f, 360.0f, "turn is { x, y, z } in degrees, -360 to 360");
+    if (lua_getfield(L, t, "scale") != LUA_TNIL) {
+        int ok;
+        const lua_Number v = lua_tonumberx(L, -1, &ok);
+
+        if (!ok || !(v >= GEVR_MODAPI_ATTACH_SCALE_MIN && v <= GEVR_MODAPI_ATTACH_SCALE_MAX)) {
+            luaL_error(L, "%s: scale is 0.01 to 100", call);
+        }
+        scale = (float)v;
+    }
+    lua_pop(L, 1);
+    attachOffset(offset, at, turn, scale);
+}
+
+/*
+ * add(t): t = { model, like, on, hand, guard, part, at, turn, scale }. model
+ * is the pack's assets/models/<model>, built over the cartridge's model file
+ * like (a G gun or P prop file: its header). on is "gun" or "hand" (with hand
+ * "right" or "left"), a body anchor (hip_gun, hip_off, back_gun, back_off,
+ * chest, belt), or "guard" (with guard, its id, and part, one of the game's
+ * hit parts: chest, head, pelvis...). at (model units), turn (degrees about
+ * the anchor's X, Y, Z) and scale place it in the anchor's frame. Its id, or
+ * nil when the model won't load, there's no such guard or part, or all are
+ * attached already.
+ */
+static int l_attachAdd(lua_State *L)
+{
+    const char *mod = gevrModScriptIdOf(L);
+    GevrModAttach a;
+    const char *on;
+    int i, id;
+
+    luaL_checktype(L, 1, LUA_TTABLE);
+    memset(&a, 0, sizeof(a));
+    attachName(L, "model", a.model, sizeof(a.model), 0);
+    attachName(L, "like", a.like, sizeof(a.like), 1);
+    if (lua_getfield(L, 1, "on") != LUA_TSTRING) {
+        luaL_error(L, "mod.attach.add: on is \"gun\", \"hand\", a body anchor or \"guard\"");
+    }
+    on = lua_tostring(L, -1);
+    if (!strcmp(on, "guard")) {
+        int whole;
+        lua_Integer g;
+
+        if (lua_getfield(L, 1, "node") != LUA_TNIL) luaL_error(L, "mod.attach.add: node is for the gun only");
+        lua_pop(L, 1);
+        lua_getfield(L, 1, "guard");
+        g = lua_tointegerx(L, -1, &whole);
+        if (!whole || g < 0 || g > 32767) luaL_error(L, "mod.attach.add: guard is a guard's id");
+        lua_pop(L, 1);
+        if (lua_getfield(L, 1, "part") != LUA_TSTRING) luaL_error(L, "mod.attach.add: part is a guard's body part (chest, head...)");
+        for (i = 0; i < GEVR_MODAPI_GUARD_PARTS && strcmp(lua_tostring(L, -1), s_bodyPartNames[i]); i++) {
+        }
+        if (i == GEVR_MODAPI_GUARD_PARTS) luaL_error(L, "mod.attach.add: no part %s (chest, head, pelvis ...)", lua_tostring(L, -1));
+        lua_pop(L, 1);
+        a.on = GEVR_MODATTACH_GUARD;
+        a.where = (int)g;
+        a.node = i + 1;   /* HIT_LEFT_FOOT 1 ... */
+    } else if (!strcmp(on, "gun") || !strcmp(on, "hand")) {
+        a.on = !strcmp(on, "gun") ? GEVR_MODATTACH_GUN : GEVR_MODATTACH_HAND;
+        lua_getfield(L, 1, "hand");
+        if (lua_type(L, -1) == LUA_TSTRING && !strcmp(lua_tostring(L, -1), "right")) a.where = 0;
+        else if (lua_type(L, -1) == LUA_TSTRING && !strcmp(lua_tostring(L, -1), "left")) a.where = 1;
+        else luaL_error(L, "mod.attach.add: hand is \"right\" or \"left\" for the gun or a hand");
+        lua_pop(L, 1);
+    } else {
+        if (lua_getfield(L, 1, "node") != LUA_TNIL) luaL_error(L, "mod.attach.add: node is for the gun only");
+        lua_pop(L, 1);
+        for (i = 0; i < GEVR_MODAPI_ANCHORS && strcmp(on, s_anchorNames[i]); i++) {
+        }
+        if (i == GEVR_MODAPI_ANCHORS) luaL_error(L, "mod.attach.add: no anchor %s (gun, hand, %s ...)", on, s_anchorNames[0]);
+        a.on = GEVR_MODATTACH_BODY;
+        a.where = i;
+    }
+    lua_pop(L, 1);
+    if (a.on == GEVR_MODATTACH_GUN) {
+        if (lua_getfield(L, 1, "node") != LUA_TNIL) {
+            int whole;
+            const lua_Integer n = lua_tointegerx(L, -1, &whole);
+
+            if (!whole || n < 0 || n >= GEVR_MODAPI_ATTACH_NODES) {
+                luaL_error(L, "mod.attach.add: node is a gun model's matrix, 0 to 255");
+            }
+            a.node = (int)n;
+        }
+        lua_pop(L, 1);
+    }
+    attachPlacement(L, 1, "mod.attach.add", a.offset);
+    needPlayer(L, "mod.attach.add");
+    id = gevrModGameAttach(&a);
+    if (id <= 0) {
+        lua_pushnil(L);
+        return 1;
+    }
+    for (i = 0; i < GEVR_MODAPI_ATTACH_MAX; i++) {
+        if (s_attachOwners[i].id == 0) {
+            s_attachOwners[i].id = id;
+            snprintf(s_attachOwners[i].mod, sizeof(s_attachOwners[i].mod), "%s", mod);
+            break;
+        }
+    }
+    lua_pushinteger(L, id);
+    return 1;
+}
+
+void gevrModApiAttachGone(int id)
+{
+    int i;
+
+    for (i = 0; id > 0 && i < GEVR_MODAPI_ATTACH_MAX; i++) {
+        if (s_attachOwners[i].id == id) s_attachOwners[i].id = 0;
+    }
+}
+
+/* this mod's attachment's place in s_attachOwners, or -1 */
+static int attachOwned(lua_State *L, lua_Integer id)
+{
+    const char *mod = gevrModScriptIdOf(L);
+    int i;
+
+    for (i = 0; id > 0 && i < GEVR_MODAPI_ATTACH_MAX; i++) {
+        if (s_attachOwners[i].id == id && !strcmp(s_attachOwners[i].mod, mod)) return i;
+    }
+    return -1;
+}
+
+/* remove(id): true when this mod had it */
+static int l_attachRemove(lua_State *L)
+{
+    const int at = attachOwned(L, luaL_checkinteger(L, 1));
+
+    if (at >= 0) {
+        gevrModGameDetach(s_attachOwners[at].id);
+        s_attachOwners[at].id = 0;
+    }
+    lua_pushboolean(L, at >= 0);
+    return 1;
+}
+
+/* show(id, shown): hides or shows it, kept attached; true when this mod has it */
+static int l_attachShow(lua_State *L)
+{
+    const int at = attachOwned(L, luaL_checkinteger(L, 1));
+
+    luaL_checktype(L, 2, LUA_TBOOLEAN);
+    if (at >= 0) gevrModGameAttachShow(s_attachOwners[at].id, lua_toboolean(L, 2));
+    lua_pushboolean(L, at >= 0);
+    return 1;
+}
+
+/* place(id, { at, turn, scale }): moves it in its anchor's frame (a slide
+ * locked back, say), from the next frame; true when this mod has it */
+static int l_attachPlace(lua_State *L)
+{
+    const int at = attachOwned(L, luaL_checkinteger(L, 1));
+    float offset[4][4];
+
+    luaL_checktype(L, 2, LUA_TTABLE);
+    attachPlacement(L, 2, "mod.attach.place", offset);
+    if (at >= 0) gevrModGameAttachPlace(s_attachOwners[at].id, (const float (*)[4])offset);
+    lua_pushboolean(L, at >= 0);
+    return 1;
+}
+
+static const luaL_Reg s_attachFuncs[] = {
+    { "add", l_attachAdd },
+    { "remove", l_attachRemove },
+    { "show", l_attachShow },
+    { "place", l_attachPlace },
+    { NULL, NULL },
+};
+
 static const luaL_Reg s_uiFuncs[] = {
     { "page", l_uiPage },
     { "remove", l_uiRemove },
@@ -1287,11 +2391,20 @@ void gevrModApiOpen(lua_State *L)
     }
     lua_setfield(L, -2, "ammo");
     lua_newtable(L);
+    luaL_setfuncs(L, s_pickupFuncs, 0);
+    lua_setfield(L, -2, "pickups");
+    lua_newtable(L);
     luaL_setfuncs(L, s_handFuncs, 0);
     lua_setfield(L, -2, "hands");
     lua_newtable(L);
     luaL_setfuncs(L, s_guardFuncs, 0);
     lua_setfield(L, -2, "guards");
+    lua_newtable(L);
+    luaL_setfuncs(L, s_padFuncs, 0);
+    lua_setfield(L, -2, "pads");
+    lua_newtable(L);
+    luaL_setfuncs(L, s_missionFuncs, 0);
+    lua_setfield(L, -2, "mission");
     lua_newtable(L);
     luaL_setfuncs(L, s_playerFuncs, 0);
     lua_setfield(L, -2, "player");
@@ -1307,18 +2420,29 @@ void gevrModApiOpen(lua_State *L)
     lua_newtable(L);
     luaL_setfuncs(L, s_uiFuncs, 0);
     lua_setfield(L, -2, "ui");
+    lua_newtable(L);
+    luaL_setfuncs(L, s_attachFuncs, 0);
+    lua_setfield(L, -2, "attach");
 }
+
+static void weaponMemosClear(int hand);
 
 void gevrModApiReset(void)
 {
     int i;
 
+    weaponMemosClear(0);   /* a declined reload or a kept empty gun: asked afresh */
+    weaponMemosClear(1);
     for (i = s_savedCount - 1; i >= 0; i--) {
         gevrModGameSetStats(s_saved[i].item, &s_saved[i].own);
     }
     s_savedCount = 0;
     gevrModGameScope(0, GEVR_MODSCOPE_GAME, 0, NULL, 0.0f, 0.0f);   /* the game's own scopes again */
     gevrModGameScope(1, GEVR_MODSCOPE_GAME, 0, NULL, 0.0f, 0.0f);
+    gevrModGameGunModelReset();   /* and the hands' own models */
+    gevrModGameAttachReset();     /* and nothing attached */
+    gevrModGameSetSpeed(1.0f);    /* and the player's own speed */
+    memset(s_attachOwners, 0, sizeof(s_attachOwners));
 }
 
 /* ---- the weapons area's events ---- */
@@ -1350,6 +2474,7 @@ void gevrModApiFired(int hand, int item)
     GevrModArg a[3];
 
     if (!forLocal()) return;
+    weaponMemosClear(hand);   /* it had rounds: empty again, it's asked again */
     handItem(a, hand, item);
     a[2].kind = GEVR_MODARG_INTEGER;
     a[2].n = gevrModGameLoaded(hand);
@@ -1373,6 +2498,31 @@ int gevrModApiReloadAttempt(int hand, int item, int reserve)
     return declined;
 }
 
+/* out_of_ammo's answer per hand: the item kept in hand, -1 none. The game asks
+ * each tick the trigger is up (gunfire.c), so a kept gun stays kept until it
+ * has rounds (a shot, a reload), is drawn, or the mission or the mod ends */
+static int s_emptyKept[2] = { -1, -1 };
+
+static void weaponMemosClear(int hand)
+{
+    if (hand < 0 || hand > 1) return;
+    s_reloadDeclined[hand] = -1;
+    s_emptyKept[hand] = -1;
+}
+
+int gevrModApiOutOfAmmo(int hand, int item)
+{
+    GevrModArg a[2];
+    int kept;
+
+    if (!forLocal() || hand < 0 || hand > 1) return 0;
+    if (s_emptyKept[hand] == item) return 1;
+    handItem(a, hand, item);
+    kept = gevrModScriptEvent("out_of_ammo", a, 2, 1);
+    s_emptyKept[hand] = kept ? item : -1;
+    return kept;
+}
+
 int gevrModApiReloadDeclined(int hand, int item, int reserve)
 {
     return forLocal() && hand >= 0 && hand <= 1 && s_reloadDeclined[hand] == item
@@ -1393,6 +2543,7 @@ void gevrModApiReloadEnd(int hand, int item)
     GevrModArg a[3];
 
     if (!forLocal()) return;
+    s_emptyKept[hand ? 1 : 0] = -1;   /* rounds in: empty again, it's asked again */
     handItem(a, hand, item);
     a[2].kind = GEVR_MODARG_INTEGER;
     a[2].n = gevrModGameLoaded(hand);
@@ -1404,6 +2555,7 @@ void gevrModApiDrawn(int hand, int item)
     GevrModArg a[2];
 
     if (!forLocal()) return;
+    weaponMemosClear(hand);   /* another gun, or this one again: asked afresh */
     gevrModGameScope(hand, GEVR_MODSCOPE_GAME, item, NULL, 0.0f, 0.0f);   /* a mod sets this gun's in weapon_drawn */
     handItem(a, hand, item);
     gevrModScriptEvent("weapon_drawn", a, 2, 0);
@@ -1527,22 +2679,29 @@ void gevrModApiPickupSpawning(GevrModPickup *p)
     gevrModScriptAsk("pickup_spawning", pushPickup, answerPickup, p, 0);
 }
 
-static void pickupNote(const char *kind, int nargs, int id, int rounds, float armour)
+/* item_pickup(kind, id, rounds, pickup): nargs of id and rounds given, the
+ * rest nil; the pickup's id always fourth (nil when it has none) */
+static void pickupNote(const char *kind, int nargs, int id, int rounds, float armour, int pickup)
 {
-    GevrModArg a[3];
+    GevrModArg a[4];
 
     a[0].kind = GEVR_MODARG_STRING;
     a[0].s = kind;
-    if (armour >= 0) {
+    a[1].kind = a[2].kind = GEVR_MODARG_NIL;
+    if (nargs >= 2 && armour >= 0) {
         a[1].kind = GEVR_MODARG_NUMBER;
         a[1].n = armour;
-    } else {
+    } else if (nargs >= 2) {
         a[1].kind = GEVR_MODARG_INTEGER;
         a[1].n = id;
     }
-    a[2].kind = GEVR_MODARG_INTEGER;
-    a[2].n = rounds;
-    gevrModScriptEvent("item_pickup", a, nargs, 0);
+    if (nargs >= 3) {
+        a[2].kind = GEVR_MODARG_INTEGER;
+        a[2].n = rounds;
+    }
+    a[3].kind = pickup >= 0 ? GEVR_MODARG_INTEGER : GEVR_MODARG_NIL;
+    a[3].n = pickup;
+    gevrModScriptEvent("item_pickup", a, 4, 0);
 }
 
 void gevrModApiItemPickup(const GevrModPickup *p)
@@ -1552,26 +2711,45 @@ void gevrModApiItemPickup(const GevrModPickup *p)
     if (!forLocal()) return;
     switch (p->kind) {
     case GEVR_MODPICKUP_WEAPON:
-        pickupNote("weapon", 2, p->item, 0, -1);
+        pickupNote("weapon", 2, p->item, 0, -1, p->pickup);
         break;
     case GEVR_MODPICKUP_AMMO:
-        pickupNote("ammo", 3, p->ammo, p->rounds, -1);
+        pickupNote("ammo", 3, p->ammo, p->rounds, -1, p->pickup);
         break;
-    case GEVR_MODPICKUP_CRATE:   /* as boxes: one for each type it held */
+    case GEVR_MODPICKUP_CRATE:   /* as boxes: one for each type it held, each with the crate's id */
         for (t = 1; t <= GEVR_MODAPI_AMMO_TYPES; t++) {
-            if (p->crate[t] > 0) pickupNote("ammo", 3, t, p->crate[t], -1);
+            if (p->crate[t] > 0) pickupNote("ammo", 3, t, p->crate[t], -1, p->pickup);
         }
         break;
     case GEVR_MODPICKUP_ARMOUR:
-        pickupNote("armour", 2, 0, 0, p->armour);
+        pickupNote("armour", 2, 0, 0, p->armour, p->pickup);
         break;
     case GEVR_MODPICKUP_KEY:
-        pickupNote("key", 1, 0, 0, -1);
+        pickupNote("key", 1, 0, 0, -1, p->pickup);
         break;
     case GEVR_MODPICKUP_OBJECT:
-        pickupNote("object", 1, 0, 0, -1);
+        pickupNote("object", 1, 0, 0, -1, p->pickup);
         break;
     }
+}
+
+void gevrModApiWeaponDropped(int pickup, int item, int from)
+{
+    GevrModArg a[3];
+
+    if (!gevrModScriptRunning()) return;
+    a[0].kind = pickup >= 0 ? GEVR_MODARG_INTEGER : GEVR_MODARG_NIL;
+    a[0].n = pickup;
+    a[1].kind = GEVR_MODARG_INTEGER;
+    a[1].n = item;
+    if (from == GEVR_MODAPI_FROM_PLAYER) {
+        a[2].kind = GEVR_MODARG_STRING;
+        a[2].s = "player";
+    } else {
+        a[2].kind = from >= 0 ? GEVR_MODARG_INTEGER : GEVR_MODARG_NIL;
+        a[2].n = from;
+    }
+    gevrModScriptEvent("weapon_dropped", a, 3, 0);
 }
 
 /* ---- the hands area's events ---- */

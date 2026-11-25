@@ -12,17 +12,21 @@
 #include "system.h"
 
 int gevrModAssetLast;
+const char *gevrModAssetPendingName;
+int gevrModAssetPendingUsed;
 
-/* A cartridge file's name: letters, digits and _ (the ROM table's), never a path */
+/* A flat asset name, never an absolute path or a directory. */
 static int nameOk(const char *name)
 {
     size_t i;
 
-    if (!name || !name[0]) return 0;
-    for (i = 0; name[i]; i++) {
-        const char c = name[i];
+    size_t n;
 
-        if (i >= 64 || !((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_')) return 0;
+    if (!name || (n = strlen(name)) == 0 || n > 63) return 0;
+    if (n > 4 && strcmp(name + n - 4, ".bin") == 0) n -= 4;
+    for (i = 0; i < n; i++) {
+        const char c = name[i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-')) return 0;
     }
     return 1;
 }
@@ -37,6 +41,40 @@ static int assetPath(char *out, size_t cap, const gevrModInfo *mod, const char *
     n = name ? snprintf(out, cap, "%s/%s/assets/%s/%s", root, mod->m.id, kind, name)
              : snprintf(out, cap, "%s/%s/assets/%s", root, mod->m.id, kind);
     return n > 0 && (size_t)n < cap;
+}
+
+int gevrModAssetNameOk(const char *name)
+{
+    return nameOk(name);
+}
+
+FILE *gevrModAssetOpenModel(const char *name)
+{
+    char path[1024];
+    if (!nameOk(name) || !assetPath(path, sizeof(path), gevrModActive(), "models", name)) return NULL;
+    return fopen(path, "rb");
+}
+
+FILE *gevrModAssetOpenModelOpacity(const char *name)
+{
+    char filename[sizeof(".opaque") + 63], path[1024];
+    if (!nameOk(name)) return NULL;
+    snprintf(filename, sizeof(filename), "%s.opaque", name);
+    if (!assetPath(path, sizeof(path), gevrModActive(), "models", filename)) return NULL;
+    return fopen(path, "rb");
+}
+
+/* a file to read: a folder opens on some systems but gives no byte */
+int gevrModAssetHasModel(const char *name)
+{
+    unsigned char first;
+    FILE *f;
+    int has;
+
+    if ((f = gevrModAssetOpenModel(name)) == NULL) return 0;
+    has = fread(&first, 1, 1, f) == 1;
+    fclose(f);
+    return has;
 }
 
 unsigned int gevrModAssetModel(const char *name, unsigned char *dst, unsigned int capacity, int numSwitches,

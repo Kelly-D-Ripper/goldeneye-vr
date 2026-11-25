@@ -13,6 +13,7 @@
  *     reload <hand> <rounds>       the native reload: asked, then start, the rounds in, end
  *     autoreload <hand> <reserve>  gunfire.c's automatic reload: ASKED unless still declined
  *     draw <hand> <item>           a switch's end
+ *     empty <hand>                 the out-of-ammo switch asks: KEPT or SWITCH
  *     look <hand> <0|1|2>          the models the hand's gun is drawn with
  *     show <item>                  the item's stats now
  *     loadedis <hand>              the hand's rounds now
@@ -34,6 +35,12 @@
  *     online <active> <host> <dedicated> <slot>   the network as this machine sees it
  *     netrecv <mod> <from> <channel> <text> | netoff <mod> <from> | peerready <slot>
  *     frame                        a frame in play (gevrModScriptFrame: the held messages go out)
+ *     slotid|slottaken|slotfreed <kind> <slot>   gevr_modgame.c: a runtime pickup named (SLOTID id),
+ *                                  taken by this player, freed (propobj.c objFree)
+ *     netpickup <mod> <from> <kind> <hex>   net_core.c: a shared pickup's drop (2), claim (3),
+ *                                  award (4) or gone (5)
+ *     pickuptry <kind> <slot> <local>   propobj.c propPickupByPlayer's ask (TRY 1: held back)
+ *     attachgone <id>              gevr_modattach.c: a guard's attachment gone with its body
  *     panel <0|1>                  this build has the in-game screen (input.c gevrPanelAvailable)
  *     ui                           the pages the in-game screen shows now (UIPAGE, UIROW, UIBUTTON, UIASKED)
  *     uiset <page> <row> <value> | uiclick <page> <button> | uiopened   the screen's side
@@ -71,6 +78,7 @@ bool netIsActive(void) { return s_online != 0; }
 bool netIsHost(void) { return s_hostNet != 0; }
 bool netIsDedicated(void) { return s_dedicated != 0; }
 int netGetLocalSlot(void) { return s_slot; }
+int netGetHostSlot(void) { return 0; }
 /* input.c: the in-game screen (mod.ui.open and close) */
 static int s_panel = 1;
 int gevrPanelAvailable(void) { return s_panel; }
@@ -154,6 +162,65 @@ void gevrModGameScope(int hand, int mode, int item, const float at[3], float rad
     printf("\n");
 }
 int gevrModGameLook(int hand) { return s_look[hand]; }
+/* gun.c's per-hand models: a mod's files are the names starting Gtac */
+int gevrModGameGunModel(int hand, int item, const char *name, const float frame[4][4])
+{
+    printf("GUNMODEL %d %d %s\n", hand, item, name ? name : "-");
+    if (frame != NULL) {
+        printf("GUNFRAME %d %.1f %.1f %.1f %.1f %.1f\n", hand,
+               frame[0][0], frame[1][2], frame[2][1], frame[3][1], frame[3][3]);
+        return name != NULL && strcmp(name, "pack-body.bin") == 0;
+    }
+    return name == NULL || strncmp(name, "Gtac", 4) == 0 || strcmp(name, "pack-body.bin") == 0;
+}
+void gevrModGameGunModelReset(void) { printf("GUNMODEL reset\n"); }
+/* gevr_modattach.c: models starting Gno won't load, nor a file past the
+ * mission's GEVR_MODAPI_ATTACH_MODELS; the offset printed whole (-0 as 0) */
+static int s_attachNext = 1, s_attached, s_attachFiles;
+static char s_attachFile[GEVR_MODAPI_ATTACH_MODELS][64];
+static int attachFileLoads(const char *model)
+{
+    int i;
+
+    for (i = 0; i < s_attachFiles; i++) {
+        if (!strcmp(s_attachFile[i], model)) return 1;
+    }
+    if (s_attachFiles >= GEVR_MODAPI_ATTACH_MODELS) return 0;
+    snprintf(s_attachFile[s_attachFiles++], sizeof(s_attachFile[0]), "%s", model);
+    return 1;
+}
+int gevrModGameAttach(const GevrModAttach *a)
+{
+    /* Only the fake pack mesh can load without a cartridge header. Guard 99 isn't there. */
+    int id = (!a->like[0] && strcmp(a->model, "pack-part.bin"))
+           || strncmp(a->model, "Gno", 3) == 0 || (a->on == GEVR_MODATTACH_GUARD && a->where == 99) ? 0
+           : s_attached >= GEVR_MODAPI_ATTACH_MAX ? -1
+           : !attachFileLoads(a->model) ? 0 : s_attachNext++;
+    int i;
+
+    if (id > 0) s_attached++;
+    printf("ATTACH %d %d %d %d %s %s", id, a->on, a->where, a->node, a->model, a->like);
+    for (i = 0; i < 4; i++) {
+        printf(" |%.0f %.0f %.0f %.0f", a->offset[i][0] + 0.0f, a->offset[i][1] + 0.0f, a->offset[i][2] + 0.0f,
+               a->offset[i][3] + 0.0f);
+    }
+    printf("\n");
+    return id;
+}
+int gevrModGameDetach(int id) { printf("DETACH %d\n", id); s_attached--; return 1; }
+int gevrModGameAttachShow(int id, int shown) { printf("ATTACHSHOW %d %d\n", id, shown); return 1; }
+int gevrModGameAttachPlace(int id, const float offset[4][4])
+{
+    int i;
+
+    printf("ATTACHPLACE %d", id);
+    for (i = 0; i < 4; i++) {
+        printf(" |%.0f %.0f %.0f %.0f", offset[i][0] + 0.0f, offset[i][1] + 0.0f, offset[i][2] + 0.0f, offset[i][3] + 0.0f);
+    }
+    printf("\n");
+    return 1;
+}
+void gevrModGameAttachReset(void) { printf("ATTACH reset\n"); s_attached = 0; s_attachFiles = 0; }
 int gevrModGameLoaded(int hand) { return s_loaded[hand]; }
 void gevrModGameSetLoaded(int hand, int rounds) { s_loaded[hand] = rounds; }
 int gevrModGameStats(int item, GevrModWeaponStats *out)
@@ -194,6 +261,36 @@ int gevrModGameTake(int item)
     return had;
 }
 int gevrModGameAmmo(int type) { return s_ammo[type]; }
+/* the game's drops: a weapon slot's id or a box slot's (as gevr_modgame.c
+ * names them), none from guard 999 */
+static int s_dropWeapons, s_dropBoxes;
+static int s_dropArmour;
+int gevrModGameDrop(int item, int ammo, float armour, int from)
+{
+    printf("DROP %d %d %.2f %d\n", item, ammo, armour, from);
+    if (from == 999) return -1;
+    return item ? gevrModApiPickupSlotId(GEVR_MODAPI_PICKUP_WEAPON, s_dropWeapons++)
+         : ammo ? gevrModApiPickupSlotId(GEVR_MODAPI_PICKUP_BOX, s_dropBoxes++)
+         : gevrModApiPickupSlotId(GEVR_MODAPI_PICKUP_ARMOUR, s_dropArmour++);
+}
+void gevrModGameDropsClear(void) { s_dropArmour = 0; }
+int gevrModGamePickupRemove(int kind, int slot)
+{
+    printf("REMOVE %d %d\n", kind, slot);
+    gevrModApiPickupSlotFreed(kind, slot);   /* as objFree tells it */
+    return 1;
+}
+/* the game's own pickup of an awarded one: asks first, as propPickupByPlayer does, then taken and freed */
+int gevrModGamePickupGrant(int kind, int slot)
+{
+    const int held = gevrModApiPickupTry(kind, slot, 1);
+
+    printf("GRANTED %d %d %d\n", kind, slot, held);
+    if (held) return 0;
+    gevrModApiPickupSlotTaken(kind, slot);
+    gevrModApiPickupSlotFreed(kind, slot);
+    return 1;
+}
 void gevrModGameSetAmmo(int type, int rounds) { s_ammo[type] = rounds; }
 int gevrModGameAmmoMax(int type) { return type >= 1 && type <= GEVR_MODAPI_AMMO_TYPES ? s_ammoMax[type] : 0; }
 
@@ -239,6 +336,7 @@ int gevrModGameGuardGun(int item) { return item >= 4 && item <= 25 && item != 23
 
 /* sound and smoke: a bank of 120; guard 99 isn't there */
 int gevrModGameSoundCount(void) { return 120; }
+void gevrModGameSetSpeed(float scale) { printf("SPEED %.2f\n", scale); }
 int gevrModGamePlaySound(int id, float volume, const float *pos)
 {
     if (pos) printf("SOUND %d %.2f %g %g %g\n", id, volume, pos[0], pos[1], pos[2]);
@@ -320,6 +418,56 @@ int gevrModGamePatrol(int id, int path)
     }
     return 0;
 }
+/* three pads and a bound one: pad i at (100 i, 0, -10 i) in room 5 + i, bound 10000 at (999, 1, 2) in no room */
+int gevrModGamePadCount(int *bound)
+{
+    *bound = 1;
+    return 3;
+}
+int gevrModGamePad(int pad, GevrModPad *out)
+{
+    if (pad == 10000) {
+        out->pos[0] = 999; out->pos[1] = 1; out->pos[2] = 2; out->room = -1;
+    } else if (pad >= 0 && pad < 3) {
+        out->pos[0] = 100.0f * pad; out->pos[1] = 0; out->pos[2] = -10.0f * pad; out->room = 5 + pad;
+    } else {
+        return 0;
+    }
+    out->look[0] = 0; out->look[1] = 0; out->look[2] = 1;
+    return 1;
+}
+static int guardAlive(int id)
+{
+    int i;
+
+    for (i = 0; i < s_guardCount; i++) {
+        if (s_guards[i].id == id) return s_guards[i].alive;
+    }
+    return 0;
+}
+int gevrModGameGoTo(int id, int pad, int speed)
+{
+    printf("GOTO %d %d %d\n", id, pad, speed);
+    return guardAlive(id) && (pad < 3 || pad == 10000);
+}
+int gevrModGameDifficulty(void) { return 2; }   /* 00 Agent */
+int gevrModGameFolder(void) { return 3; }       /* the fourth folder */
+static int s_modCampaign = 1;
+int gevrModGameComplete(int mission, int difficulty, int seconds)
+{
+    printf("COMPLETE %d %d %d\n", mission, difficulty, seconds);
+    return s_modCampaign;
+}
+int gevrModGameGiveHat(int id, int hat)
+{
+    printf("HAT %d %d\n", id, hat);
+    return guardAlive(id);
+}
+int gevrModGameFace(int id, int pad)
+{
+    printf("FACE %d %d\n", id, pad);
+    return guardAlive(id) && (pad < 3 || pad == 10000);
+}
 int gevrModGamePaths(int *ids, int max)
 {
     if (max < 2) return 0;
@@ -386,6 +534,7 @@ static void stats(int item, int magazine, int rate, float damage)
     s_stats[item].magazine = magazine;
     s_stats[item].fireRate = rate;
     s_stats[item].damage = damage;
+    s_stats[item].automatic = rate >= 0;
 }
 
 int main(int argc, char **argv)
@@ -399,6 +548,11 @@ int main(int argc, char **argv)
     stats(4, 7, -1, 1.0f);     /* wppk: single shot */
     stats(8, 30, 3, 1.5f);     /* ak47: automatic */
     stats(26, 1, -1, 4.0f);    /* grenade */
+    s_stats[26].throwSpeed = 16.666666f;   /* thrown: the game's own speed and lift, the tracer's look */
+    s_stats[26].throwLift = 5.0f;
+    s_stats[26].guideLength = GEVR_MODAPI_GUIDE_LENGTH;
+    s_stats[26].guideWidth = GEVR_MODAPI_GUIDE_WIDTH;
+    s_stats[26].guideColour[0] = s_stats[26].guideColour[1] = s_stats[26].guideColour[2] = 255;
     for (i = 1; i < argc; i++) {
         const char *cmd = argv[i];
 
@@ -454,6 +608,10 @@ int main(int argc, char **argv)
         } else if (!strcmp(cmd, "look") && i + 2 < argc) {
             s_look[atoi(argv[i + 1])] = atoi(argv[i + 2]);
             i += 2;
+        } else if (!strcmp(cmd, "empty") && i + 1 < argc) {
+            const int hand = atoi(argv[++i]);
+
+            printf("%s\n", gevrModApiOutOfAmmo(hand, s_held[hand]) ? "KEPT" : "SWITCH");
         } else if (!strcmp(cmd, "draw") && i + 2 < argc) {
             const int hand = atoi(argv[i + 1]);
 
@@ -464,6 +622,16 @@ int main(int argc, char **argv)
             const int item = atoi(argv[++i]);
 
             printf("STATS %d %d %d %.2f\n", item, s_stats[item].magazine, s_stats[item].fireRate, s_stats[item].damage);
+        } else if (!strcmp(cmd, "show3") && i + 1 < argc) {
+            const GevrModWeaponStats *s = &s_stats[atoi(argv[++i])];
+
+            printf("STATS3 %.2f %.2f %d %.1f %.1f %d %d %d %d\n", s->throwSpeed, s->throwLift, s->throwGuide,
+                   s->guideLength, s->guideWidth, s->guideColour[0], s->guideColour[1], s->guideColour[2], s->guideFade);
+        } else if (!strcmp(cmd, "show2") && i + 1 < argc) {
+            const GevrModWeaponStats *s = &s_stats[atoi(argv[++i])];
+
+            printf("STATS2 %.2f %.2f %.2f %d %.2f %.2f %d %d\n", s->inaccuracy, s->recoilBack, s->recoilUp, s->sound,
+                   s->loudnessMin, s->loudnessMax, s->automatic, s->fireRate);
         } else if (!strcmp(cmd, "loadedis") && i + 1 < argc) {
             printf("LOADED %d\n", s_loaded[atoi(argv[++i])]);
         } else if ((!strcmp(cmd, "weapon") || !strcmp(cmd, "box") || !strcmp(cmd, "crate") || !strcmp(cmd, "armour"))
@@ -495,6 +663,7 @@ int main(int argc, char **argv)
             const char *kind = argv[++i];
 
             memset(&got, 0, sizeof(got));
+            got.pickup = 77;   /* the pickup's id, passed through as item_pickup's fourth */
             if (!strcmp(kind, "weapon") && i + 1 < argc) {
                 got.kind = GEVR_MODPICKUP_WEAPON;
                 got.item = atoi(argv[++i]);
@@ -513,6 +682,40 @@ int main(int argc, char **argv)
                 got.kind = !strcmp(kind, "key") ? GEVR_MODPICKUP_KEY : GEVR_MODPICKUP_OBJECT;
             }
             gevrModApiItemPickup(&got);
+        } else if (!strcmp(cmd, "campaign") && i + 1 < argc) {
+            s_modCampaign = atoi(argv[++i]);   /* a mod campaign runs (its own save) */
+        } else if (!strcmp(cmd, "attachgone") && i + 1 < argc) {
+            gevrModApiAttachGone(atoi(argv[++i]));
+        } else if (!strcmp(cmd, "pickuptry") && i + 3 < argc) {
+            printf("TRY %d\n", gevrModApiPickupTry(atoi(argv[i + 1]), atoi(argv[i + 2]), atoi(argv[i + 3])));
+            i += 3;
+        } else if (!strcmp(cmd, "netpickup") && i + 4 < argc) {
+            unsigned char bytes[64];
+            int len = 0;
+            const char *hex = argv[i + 4];
+
+            while (hex[0] && hex[1] && len < (int)sizeof(bytes)) {
+                unsigned v;
+
+                sscanf(hex, "%2x", &v);
+                bytes[len++] = (unsigned char)v;
+                hex += 2;
+            }
+            gevrModNetPickup(argv[i + 1], atoi(argv[i + 2]), atoi(argv[i + 3]), bytes, len);
+            i += 4;
+        } else if (!strcmp(cmd, "slotid") && i + 2 < argc) {
+            printf("SLOTID %d\n", gevrModApiPickupSlotId(atoi(argv[i + 1]), atoi(argv[i + 2])));
+            i += 2;
+        } else if (!strcmp(cmd, "slottaken") && i + 2 < argc) {
+            gevrModApiPickupSlotTaken(atoi(argv[i + 1]), atoi(argv[i + 2]));
+            i += 2;
+        } else if (!strcmp(cmd, "slotfreed") && i + 2 < argc) {
+            gevrModApiPickupSlotFreed(atoi(argv[i + 1]), atoi(argv[i + 2]));
+            i += 2;
+        } else if (!strcmp(cmd, "dropped") && i + 3 < argc) {
+            /* propobjSetDropped: a chr's weapon falls */
+            gevrModApiWeaponDropped(atoi(argv[i + 1]), atoi(argv[i + 2]), atoi(argv[i + 3]));
+            i += 3;
         } else if (!strcmp(cmd, "own") && i + 1 < argc) {
             s_inv[atoi(argv[++i])] = 1;
         } else if (!strcmp(cmd, "inv")) {

@@ -33,6 +33,7 @@ extern int VrTouchModel;
 extern int VrAimNoLean, VrAimSight;
 extern int VrMotionThrowing;
 extern float VrMotionThrowStrength, VrMotionThrowPitch, VrMotionThrowGazeAssist;
+extern int VrThrowGuide;
 extern int VrGestureGripUse, VrGestureMineGrab;
 extern int VrForcePull;
 extern int VrBodySlots, VrBodySlotSize;
@@ -51,6 +52,7 @@ extern int VrBeanFillTextures, VrBloodPatch, VrOddjobHat;
 extern int VrEyeMsaa;
 extern float VrRenderScale;          /* Resolution: 0 = the game config's, else the next start's scale */
 extern int VrTextureAniso;           /* anisotropic filtering of HD pack and Bean pictures */
+extern int VrVolumetricExplosions;   /* 1 = 3D volumetric smoke/explosions, 0 = classic sprites (#249) */
 extern float vr_render_scale(void);  /* the eye images' scale this session */
 extern int VrPlayMode, VrBodySlotShow, VrCampaign;
 extern int VrAlly, VrAllyWeapon, VrAllyAggression, VrAllyHealth, VrAllyDamage, VrAllyInvincible;
@@ -76,6 +78,7 @@ extern int VrTouchHaptics, VrGyroAim;   /* vr_settings.cpp: a phone's touch cont
 extern int VrTriggerFeedback;            /* vr_settings.cpp: a pad's triggers */
 extern float VrGyroSpeed;
 static const char *const s_gyroNames[] = { "Off", "While aiming", "Always" };
+static const char *const s_volExpNames[] = { "Classic", "Volumetric" };
 extern void vr_screen_resize(float dist, float fov);
 extern int VrRefreshRate;
 extern int VrSpaceWarp;
@@ -992,6 +995,7 @@ static const Row s_rows[] = {
     { .label = "Throw gaze", .headset = 1, .tooltip = "How much throws bend toward where you look.", .kind = GEVR_SET_RANGE,
       .section = GEVR_SEC_WEAPONS, .where = GEVR_SET_BOTH, .fvar = &VrMotionThrowGazeAssist,
       .lo = 0, .hi = 1, .step = 0.1f, .scale = 100, .fmt = "%.0f%%", .def = 0.5f, .blocked = blockedThrow },
+    TOGGLE(GEVR_SEC_WEAPONS, "Throw guide", VrThrowGuide, "A short line shows where a trigger throw leaves your hand."),
 
     /* Display */
     { .label = "Play mode", .headset = 1, .tooltip = "Stereo VR: you are Bond. Flat screen: the game on a big screen.", .kind = GEVR_SET_CHOICE,
@@ -1063,6 +1067,9 @@ static const Row s_rows[] = {
       .kind = GEVR_SET_CHOICE, .section = GEVR_SEC_GRAPHICS, .lsection = L(GEVR_LSEC_GRAPHICS), .where = GEVR_SET_BOTH,
       .def = NAN, .cpositions = flatMsaaPositions, .cget = flatMsaaGet, .cset = flatMsaaSet, .ctext = flatMsaaText,
       .cdefault = 0, .warning = warnFlatMsaa },
+    { .label = "Explosions", .tooltip = "Volumetric renders 3D smoke and explosions anchored in the world. Classic keeps the original camera-facing sprites. Changes right away.",
+      .kind = GEVR_SET_CHOICE, .section = GEVR_SEC_GRAPHICS, .lsection = L(GEVR_LSEC_GRAPHICS), .where = GEVR_SET_BOTH,
+      .ivar = &VrVolumetricExplosions, .ivalues = s_two, .names = s_volExpNames, .count = 2, .def = NAN },
     { .label = "Frame rate", .flatgame = 1,
       .tooltip = "Auto matches your display's refresh rate and steps down to a steady lower rate if this device can't hold it. "
                  "Or choose a fixed cap or Uncapped.",

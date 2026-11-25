@@ -5697,6 +5697,124 @@ Gfx *gevrGexArmOnWatch(Gfx *gdl, ModelRenderData *templ, const Mtxf *w)
 }
 #endif
 
+#ifdef GEVR
+/*
+ * A mod's model for a hand's gun (mod.weapon.model, gevr_modgame.c): when the
+ * local player's hand draws item, assets/models/<name> from the run's mod in
+ * place of the item's cartridge model, built over the item's header (its
+ * switches, textures and skeleton), as assets/models' replacements are; in
+ * place of GoldenEye X's and Bean's for that hand. A file that doesn't load
+ * leaves the cartridge's (ob.c logs why). The choices are only a table:
+ * each tick, a hand showing another model than its gun's choice loads its gun
+ * again (gevrModGunReconcile), so setting one, clearing one and the reset (a
+ * new mission, a mod stopped) never touch a player that may be gone.
+ */
+#include "gevr_modassets.h"
+#include "gevr_modmesh.h"
+#define GEVR_MODGUN_NAME 64
+static char s_gevrModGun[2][ITEM_IDS_MAX][GEVR_MODGUN_NAME];
+static Mtxf s_gevrModGunFit[2][ITEM_IDS_MAX];
+static u8 s_gevrModGunHasFit[2][ITEM_IDS_MAX];
+static struct
+{
+    const void *owner;           /* the player it was loaded for: another stage's is stale */
+    char name[GEVR_MODGUN_NAME]; /* the mod's model tried at the hand's last load, "" none */
+    s32 in;                      /* and loaded */
+    const GevrModMesh *mesh;      /* self-contained model (the stock skeleton still poses the hand) */
+} s_gevrModGunShown[MAX_PLAYER_COUNT][2];
+
+static const char *gevrModGunModelFor(s32 hand, s32 item)
+{
+    if (hand < 0 || hand > 1 || item <= ITEM_UNARMED || item >= ITEM_IDS_MAX || !s_gevrModGun[hand][item][0]
+        || (netIsActive() && get_cur_playernum() != netGetLocalSlot()))
+    {
+        return NULL;   /* the local human's hands only */
+    }
+    return s_gevrModGun[hand][item];
+}
+
+static s32 gevrModGunShownOk(s32 p, s32 hand)
+{
+    return g_CurrentPlayer != NULL && p >= 0 && p < MAX_PLAYER_COUNT && hand >= 0 && hand <= 1
+        && s_gevrModGunShown[p][hand].owner == g_CurrentPlayer;
+}
+
+/* the hand's gun is drawn with a mod's model now (bondview2.c gevrFitLook, gevr_modgame.c) */
+s32 gevrModGunHeld(s32 hand)
+{
+    const s32 p = get_cur_playernum();
+
+    return gevrModGunShownOk(p, hand) && s_gevrModGunShown[p][hand].in;
+}
+
+const GevrModMesh *gevrModGunMesh(s32 hand)
+{
+    const s32 p = get_cur_playernum();
+    return gevrModGunShownOk(p, hand) ? s_gevrModGunShown[p][hand].mesh : NULL;
+}
+
+/* A new fit for the same file takes effect at the next draw. A different
+ * file or item still loading must not borrow a fit from the pending choice. */
+const Mtxf *gevrModGunFrame(s32 hand)
+{
+    const s32 p = get_cur_playernum();
+    if (!gevrModGunShownOk(p, hand) || s_gevrModGunShown[p][hand].mesh == NULL) return NULL;
+    const s32 item = g_CurrentPlayer->hand_item[hand];
+    const char *name = gevrModGunModelFor(hand, item);
+    if (name == NULL || !s_gevrModGunHasFit[hand][item]
+        || strcmp(name, s_gevrModGunShown[p][hand].name) != 0) return NULL;
+    return &s_gevrModGunFit[hand][item];
+}
+
+/* each tick: a hand showing another model than its gun's choice loads it
+ * again, as gevrUnarmedModelUpdate queues the club's replacement */
+static void gevrModGunReconcile(s32 hand)
+{
+    const s32 p = get_cur_playernum();
+    const char *want, *shown;
+    s32 item;
+
+    if (g_CurrentPlayer->lock_hand_model[hand] || g_CurrentPlayer->hand_invisible[hand] < 0)
+    {
+        return;   /* already loading, or held as it is */
+    }
+    item = g_CurrentPlayer->hand_item[hand];
+    want = gevrModGunModelFor(hand, item);
+    shown = gevrModGunShownOk(p, hand) ? s_gevrModGunShown[p][hand].name : "";
+    if (strcmp(want != NULL ? want : "", shown) != 0)
+    {
+        g_CurrentPlayer->field_2A44[hand] = item;
+        g_CurrentPlayer->hand_invisible[hand] = -3;
+    }
+}
+
+void gevrModGunModelSet(s32 hand, s32 item, const char *name, const float frame[4][4])
+{
+    if (hand >= 0 && hand <= 1 && item > ITEM_UNARMED && item < ITEM_IDS_MAX)
+    {
+        snprintf(s_gevrModGun[hand][item], GEVR_MODGUN_NAME, "%s", name != NULL ? name : "");
+        s_gevrModGunHasFit[hand][item] = name != NULL && frame != NULL;
+        if (s_gevrModGunHasFit[hand][item]) {
+            memcpy(s_gevrModGunFit[hand][item].m, frame, sizeof(s_gevrModGunFit[hand][item].m));
+        }
+    }
+}
+
+void gevrModGunModelReset(void)
+{
+    s32 p, hand;
+    memset(s_gevrModGun, 0, sizeof(s_gevrModGun));
+    memset(s_gevrModGunHasFit, 0, sizeof(s_gevrModGunHasFit));
+    for (p = 0; p < MAX_PLAYER_COUNT; ++p) {
+        for (hand = 0; hand < 2; ++hand) {
+            if (s_gevrModGunShown[p][hand].mesh != NULL) s_gevrModGunShown[p][hand].in = FALSE;
+            s_gevrModGunShown[p][hand].mesh = NULL;
+        }
+    }
+    gevrModMeshReset();
+}
+#endif
+
 void used_to_load_1st_person_model_on_demand(GUNHAND hand)
 {
     u32              size_buffer_weapon;
@@ -5704,8 +5822,16 @@ void used_to_load_1st_person_model_on_demand(GUNHAND hand)
     ModelFileHeader *ptr_weapon_model;
     u8              *buffer_weapon;
     enum ITEM_IDS    item;
+#ifdef GEVR
+    const char      *gevrModTried = NULL;   /* a mod's model tried at this load (mod.weapon.model) */
+    const GevrModMesh *gevrMesh = NULL;
+    s32              gevrModUsed = FALSE;
+#endif
 
     if (!g_CurrentPlayer->ptr_hand_weapon_buffer[hand]) return;
+#ifdef GEVR
+    gevrModGunReconcile(hand);
+#endif
 
     if ((g_CurrentPlayer->hand_invisible[hand] < 0) && (g_CurrentPlayer->lock_hand_model[hand] == 0))
     {
@@ -5769,10 +5895,20 @@ void used_to_load_1st_person_model_on_demand(GUNHAND hand)
                 {
                     texInitPool(&g_CurrentPlayer->item_related[hand], &buffer_weapon[D_80032464[hand]], size_buffer_weapon - D_80032464[hand]);
 #ifdef GEVR
-                    gevrGexGunPrepare(hand, item, &g_CurrentPlayer->copy_of_body_obj_header[hand]);
+                    /* a mod's model for this hand's gun (mod.weapon.model), in GoldenEye X's place */
+                    gevrModTried = gevrModGunModelFor(hand, item);
+                    const int packModel = gevrModMeshLoad(gevrModTried, &gevrMesh);
+                    gevrModAssetPendingName = packModel == 0 ? gevrModTried : NULL;
+                    gevrModAssetPendingUsed = FALSE;
+                    if (gevrModTried == NULL)
+                    {
+                        gevrGexGunPrepare(hand, item, &g_CurrentPlayer->copy_of_body_obj_header[hand]);
+                    }
 #endif
                     load_object_fill_header(&g_CurrentPlayer->copy_of_body_obj_header[hand], (u8 *)ptr_item_text, buffer_weapon, D_80032464[hand], &g_CurrentPlayer->item_related[hand]);
 #ifdef GEVR
+                    gevrModUsed = gevrMesh != NULL || (gevrModTried != NULL && gevrModAssetPendingUsed);
+                    gevrModAssetPendingName = NULL;
                     gevrGexGunDone();
                     /* the new gun's empty off hand now, not at its first draw after the switch */
                     if (hand == GUNRIGHT && gevrGexHeld(GUNRIGHT)
@@ -5794,6 +5930,21 @@ void used_to_load_1st_person_model_on_demand(GUNHAND hand)
             g_CurrentPlayer->hand_invisible[hand] = 1;
             g_CurrentPlayer->hand_item[hand]      = item;
             g_CurrentPlayer->field_2A44[hand]     = -1;
+#ifdef GEVR
+            {
+                /* what this hand shows now: tried, even when its file fell back to the cartridge's, so a
+                 * broken one isn't tried every tick (gevrModGunReconcile) */
+                const s32 p = get_cur_playernum();
+
+                if (p >= 0 && p < MAX_PLAYER_COUNT)
+                {
+                    s_gevrModGunShown[p][hand].owner = g_CurrentPlayer;
+                    snprintf(s_gevrModGunShown[p][hand].name, GEVR_MODGUN_NAME, "%s", gevrModTried != NULL ? gevrModTried : "");
+                    s_gevrModGunShown[p][hand].in = gevrModUsed;
+                    s_gevrModGunShown[p][hand].mesh = gevrMesh;
+                }
+            }
+#endif
         }
         else
         {
@@ -6726,6 +6877,55 @@ void gunInitProjectileFromPlayer(ObjectRecord *obj, coord3d *targetpos, Mtxf *ar
 }
 
 
+#ifdef GEVR
+/*
+ * The trigger throw (one the motion throw didn't make), as the game launches
+ * it: along the aim (world), at the item's speed with a lift upward, then the
+ * player's own motion added. The speed and lift are a mod's for that item if
+ * set (setStats' throwSpeed and throwLift), else the game's own. The thrown
+ * grenades, knives and objects below launch with these, and the throw guide
+ * (gunfire.c gevrThrowGuideDraw) is drawn from the same.
+ */
+extern void gevrModThrowStats(s32 item, f32 *speed, f32 *lift);   /* gevr_modgame.c */
+
+/* the game's own speed for an item's trigger throw (base_velocity below) */
+f32 gevrThrowBaseSpeed(s32 item)
+{
+    if (item == ITEM_THROWKNIFE)
+    {
+        return 25.0f;   /* generate_player_thrown_knife */
+    }
+    if (item == ITEM_GOLDENEYEKEY)
+    {
+        return 6.6666665f;   /* generate_player_thrown_object's key */
+    }
+    return 16.666666f;
+}
+
+void gevrThrowTrigger(s32 hand, f32 speed, const struct coord3d *aim, struct coord3d *out)
+{
+    f32 lift = 5.0f;
+
+    gevrModThrowStats(getCurrentPlayerWeaponId(hand), &speed, &lift);
+    out->f[0] = (aim->f[0] * speed);
+    out->f[1] = (aim->f[1] * speed) + lift;
+    out->f[2] = (aim->f[2] * speed);
+}
+
+void gevrThrowAddMotion(struct coord3d *v)
+{
+    struct PropRecord *me = getCurrentPlayerProp();
+    struct coord3d *prev = getCurrentPlayerPrevPos();
+
+    if (g_ClockTimer > 0)
+    {
+        v->f[0] = ((me->pos.f[0] - prev->f[0]) / g_GlobalTimerDelta) + v->f[0];
+        v->f[1] = ((me->pos.f[1] - prev->f[1]) / g_GlobalTimerDelta) + v->f[1];
+        v->f[2] = ((me->pos.f[2] - prev->f[2]) / g_GlobalTimerDelta) + v->f[2];
+    }
+}
+#endif
+
 /**
  * Address 0x7F05EE24 (NTSC)
  * Address 0x7F05F2DC (PAL)
@@ -6771,17 +6971,26 @@ void generate_player_thrown_grenade(s32 hand)
     else
 #endif
     {
+#ifdef GEVR
+        /* the trigger throw: the item's speed and lift, a mod's if set (the guide's own calculation) */
+        gevrThrowTrigger(hand, base_velocity, &base_speed_vec, &throw_speed_vec);
+#else
         throw_speed_vec.f[0] = (base_speed_vec.f[0] * base_velocity);
         throw_speed_vec.f[1] = (base_speed_vec.f[1] * base_velocity) + 5.0f;
         throw_speed_vec.f[2] = (base_speed_vec.f[2] * base_velocity);
+#endif
     }
 
+#ifdef GEVR
+    gevrThrowAddMotion(&throw_speed_vec);   /* the player's own motion */
+#else
     if (g_ClockTimer > 0)
     {
         throw_speed_vec.f[0] = ((player_prop->pos.f[0] - bondprevpos->f[0]) / g_GlobalTimerDelta) + throw_speed_vec.f[0];
         throw_speed_vec.f[1] = ((player_prop->pos.f[1] - bondprevpos->f[1]) / g_GlobalTimerDelta) + throw_speed_vec.f[1];
         throw_speed_vec.f[2] = ((player_prop->pos.f[2] - bondprevpos->f[2]) / g_GlobalTimerDelta) + throw_speed_vec.f[2];
     }
+#endif
 
     spE0.f[0] = g_CurrentPlayer->hands[hand].throw_item_pos_related.m[3][0];
     spE0.f[1] = g_CurrentPlayer->hands[hand].throw_item_pos_related.m[3][1];
@@ -6874,17 +7083,26 @@ void generate_player_thrown_knife(s32 hand)
     else
 #endif
     {
+#ifdef GEVR
+        /* the trigger throw: the item's speed and lift, a mod's if set (the guide's own calculation) */
+        gevrThrowTrigger(hand, base_velocity, &base_speed_vec, &throw_speed_vec);
+#else
         throw_speed_vec.f[0] = (base_speed_vec.f[0] * base_velocity);
         throw_speed_vec.f[1] = (base_speed_vec.f[1] * base_velocity) + 5.0f;
         throw_speed_vec.f[2] = (base_speed_vec.f[2] * base_velocity);
+#endif
     }
 
+#ifdef GEVR
+    gevrThrowAddMotion(&throw_speed_vec);   /* the player's own motion */
+#else
     if (g_ClockTimer > 0)
     {
         throw_speed_vec.f[0] = ((player_prop->pos.f[0] - bondprevpos->f[0]) / g_GlobalTimerDelta) + throw_speed_vec.f[0];
         throw_speed_vec.f[1] = ((player_prop->pos.f[1] - bondprevpos->f[1]) / g_GlobalTimerDelta) + throw_speed_vec.f[1];
         throw_speed_vec.f[2] = ((player_prop->pos.f[2] - bondprevpos->f[2]) / g_GlobalTimerDelta) + throw_speed_vec.f[2];
     }
+#endif
 
     spE0.f[0] = g_CurrentPlayer->hands[hand].throw_item_pos_related.m[3][0];
     spE0.f[1] = g_CurrentPlayer->hands[hand].throw_item_pos_related.m[3][1];
@@ -6993,17 +7211,26 @@ void generate_player_thrown_object(s32 hand)
     else
 #endif
     {
+#ifdef GEVR
+        /* the trigger throw: the item's speed and lift, a mod's if set (the guide's own calculation) */
+        gevrThrowTrigger(hand, base_velocity, &base_speed_vec, &throw_speed_vec);
+#else
         throw_speed_vec.f[0] = (base_speed_vec.f[0] * base_velocity);
         throw_speed_vec.f[1] = (base_speed_vec.f[1] * base_velocity) + 5.0f;
         throw_speed_vec.f[2] = (base_speed_vec.f[2] * base_velocity);
+#endif
     }
 
+#ifdef GEVR
+    gevrThrowAddMotion(&throw_speed_vec);   /* the player's own motion */
+#else
     if (g_ClockTimer > 0)
     {
         throw_speed_vec.f[0] = ((player_prop->pos.f[0] - bondprevpos->f[0]) / g_GlobalTimerDelta) + throw_speed_vec.f[0];
         throw_speed_vec.f[1] = ((player_prop->pos.f[1] - bondprevpos->f[1]) / g_GlobalTimerDelta) + throw_speed_vec.f[1];
         throw_speed_vec.f[2] = ((player_prop->pos.f[2] - bondprevpos->f[2]) / g_GlobalTimerDelta) + throw_speed_vec.f[2];
     }
+#endif
 
     spE0.f[0] = g_CurrentPlayer->hands[hand].throw_item_pos_related.m[3][0];
     spE0.f[1] = g_CurrentPlayer->hands[hand].throw_item_pos_related.m[3][1];

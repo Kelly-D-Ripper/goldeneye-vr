@@ -1305,7 +1305,10 @@ static void netReadPrintable(struct netbuf *buf, char *dst, size_t cap) {
 /* ---- Mods' messages (NET_MSG_MOD; docs/mod-system.md, mod.net) ---- */
 
 _Static_assert(NET_MOD_PAYLOAD_MAX == GEVR_MODAPI_NET_PAYLOAD && NET_MOD_CHANNEL_MAX == GEVR_MODAPI_NET_CHANNEL
-               && (int)NET_MOD_DATA == (int)GEVR_MODNET_DATA && (int)NET_MOD_OFF == (int)GEVR_MODNET_OFF,
+               && (int)NET_MOD_DATA == (int)GEVR_MODNET_DATA && (int)NET_MOD_OFF == (int)GEVR_MODNET_OFF
+               && (int)NET_MOD_DROP == (int)GEVR_MODNET_DROP && (int)NET_MOD_CLAIM == (int)GEVR_MODNET_CLAIM
+               && (int)NET_MOD_GRANT == (int)GEVR_MODNET_GRANT && (int)NET_MOD_GONE == (int)GEVR_MODNET_GONE
+               && NET_MOD_DROP_BYTES == GEVR_MODAPI_NET_DROP_BYTES && NET_MOD_PICKUP_BYTES == GEVR_MODAPI_NET_PICKUP_BYTES,
                "mod.net's limits as the wire's");
 
 /* A mod's id or channel: 1 to cap - 1 printable characters, no spaces; 0 else */
@@ -1330,9 +1333,15 @@ int netSendModMessage(int kind, int to, const char *mod, const char *channel, co
     struct netbuf buf = { .data = raw, .size = sizeof(raw) };
 
     if (s_state != NET_STATE_INGAME || !s_host || !mod || !mod[0] || strlen(mod) > GEVR_MOD_ID_MAX) return 0;
-    if (kind != NET_MOD_DATA && kind != NET_MOD_OFF) return 0;
+    if (kind < NET_MOD_DATA || kind > NET_MOD_GONE) return 0;
     if (kind == NET_MOD_DATA && (!channel || !channel[0] || strlen(channel) > NET_MOD_CHANNEL_MAX || len < 0 ||
                                  len > NET_MOD_PAYLOAD_MAX || (len > 0 && !data))) return 0;
+    /* a shared pickup's: its fixed bytes; a drop and an award the host's, to
+     * everyone; a claim a player's, to the host */
+    if (kind >= NET_MOD_DROP
+        && (!data || len != (kind == NET_MOD_DROP ? NET_MOD_DROP_BYTES : NET_MOD_PICKUP_BYTES)
+            || ((kind == NET_MOD_DROP || kind == NET_MOD_GRANT) && (!netIsHost() || to != 0xFF))
+            || (kind == NET_MOD_CLAIM && (netIsHost() || to != s_host_slot)))) return 0;
     if (to != 0xFF && (to < 0 || to >= GEVR_MAX_PLAYERS || to == s_local_slot)) return 0;
     netbufStartWrite(&buf);
     netbufWriteU32(&buf, GEVR_NET_MAGIC);netbufWriteU16(&buf, GEVR_NET_VERSION);
@@ -1343,6 +1352,8 @@ int netSendModMessage(int kind, int to, const char *mod, const char *channel, co
         netbufWriteStr(&buf, channel);
         netbufWriteU16(&buf, (uint16_t)len);
         if (len > 0) netbufWriteData(&buf, data, (u32)len);
+    } else if (kind >= NET_MOD_DROP) {
+        netbufWriteData(&buf, data, (u32)len);
     }
     if (buf.error) return 0;
     if (netIsHost()) {
@@ -1372,12 +1383,21 @@ static void netReceiveMod(ENetPeer *peer, uint8_t slot_id, const uint8_t *data, 
     if (s_state != NET_STATE_INGAME) return;
     kind = netbufReadU8(buf);
     to = netbufReadU8(buf);
-    if (buf->error || (kind != NET_MOD_DATA && kind != NET_MOD_OFF) || !netReadModName(buf, mod, sizeof(mod))) return;
+    if (buf->error || kind > NET_MOD_GONE || !netReadModName(buf, mod, sizeof(mod))) return;
     channel[0] = '\0';
     if (kind == NET_MOD_DATA) {
         if (!netReadModName(buf, channel, sizeof(channel))) return;
         len = netbufReadU16(buf);
         if (buf->error || len > NET_MOD_PAYLOAD_MAX || netbufReadLeft(buf) != len) return;
+        payload = buf->data + buf->rp;
+    } else if (kind >= NET_MOD_DROP) {
+        /* a shared pickup's, its fixed bytes: a drop or an award only the host's
+         * own, to everyone; a claim only to the host */
+        len = kind == NET_MOD_DROP ? NET_MOD_DROP_BYTES : NET_MOD_PICKUP_BYTES;
+        if (netbufReadLeft(buf) != len) return;
+        if ((kind == NET_MOD_DROP || kind == NET_MOD_GRANT)
+            && (to != 0xFF || netIsHost() || slot_id != (uint8_t)s_host_slot)) return;
+        if (kind == NET_MOD_CLAIM && (!netIsHost() || to != (uint8_t)s_local_slot)) return;
         payload = buf->data + buf->rp;
     } else if (netbufReadLeft(buf) != 0) {
         return;
@@ -1407,7 +1427,8 @@ static void netReceiveMod(ENetPeer *peer, uint8_t slot_id, const uint8_t *data, 
         if (peer != s_server_peer || (to != 0xFF && to != s_local_slot)) return;
     }
     if (kind == NET_MOD_DATA) gevrModNetReceive(mod, slot_id < GEVR_MAX_PLAYERS ? slot_id : -1, channel, payload, len);
-    else gevrModNetStopped(mod, slot_id < GEVR_MAX_PLAYERS ? slot_id : -1);
+    else if (kind == NET_MOD_OFF) gevrModNetStopped(mod, slot_id < GEVR_MAX_PLAYERS ? slot_id : -1);
+    else gevrModNetPickup(mod, slot_id < GEVR_MAX_PLAYERS ? slot_id : -1, kind, payload, len);
 }
 
 /* The host, turning a joiner away for its mod: which mod it plays ("" none) */

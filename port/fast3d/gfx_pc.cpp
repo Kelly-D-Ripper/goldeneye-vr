@@ -91,6 +91,7 @@ static unsigned s_beanPaintUploads, s_beanPaintHits;
 extern "C" int gevrStatsPicture(const void *addr, const uint8_t **rgba, int *w, int *h);   // bondview2.c
 #include "gevr_bean.h"
 #include "gevr_modassets.h"   /* a mod's textures (assets/textures) */
+#include "gevr_packmesh.h"
 #include "gevr_modpack.h"
 #include "gevr_romlayout.h"
 #include "gevr_oddjobhat.h"
@@ -198,6 +199,7 @@ extern "C" void vr_get_eye_view_proj_gl(int eye, float outVP[16]);
 extern "C" void gevrVrMarkEyesRendered(int stereo); // vr_openxr.cpp
 void gfx_vr_hud_H_new_frame(void);                  // gfx_opengl.cpp
 void gfx_opengl_draw_vignette(float strength, float blink);   // gfx_opengl.cpp
+void gfx_opengl_draw_volumetric(int batchId);                 // gfx_opengl.cpp (issue #249)
 extern "C" float gevrStereoVignette(void);          // bondview2.c
 extern "C" float gevrTeleportBlink(void);           // gevr_teleport.c: the teleport's blink, 0..1
 void gfx_vr_scope_record(bool on, bool invert_y);   // gfx_opengl.cpp (issue #40)
@@ -2089,7 +2091,9 @@ static void import_texture(int i, int tile, bool is_rect) {
         int beanW = 0, beanH = 0;
         const void *frameAddr = gevrBeanTextureFrame(loaded_texture.addr, g_GlobalTimer / 60.0f);
         /* Mods: Oddjob's hat loads its pictures the same way (gevr_oddjobhat.c) */
-        if ((gevrBeanTexture(frameAddr, &beanRgba, &beanW, &beanH) || gevrHatTexture(frameAddr, &beanRgba, &beanW, &beanH))
+        if ((gevrBeanTexture(frameAddr, &beanRgba, &beanW, &beanH)
+             || gevrHatTexture(frameAddr, &beanRgba, &beanW, &beanH)
+             || gevrPackMeshTexture(frameAddr, &beanRgba, &beanW, &beanH))
             && beanRgba && beanW > 0 && beanH > 0) {
             /* UV normalization below uses the logical tile, not the 16x16
              * stand-in's byte count. Keep both axes in those same units. */
@@ -5446,6 +5450,51 @@ static void gfx_run_dl(Gfx* cmd) {
             // RSP commands:
             case G_NOOP: {
                 uint32_t tag_w1 = cmd->words.w1;
+                if (tag_w1 == GEVR_PACKMESH_DRAW_BEGIN || tag_w1 == GEVR_PACKMESH_DRAW_END) {
+                    // Pack texture blocks only load TMEM slot 0. Keep the caller's tile and
+                    // material state: a stock hand or attachment may draw immediately after us.
+                    static struct {
+                        uint32_t geometry, modeL, modeH, paletteFmt;
+                        uint64_t combine;
+                        bool texLod, texDetail;
+                        uint8_t firstTile, maxLod;
+                        decltype(rsp.texture_scaling_factor) scale;
+                        decltype(rdp.texture_to_load) pending;
+                        decltype(rdp.texture_tile) tiles;
+                        LoadedTexture loaded;
+                    } saved;
+                    if (tag_w1 == GEVR_PACKMESH_DRAW_BEGIN) {
+                        saved.geometry = rsp.geometry_mode;
+                        saved.modeL = rdp.other_mode_l;
+                        saved.modeH = rdp.other_mode_h;
+                        saved.paletteFmt = rdp.palette_fmt;
+                        saved.combine = rdp.combine_mode;
+                        saved.texLod = rdp.tex_lod;
+                        saved.texDetail = rdp.tex_detail;
+                        saved.firstTile = rdp.first_tile_index;
+                        saved.maxLod = rdp.tex_max_lod;
+                        saved.scale = rsp.texture_scaling_factor;
+                        saved.pending = rdp.texture_to_load;
+                        memcpy(saved.tiles, rdp.texture_tile, sizeof(saved.tiles));
+                        saved.loaded = rdp.loaded_texture[0];
+                    } else {
+                        rsp.geometry_mode = saved.geometry;
+                        rdp.other_mode_l = saved.modeL;
+                        rdp.other_mode_h = saved.modeH;
+                        rdp.palette_fmt = saved.paletteFmt;
+                        rdp.combine_mode = saved.combine;
+                        rdp.tex_lod = saved.texLod;
+                        rdp.tex_detail = saved.texDetail;
+                        rdp.first_tile_index = saved.firstTile;
+                        rdp.tex_max_lod = saved.maxLod;
+                        rsp.texture_scaling_factor = saved.scale;
+                        rdp.texture_to_load = saved.pending;
+                        memcpy(rdp.texture_tile, saved.tiles, sizeof(saved.tiles));
+                        rdp.loaded_texture[0] = saved.loaded;
+                        rdp.textures_changed[0] = rdp.textures_changed[1] = true;
+                    }
+                    break;
+                }
                 if ((tag_w1 & 0xffff0000) == 0x47450000) {
                     if (tag_w1 == 0x4745ffff) {
                         if (gevrMenuTrace) {
@@ -5462,6 +5511,24 @@ static void gfx_run_dl(Gfx* cmd) {
                         gevrMenuVertices = gevrMenuTriangles = gevrMenuClipped = gevrMenuCulled = 0;
                         if (gevrMenuTrace) vr_log("menubg-rsp: begin menu=%u", menu);
                     }
+                    break;
+                }
+                if ((tag_w1 & 0xFFFF0000u) == 0x56640000u) {
+                    // GEVR_VOL_DL_TAG_PREFIX (issue #249): analytical 3D volumetric
+                    // smoke/explosion batch drawn in-place in transparency order
+                    gfx_flush();
+                    if (rdp.viewport_or_scissor_changed) {
+                        if (memcmp(&rdp.viewport, &rendering_state.viewport, sizeof(rdp.viewport)) != 0) {
+                            gfx_rapi->set_viewport(rdp.viewport.x, rdp.viewport.y, rdp.viewport.width, rdp.viewport.height);
+                            rendering_state.viewport = rdp.viewport;
+                        }
+                        if (memcmp(&rdp.scissor, &rendering_state.scissor, sizeof(rdp.scissor)) != 0) {
+                            gfx_rapi->set_scissor(rdp.scissor.x, rdp.scissor.y, rdp.scissor.width, rdp.scissor.height);
+                            rendering_state.scissor = rdp.scissor;
+                        }
+                        rdp.viewport_or_scissor_changed = false;
+                    }
+                    gfx_opengl_draw_volumetric((int)(tag_w1 & 0xFFFFu));
                     break;
                 }
                 if ((tag_w1 & 0xFFFF0000u) == 0x56630000u) {
@@ -6871,6 +6938,9 @@ extern "C" void gfx_end_frame(void) {
         gfx_rapi->finish_render();
         gfx_wapi->swap_buffers_end();
     }
+#ifdef GEVR
+    gevrPackMeshCollect();
+#endif
 }
 
 extern "C" void gfx_set_target_fps(int fps) {

@@ -334,6 +334,7 @@ extern "C" void vrSettingsSave(void)
     iniPrintf(f, "MotionThrowPitch=%.1f\n", VrMotionThrowPitch);
     iniPrintf(f, "MotionThrowGazeAssist=%.2f\n", VrMotionThrowGazeAssist);
     iniPrintf(f, "MotionThrowStrength=%.2f\n", VrMotionThrowStrength);
+    iniPrintf(f, "ThrowGuide=%d\n", VrThrowGuide ? 1 : 0);
     iniPrintf(f, "Vibration=%.4f\n", inputRumbleGetStrength(g_ExtMenuPlayer));
     iniPrintf(f, "PadDefaults=2\n");   // #269: Vibration's default is 30%; an older ini's 0.5 was the old default
     iniPrintf(f, "PadLookSpeed=%.2f\nPadLookDeadzone=%.4f\nPadLookInvert=%d\n", inputPadLookSpeed(),
@@ -424,6 +425,8 @@ extern "C" void vrSettingsSave(void)
     iniPrintf(f, "EyeResolution=%.2f\n", VrRenderScale);
     iniPrintf(f, "; Anisotropic filtering of HD pack and Bean textures: 0 = Auto (this headset's), 1 = off, 2, 4, 8 or 16.\n");
     iniPrintf(f, "TextureAniso=%d\n", VrTextureAniso);
+    iniPrintf(f, "; 1 = 3D volumetric smoke and explosions (all modes), 0 = classic flat sprites.\n");
+    iniPrintf(f, "VolumetricExplosions=%d\n", VrVolumetricExplosions ? 1 : 0);
     iniPrintf(f, "; CPU performance level asked of the headset at start: -1 = none, 0 = power savings,\n");
     iniPrintf(f, "; 1 = sustained low, 2 = sustained high (lifts the CPU cap on battery).\n");
     iniPrintf(f, "CpuLevel=%d\n", VrCpuLevel);
@@ -1031,6 +1034,7 @@ extern "C" void vrSettingsLoad(void)
             else if (strcmp(key, "LaserDotForAll") == 0) VrlaserDotForALL = ival != 0;
             else if (strcmp(key, "SeatedMode") == 0) VrSeatedMode = ival != 0;
             else if (strcmp(key, "MotionThrowing") == 0) VrMotionThrowing = ival != 0;
+            else if (strcmp(key, "ThrowGuide") == 0) VrThrowGuide = ival != 0;
             else if (strcmp(key, "WeaponRecoil") == 0) VrWeaponRecoil = (ival != 0);
             else if (strcmp(key, "StickClickToCrouch") == 0) VrStickClickToCrouch = (ival != 0);
             else if (strcmp(key, "AimNoLean") == 0) VrAimNoLean = (ival != 0);
@@ -1089,6 +1093,7 @@ extern "C" void vrSettingsLoad(void)
             else if (strcmp(key, "EyeMsaa") == 0) VrEyeMsaa = ival >= 4 ? 4 : ival >= 2 ? 2 : 1;   // 4x is back, warned
 #endif
             else if (strcmp(key, "TextureAniso") == 0) VrTextureAniso = ival <= 0 ? 0 : ival >= 16 ? 16 : ival >= 8 ? 8 : ival >= 4 ? 4 : ival >= 2 ? 2 : 1;
+            else if (strcmp(key, "VolumetricExplosions") == 0) VrVolumetricExplosions = ival != 0;
             else if (strcmp(key, "CpuLevel") == 0) VrCpuLevel = ival < 0 ? -1 : ival > 2 ? 2 : ival;
             else if (strcmp(key, "BatTwoHand") == 0) VrBatTwoHand = ival ? 1 : 0;
             else if (strcmp(key, "RenderScale") == 0) VrResetRenderScale = 1;

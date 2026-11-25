@@ -936,6 +936,48 @@ static void gevrCheatProbe(s32 inlevel)
             sysLogPrintf(LOG_NOTE, "cheathook: guards' detailed guns %s", g_gevrHeldGunGuards ? "on" : "off");
             continue;
         }
+        /* "vol0" / "vol1": live-switch volumetric explosions (#249) for A/B profiling */
+        if (strcasecmp(word, "vol0") == 0 || strcasecmp(word, "vol1") == 0)
+        {
+            extern int VrVolumetricExplosions;
+            VrVolumetricExplosions = (word[3] == '1') ? 1 : 0;
+            sysLogPrintf(LOG_NOTE, "cheathook: volumetric explosions %s", VrVolumetricExplosions ? "on" : "off");
+            continue;
+        }
+        /* "boom<N>": spawn N grenade explosions (type 0xD, default 1, max 6) directly
+         * ahead of Bond for repeatable A/B smoke & fireball performance benchmarks */
+        if (strncasecmp(word, "boom", 4) == 0)
+        {
+            s32 n = word[4] ? atoi(word + 4) : 1;
+            s32 k;
+            Mtxf *v2w = currentPlayerGetViewToWorldMtxf();
+            coord3d base = g_CurrentPlayer->prop->pos;
+            StandTile *tile = g_CurrentPlayer->prop->stan;
+            u8 rooms[2];
+            if (n < 1) n = 1;
+            if (n > 6) n = 6;
+            rooms[0] = (tile != NULL) ? (u8)getTileRoom(tile) : g_CurrentPlayer->prop->rooms[0];
+            rooms[1] = 0xFF;
+            for (k = 0; k < n; k++)
+            {
+                coord3d pos = base;
+                f32 side = ((f32)k - 0.5f * (f32)(n - 1)) * 120.0f;
+                f32 fwd = 340.0f + (f32)(k & 1) * 80.0f;
+                if (v2w != NULL)
+                {
+                    pos.x += -v2w->m[2][0] * fwd + v2w->m[0][0] * side;
+                    pos.y -= 40.0f;
+                    pos.z += -v2w->m[2][2] * fwd + v2w->m[0][2] * side;
+                }
+                else
+                {
+                    pos.z -= fwd;
+                }
+                explosionCreate(NULL, &pos, tile, 0xD, 1, get_cur_playernum(), rooms, 0);
+            }
+            sysLogPrintf(LOG_NOTE, "cheathook: boom %d grenade blasts", n);
+            continue;
+        }
         /* "blast<R>": every object within R units of Bond (600 if none) takes the
          * damage that destroys it, as a shot's would (objApplyDamage): destroyed
          * props, scorched and crumpled, without aiming from the PC */
@@ -1778,6 +1820,36 @@ static s32 gevrGripAxesRaw(s32 ctrl, f32 pos[3], f32 right[3], f32 up[3], f32 ba
     return TRUE;
 }
 
+/*
+ * mod.attach (gevr_modattach.c): a hand's controller grip as a frame, view space,
+ * at the viewmodel's scale (a gun model's units, 0.085 cm each at the player's
+ * gun size): the hand's left, up and ahead as the model's X, Y and Z, as the
+ * body slots' frames. hand: GUNRIGHT the gun hand (controller 1), GUNLEFT the
+ * off hand. The raw pose: a two-handed aim doesn't turn what a hand carries.
+ */
+s32 gevrModAttachHandFrame(s32 hand, Mtxf *root)
+{
+    extern f32 gevrGunSizeNow(s32 *setting, s32 *online);   /* below */
+    f32 pos[3], right[3], up[3], back[3], k;
+    s32 setting, online, i;
+
+    if (!g_gevrStereo || !gevrGripAxesRaw(hand == GUNRIGHT ? 1 : 0, pos, right, up, back))
+    {
+        return FALSE;
+    }
+    k = 0.085f * D_800364CC * gevrGunSizeNow(&setting, &online);
+    for (i = 0; i < 3; i++)
+    {
+        root->m[0][i] = -right[i] * k;
+        root->m[1][i] = up[i] * k;
+        root->m[2][i] = -back[i] * k;
+        root->m[3][i] = pos[i];
+    }
+    root->m[0][3] = root->m[1][3] = root->m[2][3] = 0.0f;
+    root->m[3][3] = 1.0f;
+    return TRUE;
+}
+
 /* Every user of the gun hand's axes comes through here - the gun, its shots,
  * sight, muzzle and scope - so the two-handed aim (issue #35) turns them all,
  * as Perfect Dark VR's vrBuildGunRotation is the one writer of the gun's
@@ -2230,8 +2302,9 @@ f32 gevrGunSizeNow(s32 *setting, s32 *online)
 int gevrFitLook(int hand)
 {
     extern int gevrBeanIsEnabled(void);
+    extern s32 gevrModGunHeld(s32 hand);   /* gun.c: a mod's model, over the cartridge's, takes GoldenEye's fits */
 
-    return gevrGexHeld(hand) ? 1 : gevrBeanIsEnabled() ? 2 : 0;
+    return gevrGexHeld(hand) ? 1 : gevrBeanIsEnabled() && !gevrModGunHeld(hand) ? 2 : 0;
 }
 
 /*
@@ -13422,6 +13495,16 @@ void bondviewProcessInput(s8 stick_x, s8 stick_y, u16 buttons, u16 oldbuttons)
 
         g_CurrentPlayer->speedforwards *= 1.08f;
         g_CurrentPlayer->speedforwards *= g_CurrentPlayer->speedboost;
+#ifdef GEVR
+        {
+            /* a mod's mod.player.setSpeed (gevr_modgame.c): the local player's walk and strafe */
+            extern f32 gevrModMoveScale(void);
+            const f32 k = gevrModMoveScale();
+
+            g_CurrentPlayer->speedforwards *= k;
+            g_CurrentPlayer->speedsideways *= k;
+        }
+#endif
 
         if ((moveData.canLookAhead == 0) && (moveData.digitalStepForward == 0))
         {
@@ -19011,6 +19094,8 @@ void gevrAutoAdvanceHand(s32 hand)
 
         if (gevrGexMinesHold(hand))
             return;   /* GE-X's remote mines: the watch detonates them, the hand stays */
+        if (gevrModApiOutOfAmmo(hand, item))
+            return;   /* a mod keeps the empty gun in hand (out_of_ammo, gevr_modapi.c) */
         if (hand == GUNRIGHT && item == ITEM_REMOTEMINE && bondinvItemAvailable(ITEM_TRIGGER) && !VrGexGuns)
             gunRequestHandWeaponChange(hand, ITEM_TRIGGER, 1);
         else

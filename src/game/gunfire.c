@@ -17,6 +17,10 @@
 #include "bondview.h"
 #include "bondinv.h"
 #include "gun.h"
+#ifdef GEVR
+#include "gevr_modmesh.h"
+#include "gevr_modattach.h"
+#endif
 #include "chrobjdata.h"
 #include "game/propobj.h"
 #include "game/objective_status.h"
@@ -1758,6 +1762,20 @@ void gunCreateBeamForHand(enum GUNHAND hand)
 }
 
 
+#ifdef GEVR
+/* A beam in a look of its own (gevrThrowGuideDraw: a pack's throw guide): its
+ * radius in the beam's vertex units (a tenth of a world unit; the tracer's
+ * 30), its colour over the game's own image and alpha, and fading to nothing
+ * at its far end. NULL: the game's own looks. */
+typedef struct
+{
+    f32 radius;
+    u8 rgb[3];
+    s32 fade;
+} GevrBeamStyle;
+static const GevrBeamStyle *s_gevrBeamStyle;
+#endif
+
 Gfx *sub_GAME_7F061E18(Gfx *gdl, BeamRecord *flash, s32 arg2)
 {
     f32 posz;
@@ -1820,6 +1838,15 @@ Gfx *sub_GAME_7F061E18(Gfx *gdl, BeamRecord *flash, s32 arg2)
         {
             radius = 30.0f;
         }
+#ifdef GEVR
+        if (s_gevrBeamStyle != NULL)
+        {
+            radius = s_gevrBeamStyle->radius;
+            templatevtx.v.cn[0] = s_gevrBeamStyle->rgb[0];
+            templatevtx.v.cn[1] = s_gevrBeamStyle->rgb[1];
+            templatevtx.v.cn[2] = s_gevrBeamStyle->rgb[2];
+        }
+#endif
 
         pos.f[0] = flash->pos.f[0];
         pos.f[1] = flash->pos.f[1];
@@ -1959,6 +1986,13 @@ Gfx *sub_GAME_7F061E18(Gfx *gdl, BeamRecord *flash, s32 arg2)
         vtx[3].v.ob[2] = flareoffset.f[2] - (right.f[2] * 0.9f);
         vtx[3].v.tc[0] = 0;
         vtx[3].v.tc[1] = image->height << 5;
+#ifdef GEVR
+        if (s_gevrBeamStyle != NULL && s_gevrBeamStyle->fade)
+        {
+            vtx[2].v.cn[3] = 0;   /* the far end: faded to nothing */
+            vtx[3].v.cn[3] = 0;
+        }
+#endif
 
         if (flash->item_id == ITEM_LASER)
         {
@@ -2042,6 +2076,98 @@ Gfx *sub_GAME_7F061E18(Gfx *gdl, BeamRecord *flash, s32 arg2)
 
     return gdl;
 }
+
+
+#ifdef GEVR
+/* The aim a shot or throw leaves along (bullet_path_from_screen_center's)
+ * without the item's random spread, which draws random numbers: for what's
+ * drawn every frame, the throw guide. The cartridge's thrown items' own
+ * spread is the only difference from a throw's aim. */
+static void gevrAimNoSpread(coord3d *origin, coord3d *dir, s32 hand)
+{
+    extern s32 gevrStereoShotFromEye(s32 handnum, coord2d *spreadpos, coord3d *origin, coord3d *dir);
+    coord2d crosspos;
+
+    crosspos.x = g_CurrentPlayer->crosshair_angle.f[0];
+    crosspos.y = g_CurrentPlayer->crosshair_angle.f[1];
+    if (gevrStereoShotFromEye(hand, &crosspos, origin, dir))
+    {
+        return;
+    }
+    origin->x = 0.0f;
+    origin->y = 0.0f;
+    origin->z = 0.0f;
+    transformAndNormalizeByLength2Dto3D(&crosspos, dir, 1.0f);
+}
+
+#define GEVR_THROW_GUIDE_LENGTH 100.0f   /* world units: the launch's first stretch */
+
+/*
+ * The trigger throw's guide (#291): a short line from where a throw leaves
+ * the hand along the way it would leave now, drawn as the game draws a
+ * tracer (sub_GAME_7F061E18), from the throw's own calculation (gun.c
+ * gevrThrowTrigger and gevrThrowAddMotion) less the item's random spread.
+ * For a thrown weapon or gadget ready in the hand (idle, or the trigger
+ * pressed: not while a throw leaves or the next one comes up), when the Throw
+ * guide setting is on or a mod turned it on for the item (setStats'
+ * throwGuide, in its look if the mod gave one), and not while the grip winds
+ * up a motion throw.
+ */
+Gfx *gevrThrowGuideDraw(Gfx *gdl, s32 hand, s32 item)
+{
+    extern int VrThrowGuide;                          /* vr_settings_defaults.c */
+    extern s32 gevrIsThrowable(s32 item);             /* input.c */
+    extern s32 gevrMotionThrowOwnsHand(s32 hand);     /* bondview2.c */
+    extern s32 gevrModThrowGuide(s32 item);           /* gevr_modgame.c */
+    extern f32 gevrThrowBaseSpeed(s32 item);          /* gun.c */
+    extern void gevrThrowTrigger(s32 hand, f32 speed, const coord3d *aim, coord3d *out);
+    extern void gevrThrowAddMotion(coord3d *v);
+    extern s32 gevrModThrowGuideLook(s32 item, f32 *length, f32 *width, u8 rgb[3], s32 *fade);   /* gevr_modgame.c */
+    BeamRecord guide;
+    GevrBeamStyle style;
+    coord3d origin, aim, v;
+    f32 len, length = GEVR_THROW_GUIDE_LENGTH, width = 0.0f;
+    s32 k, styled;
+
+    if (g_CurrentPlayer == NULL || !gevrIsThrowable(item) || gevrMotionThrowOwnsHand(hand)
+        || !(VrThrowGuide || gevrModThrowGuide(item)))
+    {
+        return gdl;
+    }
+    if (g_CurrentPlayer->hands[hand].weapon_action_state != GUN_ANIM_STATE_IDLE
+        && g_CurrentPlayer->hands[hand].weapon_action_state != GUN_ANIM_STATE_TRIGGER_PRESS)
+    {
+        return gdl;   /* nothing ready in the hand: a throw leaving, the next coming up */
+    }
+    styled = gevrModThrowGuideLook(item, &length, &width, style.rgb, &style.fade);
+    style.radius = width * 5.0f;   /* half the width, in the beam's tenths */
+    gevrAimNoSpread(&origin, &aim, hand);
+    mtx4RotateVecInPlace(currentPlayerGetViewToWorldMtxf(), (f32 *)&aim);
+    gevrThrowTrigger(hand, gevrThrowBaseSpeed(item), &aim, &v);
+    gevrThrowAddMotion(&v);
+    len = sqrtf((v.f[0] * v.f[0]) + (v.f[1] * v.f[1]) + (v.f[2] * v.f[2]));
+    if (!(len > 0.0f))
+    {
+        return gdl;
+    }
+    memset(&guide, 0, sizeof(guide));
+    for (k = 0; k < 3; k++)
+    {
+        guide.pos.f[k] = g_CurrentPlayer->hands[hand].throw_item_pos_related.m[3][k];   /* where a throw leaves */
+        guide.delta.f[k] = v.f[k] / len;
+    }
+    guide.unk00 = 0;             /* drawn */
+    guide.item_id = (s8)item;    /* a tracer's look: not a laser's */
+    guide.unk1c = length;
+    guide.unk20 = length;
+    guide.unk24 = length;
+    guide.unk28 = 0.0f;          /* from its start */
+    s_gevrBeamStyle = styled ? &style : NULL;
+    gdl = sub_GAME_7F061E18(gdl, &guide, 0);
+    s_gevrBeamStyle = NULL;
+    return gdl;
+}
+#endif
 
 
 /*
@@ -2870,33 +2996,6 @@ static s32 s_gevrBatHandStage = -1;
 static s32 s_gevrBatHandReady;
 static s32 s_gevrBatHandBean = -1;   /* the hand was cut for Bean (1) or GoldenEye's own model (0) */
 
-/*
- * GoldenEye's hand and sleeve: under Switches 8-13. The game shows 35 with
- * them (gun.c sub_GAME_7F05E978), but in GwppkZ that is a piece of the
- * pistol - a short tube ahead of the grip, 18 units across and 54 long -
- * left floating by the fist on GoldenEye's own rifle bat (owner, 2026-11-22,
- * headset: "leftover barrel on original sniper melee hand"). Bean draws its
- * glove on the hand's lists and blanks the pistol itself, so for Bean it is
- * kept as it was (cuff).
- */
-static s32 gevrBatHandNode(const ModelFileHeader *header, ModelNode *node, s32 cuff)
-{
-    s32 s;
-
-    for (; node != NULL; node = node->Parent)
-    {
-        for (s = 8; s <= 13 && s < header->numSwitches; s++)
-        {
-            if (header->Switches[s] != NULL && node == header->Switches[s]) return TRUE;
-        }
-        if (cuff && header->numSwitches > 35 && header->Switches[35] != NULL && node == header->Switches[35])
-        {
-            return TRUE;
-        }
-    }
-    return FALSE;
-}
-
 static s32 gevrBatHandLoad(void)
 {
     ModelFileHeader *tmpl;
@@ -2943,7 +3042,12 @@ static s32 gevrBatHandLoad(void)
         {
             continue;
         }
-        if (gevrBatHandNode(&s_gevrBatHandHeader, node, bean))
+        /* GoldenEye's hand and sleeve, less the PP7's tube ahead of the grip,
+         * which was left floating by the fist on GoldenEye's own rifle bat
+         * (owner, 2026-11-22, headset: "leftover barrel on original sniper
+         * melee hand"); Bean's own list in its place stays (model.c
+         * modelGunHandList) */
+        if (modelGunHandList(&s_gevrBatHandHeader, node, (const char *) name))
         {
             kept++;
         }
@@ -3044,6 +3148,7 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
     renderdata.zbufferenabled = TRUE;
     renderdata.flags = 3;
 #ifdef GEVR
+    gevrModAttachBeginGunDraw();
     /*
      * The right fist first (issue #19): a gadget held in it does not write
      * depth, so a fist drawn after it painted over the gadget wherever the two
@@ -3121,6 +3226,14 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
         {
             gdl = sub_GAME_7F061E18(gdl, &handptr->weapon_beam, 0);
         }
+#ifdef GEVR
+        {
+            /* a trigger throw's guide from this hand, with the hand's own draws */
+            extern Gfx *gevrThrowGuideDraw(Gfx *gdl, s32 hand, s32 item);
+
+            gdl = gevrThrowGuideDraw(gdl, handnum, item);
+        }
+#endif
  
         if (item == ITEM_GOLDENGUN || item == ITEM_RUGER || item == ITEM_KNIFE || item == ITEM_THROWKNIFE || item == ITEM_SILVERWPPK || item == ITEM_GOLDWPPK) 
         {
@@ -3301,9 +3414,30 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
         extern s32 gevrBeanMagShown(s32 hand);
         gevrBeanSetMagazine(gevrBeanMagShown(handnum));
         /* issue #31: the watch items' arm is the tracked watch arm (bondview2.c gevrStereoWatchItem) */
-        if (!gevrStereoWatchItem(item))
-#endif
+        {
+            const GevrModMesh *mesh = gevrModGunMesh(handnum);
+            if (!gevrStereoWatchItem(item)) {
+                if (mesh != NULL) {
+                    Mtxf *root = (Mtxf *)handptr->weaponModel.render_pos;
+                    const Mtxf *fit = gevrModGunFrame(handnum);
+                    Mtxf fitted;
+                    if (fit != NULL) {
+                        Mtxf offset = *fit;
+                        matrix_4x4_multiply(root, &offset, &fitted);
+                    }
+                    renderdata.gdl = gevrModMeshDraw(renderdata.gdl, fit != NULL ? &fitted : root, mesh);
+                    /* the stock hand, less the gun pieces some models file under it
+                     * (model.c modelGunHandList), known by the item's cartridge file */
+                    modelDrawGunHand(&renderdata, &handptr->weaponModel,
+                                     (const char *)get_ptr_item_text_call_line(item));
+                } else {
+                    subdraw(&renderdata, &handptr->weaponModel);
+                }
+            }
+        }
+#else
         subdraw(&renderdata, &handptr->weaponModel);
+#endif
 #ifdef GEVR
         gevrBeanSetLoaded(1);
         gevrBeanSetMagazine(0);
@@ -3338,6 +3472,12 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
                 extern Gfx *gevrBeanMagDraw(Gfx *gdl, ModelRenderData *templ, GUNHAND hand);
 
                 renderdata.gdl = gevrBeanMagDraw(renderdata.gdl, &renderdata, handnum);
+            }
+            {
+                /* a mod's models on this gun, on its root as drawn (mod.attach, gevr_modattach.c) */
+                extern Gfx *gevrModAttachDrawGun(Gfx *gdl, ModelRenderData *templ, s32 hand, Model *gun);
+
+                renderdata.gdl = gevrModAttachDrawGun(renderdata.gdl, &renderdata, handnum, &handptr->weaponModel);
             }
         }
 #endif
@@ -4875,6 +5015,10 @@ void gunTickHandState(enum GUNHAND hand, s32 triggerOn)
                                         && ((get_ammo_type_for_weapon(temp_v0_3) != 0))
                                         && ((get_ammo_in_hands_weapon(1 - hand) <= 0)))))
                             {
+#ifdef GEVR
+                                /* a mod can keep the empty gun in hand (out_of_ammo, gevr_modapi.c) */
+                                if (!gevrModApiOutOfAmmo(hand, var_s1))
+#endif
                                 autoadvance_on_deplete_all_ammo();
 
                                 handptr->field_88C = 0;
@@ -5079,7 +5223,14 @@ void gunTickHandState(enum GUNHAND hand, s32 triggerOn)
     {
         if ((get_ammo_type_for_weapon(var_s1) == 0) || (handptr->weapon_ammo_in_magazine > 0))
         {
+#ifdef GEVR
+            /* a mod's automatic or a-shot-a-press fire for this gun (setStats' automatic, gevr_modgame.c) */
+            extern s32 gevrModFireAs(s32 item, s32 as);
+
+            switch (gevrModFireAs(var_s1, GEVR_ITEM_AS(var_s1)))
+#else
             switch (GEVR_ITEM_AS(var_s1))
+#endif
             {
             case ITEM_CAMERA:
             case ITEM_WATCHMAGNETATTRACT:
