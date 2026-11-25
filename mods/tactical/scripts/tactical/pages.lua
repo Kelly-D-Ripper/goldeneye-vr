@@ -6,6 +6,7 @@ local progress = require "tactical.progress"
 local magazines = require "tactical.magazines"
 local state = require "tactical.state"
 local firing = require "tactical.firing"
+local looks = require "tactical.looks"
 
 local pages = {}
 
@@ -110,6 +111,25 @@ function pages.loadout()
       value = indexOf(modes, function(m) return m == progress.firemode(p.key) end),
       tip = "Or grip at your chest with the off hand to switch the held gun's mode." }
   end
+  -- each gun's build: the stock assembly or a native preset ("*" not yet earned)
+  view.buildVals = {}
+  local function buildRow(id, labelText, def)
+    if not def then return end
+    local names, vals = {}, {}
+    for _, preset in ipairs(looks.presets(def.key)) do
+      local text = preset == "-" and "Factory" or preset
+      if not progress.buildAllowed(def.key, preset) then text = ("* " .. text):sub(1, 24) end
+      names[#names + 1], vals[#vals + 1] = text, preset
+    end
+    if #names < 2 then names[#names + 1], vals[#vals + 1] = "(no presets)", "-" end
+    view.buildVals[id] = vals
+    local now = progress.build(def.key)
+    rows[#rows + 1] = { id = id, label = labelText, kind = "choice", choices = names,
+      value = indexOf(vals, function(v) return v == now end),
+      tip = "The native Workshop's builds. * needs every part earned (attachment unlocks aren't ported yet)." }
+  end
+  buildRow("pbuild", "Primary build", p)
+  buildRow("sbuild", "Pistol build", s)
   local shown = p or s
   local canBuy = shown and not progress.owned(shown.key) and progress.reserve() > 0
     and progress.totalClears() >= shown.reserveAt
@@ -204,6 +224,13 @@ function pages.change(page, row, value)
     elseif row == "mode" then
       local p = selectedPrimary()
       if p then progress.setFiremode(p.key, catalog.modes(p)[value]) end
+    elseif row == "pbuild" or row == "sbuild" then
+      local def = row == "pbuild" and selectedPrimary() or selectedPistol()
+      local preset = view.buildVals and view.buildVals[row] and view.buildVals[row][value]
+      if def and preset and not progress.setBuild(def.key, preset) then
+        view.note = "That build has parts this save hasn't earned."
+      end
+      if pages.onBuild then pages.onBuild() end
     end
     pages.loadout()
   elseif page == PROGRESS then

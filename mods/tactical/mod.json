@@ -3,7 +3,7 @@
   "id": "tactical",
   "title": "GoldenEye Tactical",
   "by": "Kelly-D-Ripper",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "api": 1,
   "kind": "campaign",
   "base": "ge",

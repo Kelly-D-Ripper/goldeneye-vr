@@ -79,6 +79,10 @@ def build(temp):
             s_tacDifficulty = atoi(argv[i + 2]);
             i += 2;
 '''
+    # Tactical's meshes are real pack files: let the fake loaders take any .bin
+    src = src.replace('return name != NULL && strcmp(name, "pack-body.bin") == 0;',
+                      'return name != NULL && strstr(name, ".bin") != NULL;')
+    src = src.replace('strcmp(a->model, "pack-part.bin")', '(strstr(a->model, ".bin") == NULL)')
     harness.write_text(src.replace(anchor, extra + anchor, 1))
     flags = ["-std=gnu11", "-O1", "-funsigned-char", "-fwrapv", "-fno-strict-aliasing", "-D_LANGUAGE_C=1", "-DGEVR=1"]
     objects = []
@@ -453,6 +457,42 @@ def profile_isolation(exe, temp):
           "returning to folder 1 keeps its unlocks and difficulty counts")
 
 
+def looks(exe, temp):
+    """Tactical's guns drawn as the native build draws them (assemblies.lua)."""
+    r = Run(exe, temp, "looks", save=ALL.format(p=16, s=1) + "build 16 Whiteout\n")   # M4A1, Whiteout
+    out = r("start", "prepare", 34, *GUNS, "begin", 34, "draw", 0, M16, "frame",
+            "reload", 0, 30, "draw", 0, WPPK, "frame")
+    check(not errors(out), "looks scenario without errors: %s" % errors(out)[:3])
+    # the M4's draw: from its body to the PPK's draw
+    seq = out.splitlines()
+    m4 = next(i for i, l in enumerate(seq) if l.startswith("GUNMODEL 0 13 ") and l.endswith(".bin"))
+    ppk = next(i for i, l in enumerate(seq) if i > m4 and l.startswith("GUNMODEL 0 4 "))
+    seg = seq[m4:ppk]
+    check(seq[m4] == "GUNMODEL 0 13 67c26286da8783675c5967d0.bin",
+          "the M4A1's Whiteout body goes on the AR33 in the right hand (%s)" % seq[m4])
+    frame = [l for l in seg if l.startswith("GUNFRAME 0 ")]
+    check(frame and frame[0].split()[2:] == ["-1.8", "0.0", "0.0", "34.0", "1.0"],
+          "at the native M4A1 axes (%s)" % frame[:1])
+    attached = [l for l in seg if l.startswith("ATTACH ") and not l.startswith("ATTACH reset")]
+    ids = [int(l.split()[1]) for l in attached]
+    check(len(attached) == 18 and all(i > 0 for i in ids),
+          "its 18 Whiteout parts attach to the gun (%d, %s)" % (len(attached), ids[:3]))
+    mag = next((l for l in attached if " 67c26286da8783675c5967c4.bin" in l), None)
+    mag_id = mag and mag.split()[1]
+    check(mag_id is not None and ("ATTACHSHOW %s 0" % mag_id) in out and ("ATTACHSHOW %s 1" % mag_id) in out,
+          "the magazine hides while it's out for a reload, and shows when one is seated")
+    detached = sorted(int(l.split()[1]) for l in seq[ppk - 40 if ppk > 40 else 0:ppk + 1] if l.startswith("DETACH "))
+    detached = [i for i in detached if i in ids]
+    check(detached == sorted(ids), "switching to the PPK takes the M4A1's parts off (%d of %d)" % (len(detached), len(ids)))
+    check("GUNMODEL 0 4 " in out, "and dresses the PPK in its own build")
+    # a progression save without the parts earned keeps the stock build
+    r = Run(exe, temp, "looks-earn", save="mode 1\nloadout 16 1\ngun 16 1 0 0 0 0 0\nbuild 16 Whiteout\n")
+    out = r("start", "prepare", 34, *GUNS, "begin", 34, "draw", 0, M16, "frame")
+    stock = [l for l in lines(out, "GUNMODEL 0 13 ") if l.endswith(".bin")]
+    check(len(stock) == 1 and "67c26286da8783675c5967d0" not in stock[0] or stock == [],
+          "a progression save draws the stock build until the preset's parts are earned (%s)" % stock)
+
+
 def main():
     problems = validate(PACK)
     check(not problems, "the pack follows docs/mod-system.md's format: %s" % problems)
@@ -467,6 +507,8 @@ def main():
             empty_gun(exe, temp)
         if "int gevrModGameFolder(void)" in (ROOT / "port/tests/modapi_native.c").read_text():
             profile_isolation(exe, temp)
+        if "int gevrModGameAttach(" in (ROOT / "port/tests/modapi_native.c").read_text():
+            looks(exe, temp)
     if FAILS:
         print("%d FAILED" % len(FAILS))
         sys.exit(1)

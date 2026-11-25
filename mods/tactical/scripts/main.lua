@@ -12,6 +12,7 @@ local guards = require "tactical.guards"
 local pages = require "tactical.pages"
 local coop = require "tactical.coop"
 local sights = require "tactical.sights"
+local looks = require "tactical.looks"
 local util = require "tactical.util"
 
 local CHEST_SWITCH = "chest"   -- the off hand's grip here cycles the gun hand's fire mode
@@ -27,6 +28,7 @@ end)
 
 mod.on("mission_prepare", function(stage)
   state.reset(stage)
+  looks.reset()
   coop.missionReset()
   completed = false
   missionDifficulty = mod.mission and mod.mission.difficulty and mod.mission.difficulty()
@@ -42,6 +44,7 @@ local function issueKit()
       arsenal.apply(item, state.carried[item])
       magazines.drawn(hand, item)
     end
+    looks.drawn(hand, item)
   end
 end
 
@@ -55,6 +58,12 @@ mod.on("mission_start", function(stage)
   pages.refresh()
   pages.ask()
 end)
+
+-- A new build shows on the held gun at once.
+pages.onBuild = function()
+  if state.stage < 0 then return end
+  for _, hand in ipairs(arsenal.HANDS) do looks.drawn(hand, util.try(mod.weapon.held, hand)) end
+end
 
 pages.onApply = function()
   if state.stage >= 0 then issueKit() end
@@ -105,9 +114,11 @@ end)
 
 mod.on("reload_start", function(hand, item)
   magazines.reloadStart(hand, item)
+  looks.reloadStart(hand)
 end)
 
 mod.on("reload_end", function(hand, item, loaded)
+  looks.reloadEnd(hand)
   magazines.reloadEnd(hand, item)
 end)
 
@@ -121,6 +132,7 @@ mod.on("weapon_drawn", function(hand, item)
     sights.drawn(hand, item)
   end
   arsenal.releaseUnheld()
+  looks.drawn(hand, item)
 end)
 
 -- items ----------------------------------------------------------------

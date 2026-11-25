@@ -34,6 +34,7 @@ local function fresh()
     loadout = { primary = -1, pistol = STARTER },
     magazine = {},      -- key -> chosen capacity
     firemode = {},      -- key -> "semi" | "burst" | "auto"
+    build = {},         -- key -> preset name ("-" the stock build)
   }
 end
 
@@ -93,6 +94,8 @@ function progress.selectFolder()
       s.magazine[tonumber(f[2])] = tonumber(f[3])
     elseif tag == "firemode" and catalog.byKey[tonumber(f[2])] then
       s.firemode[tonumber(f[2])] = f[3]
+    elseif tag == "build" and catalog.byKey[tonumber(f[2])] then
+      s.build[tonumber(f[2])] = line:match("^build %d+ (.-)%s*$")
     end
   end
   -- A save without the aggregate can only tell us about its distinct clears.
@@ -122,6 +125,7 @@ function progress.save()
     end
     if s.magazine[g.key] then out[#out + 1] = "mag " .. g.key .. " " .. s.magazine[g.key] end
     if s.firemode[g.key] then out[#out + 1] = "firemode " .. g.key .. " " .. s.firemode[g.key] end
+    if s.build[g.key] then out[#out + 1] = "build " .. g.key .. " " .. s.build[g.key] end
   end
   out[#out + 1] = "loadout " .. s.loadout.primary .. " " .. s.loadout.pistol
   mod.save.write(activeFile, table.concat(out, "\n") .. "\n")
@@ -198,6 +202,26 @@ end
 function progress.setFiremode(key, m)
   s.firemode[key] = m
   progress.save()
+end
+
+-- The gun's build: the stock assembly, or a native preset. Until the native
+-- part kits are ported (PARITY-AUDIT.md), a progression save only deploys
+-- the stock build: a preset can carry parts that save hasn't earned.
+function progress.buildAllowed(key, preset)
+  return preset == "-" or not progress.locks()
+end
+
+function progress.build(key)
+  local b = s.build[key]
+  if b and progress.buildAllowed(key, b) then return b end
+  return "-"
+end
+
+function progress.setBuild(key, preset)
+  if not progress.buildAllowed(key, preset) then return false end
+  s.build[key] = preset ~= "-" and preset or nil
+  progress.save()
+  return true
 end
 
 function progress.loadout() return s.loadout end
