@@ -11,6 +11,7 @@ function state.reset(stage)
   state.speed = 1              -- the move speed last given the game           -- cartridge item id -> Tactical gun key
   state.guns = {}              -- key -> { loaded, cap, chamber }
   state.held = {}              -- "right"/"left" -> item id held, as last seen
+  state.drawn = {}             -- "right"/"left" -> item id whose weapon_drawn has fired
   state.lastPrimary = nil      -- the primary last put away: the back slot
   state.ownedAtStart = {}      -- keys owned as the mission began
   state.drops = {}             -- legacy only: guard guns by item id, newest last

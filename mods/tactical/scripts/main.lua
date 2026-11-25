@@ -41,6 +41,7 @@ local function issueKit()
   for _, hand in ipairs(arsenal.HANDS) do
     local item = util.try(mod.weapon.held, hand)
     if item and state.carried[item] then
+      state.drawn[hand] = item
       arsenal.apply(item, state.carried[item])
       magazines.drawn(hand, item)
     end
@@ -129,6 +130,7 @@ mod.on("reload_end", function(hand, item, loaded)
 end)
 
 mod.on("weapon_drawn", function(hand, item)
+  state.drawn[hand] = item
   local key = arsenal.carry(item)
   arsenal.noteHeld(hand, item)
   if key then

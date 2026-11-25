@@ -108,6 +108,9 @@ end
 -- Give the held cartridge gun this Tactical gun's magazine and rate of fire.
 -- Stats are per weapon type (guards' too), so they're put back once no hand
 -- holds the item.
+-- silenced cartridge guns and the loud ones whose report they'd otherwise lack
+local LOUD = { wppksil = "wppk", mp5ksil = "mp5k" }
+
 function arsenal.apply(itemId, key)
   local def = catalog.byKey[key]
   if not state.original[itemId] then
@@ -135,6 +138,13 @@ function arsenal.apply(itemId, key)
   elseif key == 7 then
     local ar = util.try(mod.weapon.stats, mod.items.m16)
     if ar then t.sound = ar.sound end
+  elseif LOUD[catalog.itemName[itemId] or ""] then
+    -- an unsuppressed gun on a silenced cartridge gun has the gun's own report
+    local id = mod.items[LOUD[catalog.itemName[itemId]]]
+    local loud = state.original[id] or util.try(mod.weapon.stats, id)
+    if loud then
+      t.sound, t.loudnessMin, t.loudnessMax = loud.sound, loud.loudnessMin, loud.loudnessMax
+    end
   end
   if next(t) then util.try(mod.weapon.setStats, itemId, t) end
   state.applied[itemId] = key
@@ -226,9 +236,9 @@ function arsenal.slotFor(key)
 end
 
 -- Put a Tactical gun in the inventory on a cartridge gun of its own.
-function arsenal.issue(key, preset)
+function arsenal.issue(key, preset, prefer)
   if arsenal.carries(key) then return nil end
-  local itemId = arsenal.slotFor(key)
+  local itemId = (prefer and free(prefer) and prefer) or arsenal.slotFor(key)
   if not itemId then
     mod.log("no free cartridge gun for " .. catalog.byKey[key].name)
     return nil
@@ -276,12 +286,26 @@ function arsenal.applyKit(stage)
   if NO_STARTING_KIT[stage] or not mod.setting("starting_kit", true) then return end
   local lo = progress.loadout()
   -- the cartridge's own guns go; gadgets, keys and thrown weapons stay
+  local startPistol
   for name, id in pairs(mod.items) do
-    if catalog.ammoOf[name] and util.try(mod.inventory.has, id) then util.try(mod.inventory.take, id) end
+    if catalog.ammoOf[name] and util.try(mod.inventory.has, id) then
+      util.try(mod.inventory.take, id)
+      if PISTOL_LOOK[name] and not AUTOMATIC[name] then startPistol = startPistol or name end
+    end
   end
   state.carried = {}
   for _, key in ipairs({ lo.primary, lo.pistol }) do
-    local issued = catalog.byKey[key] and progress.owned(key) and arsenal.issue(key, progress.build(key))
+    -- The game's first draw brings up the gun the mission started with, even
+    -- though it has just been taken (a take doesn't cancel a pending draw).
+    -- So the kit's pistol goes on that cartridge pistol when it can carry it
+    -- (Dam's silenced PP7, for one); otherwise the hand would come up with a
+    -- gun the player doesn't have.
+    local def, prefer = catalog.byKey[key], nil
+    if def and def.slot == "pistol" and startPistol and not catalog.noMagazine[key]
+        and def.modes & 6 == 0 and catalog.ammoOf[startPistol] == catalog.ammo(def.itemId) then
+      prefer = mod.items[startPistol]
+    end
+    local issued = def and progress.owned(key) and arsenal.issue(key, progress.build(key), prefer)
     if issued then
       state.kitItems[issued] = true
       arsenal.gun(key).cap = progress.magazineChoice(key)

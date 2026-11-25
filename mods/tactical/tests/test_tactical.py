@@ -446,6 +446,39 @@ def empty_gun(exe, temp):
           "the physical rig keeps an empty Tactical gun without vetoing an unmanaged item")
 
 
+def draw_timing(exe, temp):
+    """The real game's draw order (gunfire.c): the hand holds the next gun and
+    the game fills its magazine before weapon_drawn fires."""
+    WPPKSIL, SNIPER = 5, 17
+    # The SVD (on the sniper rifle, 8 rounds) is switched to: the count goes to
+    # 0, then the game refills 8 from the reserve, then the draw finishes.
+    r = Run(exe, temp, "svd-draw", save=ALL.format(p=7, s=1))
+    out = r("start", "prepare", 34, "stats", SNIPER, 8, -1, 3.0, "begin", 34,
+            "hold", 0, SNIPER, 0, "frame", "hold", 0, SNIPER, 8, "frame", "draw", 0, SNIPER,
+            "loadedis", 0, "show", SNIPER)
+    check(not errors(out), "SVD draw without errors: %s" % errors(out)[:3])
+    loaded = [int(l.split()[1]) for l in lines(out, "LOADED")]
+    mag = int(lines(out, "STATS %d " % SNIPER)[-1].split()[2])
+    check(loaded == [11] and mag == 11,
+          "the SVD comes up 10 + 1, not with the count the game filled mid-switch (%s, magazine %d)" % (loaded, mag))
+
+    # Dam starts Bond with the silenced PP7. The kit takes it, but the game's
+    # first draw still brings up that item, so the PPK has to be on it.
+    r = Run(exe, temp, "dam-start", save="mode 1\nloadout -1 1\n")
+    out = r("start", "prepare", 33, "stats", WPPK, 7, -1, 1.0, "stats", WPPKSIL, 7, -1, 1.0,
+            "sound", WPPK, 10, 1.0, 2.0, "sound", WPPKSIL, 11, 0.1, 0.2, "own", WPPKSIL,
+            "begin", 33, "inv", "draw", 0, WPPKSIL, "frame", "loadedis", 0, "show", WPPKSIL, "show2", WPPKSIL)
+    check(not errors(out), "Dam start without errors: %s" % errors(out)[:3])
+    inv = lines(out, "INV")[-1].split(" held")[0] + " "
+    check(" %d " % WPPKSIL in inv and " %d " % WPPK not in inv,
+          "Dam's kit puts the PPK on the silenced PP7 the game is about to draw (%s)" % inv.strip())
+    loaded = [int(l.split()[1]) for l in lines(out, "LOADED")]
+    mag = int(lines(out, "STATS %d " % WPPKSIL)[-1].split()[2])
+    check(loaded == [mag] and mag > 1, "the PPK comes up with a full magazine and one chambered (%s of %d)" % (loaded, mag))
+    sound = int(lines(out, "STATS2")[-1].split()[4])
+    check(sound == 10, "an unsuppressed PPK on the silenced PP7 fires the PP7's report (sound %d)" % sound)
+
+
 def pickup_identity(exe, temp):
     stage = 34
     hk = elite_hk416(stage)
@@ -551,6 +584,7 @@ def main():
         temp = Path(t)
         exe = build(temp)
         scenarios(exe, temp)
+        draw_timing(exe, temp)
         extraction_outcomes(exe, temp)
         if HAS_PICKUP_IDS:
             pickup_identity(exe, temp)

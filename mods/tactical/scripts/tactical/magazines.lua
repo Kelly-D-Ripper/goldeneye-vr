@@ -251,10 +251,13 @@ function magazines.drawn(hand, itemId)
   end
 end
 
--- The rounds in each held gun, as the game counts them now.
+-- The rounds in each held gun, as the game counts them now. While a hand is
+-- still switching to a gun, its count isn't the gun's: the game fills it from
+-- the reserve, capped at the cartridge gun's own magazine (the gun's stats
+-- are only applied at weapon_drawn), so it waits for the draw.
 function magazines.observe(hand, itemId)
   local key = state.carried[itemId]
-  if key and not catalog.noMagazine[key] then
+  if key and not catalog.noMagazine[key] and state.drawn[hand] == itemId then
     local n = util.try(mod.weapon.loaded, hand)
     if n then arsenal.gun(key).loaded = n end
   end
