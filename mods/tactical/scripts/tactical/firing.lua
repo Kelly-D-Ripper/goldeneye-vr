@@ -32,7 +32,7 @@ end
 function firing.attempt(hand, itemId)
   local key = state.carried[itemId]
   if not key or not automatic(itemId) then return nil end
-  local def = catalog.byKey[key]
+  local def = arsenal.stats(itemId) or catalog.byKey[key]
   local mode = progress.firemode(key)
   local limit = mode == "semi" and 1 or mode == "burst" and def.burst or math.huge
   local p = state.pull[hand]
@@ -64,22 +64,21 @@ end
 
 -- The multiplier for a shot by a player's gun: this headset's own, or (on
 -- the co-op host) the gun a player told us about.
+-- chraction.c: a Tactical gun's shot does its build's damage in place of the
+-- cartridge gun's own (gevrTacticalShotDamage), before the hit part's and the
+-- difficulty's multipliers. before_damage sees the amount after them, so the
+-- ratio of the build's damage to the carrier's own gives the native result.
 function firing.multiplier(slot, itemId)
-  local key
+  local key, preset
   if slot == nil or slot == (mod.net.slot() or 0) then
-    key = state.carried[itemId]
-  elseif state.peers[slot] then
-    key = state.peers[slot][itemId]
+    key, preset = state.carried[itemId], arsenal.preset(itemId)
+  elseif state.peers[slot] and state.peers[slot][itemId] then
+    key, preset = state.peers[slot][itemId].key, state.peers[slot][itemId].preset
   end
-  local def = key and catalog.byKey[key]
-  if not def then return 1 end
-  local m = util.clamp(def.damage, 0.75, 1.75)
-  -- a gun on a borrowed cartridge gun hits as it would on its home one
-  if itemId ~= def.itemId then
-    local home, here = arsenal.baseDamage(def.itemId), arsenal.baseDamage(itemId)
-    if home and here and here > 0 then m = m * home / here end
-  end
-  return m
+  local b = key and arsenal.build(key, preset)
+  local here = arsenal.baseDamage(itemId)
+  if not b or not b.stats or not here or here <= 0 then return 1 end
+  return b.stats.damage / here
 end
 
 function firing.beforeDamage(d)
@@ -87,7 +86,7 @@ function firing.beforeDamage(d)
   local m = firing.multiplier(d.by, d.item)
   local g = state.guards[d.id]
   if g and g.armoured and d.part == "body" then m = m * 0.5 end
-  if m == 1 then return nil end
+  if math.abs(m - 1) < 1e-6 then return nil end
   return util.clamp(d.amount * m, 0, 1000)
 end
 

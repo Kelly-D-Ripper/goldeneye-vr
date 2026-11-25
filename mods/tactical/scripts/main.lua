@@ -62,6 +62,7 @@ end)
 -- A new build shows on the held gun at once.
 pages.onBuild = function()
   if state.stage < 0 then return end
+  arsenal.rebuild()
   for _, hand in ipairs(arsenal.HANDS) do looks.drawn(hand, util.try(mod.weapon.held, hand)) end
 end
 
@@ -83,6 +84,11 @@ mod.on("tick", function(dt)
     if item then magazines.observe(hand, item) end
   end
   arsenal.releaseUnheld()
+  -- carried weight slows the player (bondview2.c gevrTacticalMoveScale)
+  if mod.player.setSpeed then
+    local speed = arsenal.moveScale()
+    if math.abs(speed - state.speed) > 1e-4 and util.try(mod.player.setSpeed, speed) then state.speed = speed end
+  end
   magazines.sync()
   guards.tick()
   coop.shareGuns()

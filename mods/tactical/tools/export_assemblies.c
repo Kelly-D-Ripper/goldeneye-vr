@@ -11,6 +11,8 @@
  * Output, one line each:
  *   BUILD <key> <preset or "-">
  *   AXES <16 floats>          the native gun axes (gearGunAxes, first person)
+ *   STATS <modes> <rpm> <semiRpm> <burst> <mass> <ergo> <recoil> <spread> <damage> <flash> <suppressed>
+ *                             gevrWeaponStats for the assembly (gevr_tactical_stats.c)
  *   MOUNT <path or "-"> <part id> <16 floats: frame rows>
  *   END
  */
@@ -28,6 +30,7 @@
 #include "gevr_tactical_gear.h"
 #include "gevr_tactical_asset.h"
 #include "gevr_tactical_fit.h"
+#include "gevr_tactical_stats.h"
 
 /* gevr_tactical_mesh.c, verbatim: the view-forward offsets and gearGunAxes
  * (first person). The native build runs with --tactical-physical. */
@@ -92,6 +95,12 @@ static void dump(int key, const char *preset, const GevrGearAssembly *a)
         for (int r = 0; r < 4; r++)
             for (int c = 0; c < 4; c++) printf(" %.9g", axes.m[r][c]);
         printf("\n");
+    }
+    {
+        GevrWeaponStats st;
+        if (gevrWeaponStats(key, a, &st))
+            printf("STATS %d %d %d %d %.9g %.9g %.9g %.9g %.9g %.9g %d\n", st.modes, st.rpm, st.semiRpm, st.burst,
+                   st.mass, st.ergo, st.recoil, st.spread, st.damage, st.flash, gevrTacticalGearAssemblySuppressed(a));
     }
     for (int i = 0; i < a->count; i++) {
         const GevrGearMount *m = &a->mounts[i];

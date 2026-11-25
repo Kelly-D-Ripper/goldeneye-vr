@@ -23,7 +23,9 @@ function coop.myslot() return mod.net.slot() or 0 end
 function coop.shareGuns()
   if mod.net.role() ~= "client" then return end
   local parts = {}
-  for itemId, key in pairs(state.carried) do parts[#parts + 1] = itemId .. ":" .. key end
+  for itemId, key in pairs(state.carried) do
+    parts[#parts + 1] = itemId .. ":" .. key .. ":" .. (state.builds[itemId] or "-")
+  end
   table.sort(parts)
   local text = table.concat(parts, ",")
   if text ~= lastSent then
@@ -43,10 +45,10 @@ function coop.init()
     if mod.net.role() ~= "host" and mod.net.role() ~= "server" then return end
     if from == nil then return end
     local map = {}
-    for item, key in string.gmatch(data, "(%d+):(%d+)") do
+    -- item:key:preset, the item any cartridge gun (a borrowed one too)
+    for item, key, preset in string.gmatch(data, "(%d+):(%d+):?([^,]*)") do
       item, key = tonumber(item), tonumber(key)
-      local def = catalog.byKey[key]
-      if def and def.itemId == item then map[item] = key end
+      if catalog.byKey[key] and catalog.itemName[item] then map[item] = { key = key, preset = preset ~= "" and preset or "-" } end
     end
     state.peers[from] = map
   end)

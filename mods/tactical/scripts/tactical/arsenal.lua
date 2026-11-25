@@ -12,6 +12,7 @@ local catalog = require "tactical.catalog"
 local progress = require "tactical.progress"
 local state = require "tactical.state"
 local util = require "tactical.util"
+local assemblies = require "tactical.assemblies"
 
 local arsenal = {}
 
@@ -40,43 +41,64 @@ function arsenal.gun(key)
 end
 
 -- Compatibility with hosts that do not report the actual dropped pickup.
-function arsenal.noteDrop(itemId, key)
+function arsenal.noteDrop(itemId, key, preset)
   local list = state.drops[itemId]
   if not list then list = {}; state.drops[itemId] = list end
-  list[#list + 1] = { key = key, at = state.clock }
+  list[#list + 1] = { key = key, preset = preset or "-", at = state.clock }
 end
 
 -- Modern hosts report the world pickup that received the guard's weapon.
 -- That pickup keeps the identity until it is taken or freed, regardless of
 -- which other guards drop a weapon on the same cartridge slot in between.
-function arsenal.trackDrop(pickup, itemId, key)
+function arsenal.trackDrop(pickup, itemId, key, preset)
   if pickup == nil or not catalog.isGunItem(itemId) then return end
-  state.pickupDrops[pickup] = { item = itemId, key = key }
+  state.pickupDrops[pickup] = { item = itemId, key = key, preset = preset or "-" }
 end
 
 function arsenal.removeDrop(pickup)
   if pickup ~= nil then state.pickupDrops[pickup] = nil end
 end
 
+-- The looted gun and its build: a guard's roster preset, else the stock build.
 local function identify(itemId, pickup)
   if arsenal.hasPickupIds then
     local d = pickup ~= nil and state.pickupDrops[pickup]
     arsenal.removeDrop(pickup)
-    return d and d.item == itemId and d.key or catalog.defaultKey(itemId)
+    if d and d.item == itemId then return d.key, d.preset end
+    return catalog.defaultKey(itemId), "-"
   end
   -- Legacy hosts only know that a guard with this gun died recently.
   local list = state.drops[itemId]
   while list and #list > 0 do
     local d = table.remove(list)
-    if state.clock - d.at <= DROP_MEMORY then return d.key end
+    if state.clock - d.at <= DROP_MEMORY then return d.key, d.preset end
   end
-  return catalog.defaultKey(itemId)
+  return catalog.defaultKey(itemId), "-"
+end
+
+-- The build a carried cartridge gun holds, and its native stats.
+function arsenal.preset(itemId)
+  return state.builds[itemId] or "-"
+end
+
+function arsenal.build(key, preset)
+  local builds = assemblies[key]
+  return builds and (builds[preset or "-"] or builds["-"]) or nil
+end
+
+function arsenal.stats(itemId)
+  local key = state.carried[itemId]
+  local b = key and arsenal.build(key, arsenal.preset(itemId))
+  return b and b.stats or nil
 end
 
 local function restore(itemId)
   local orig = state.original[itemId]
   if orig and state.applied[itemId] then
     local t = { magazine = orig.magazine, damage = orig.damage }
+    if orig.sound then t.sound = orig.sound end
+    if orig.loudnessMax then t.loudnessMin, t.loudnessMax = orig.loudnessMin, orig.loudnessMax end
+    if orig.automatic ~= nil then t.automatic = orig.automatic end
     if orig.fireRate then t.fireRate = orig.fireRate end
     util.try(mod.weapon.setStats, itemId, t)
   end
@@ -94,10 +116,25 @@ function arsenal.apply(itemId, key)
   local orig = state.original[itemId]
   if not orig then return end
   local g = arsenal.gun(key)
+  local st = arsenal.stats(itemId) or def
   local t = {}
   if not catalog.noMagazine[key] then t.magazine = util.clamp(g.cap + 1, 1, 255) end
-  if orig.fireRate and def.rpm > 0 then
-    t.fireRate = util.clamp(math.floor(3600 / def.rpm + 0.5), 1, 60)
+  -- automatic or burst fire needs the carrier's automatic branch (the Glock 18C on the PPK)
+  local wantsAuto = st.modes & 6 ~= 0 and st.rpm > 0
+  if wantsAuto then
+    t.fireRate = util.clamp(math.floor(3600 / st.rpm + 0.5), 1, 60)
+    if orig.automatic == false then t.automatic = true end
+  end
+  -- gun.c gevrTacticalShotSound: a suppressed build sounds, and is heard, as the
+  -- silenced PPK or silenced D5K; the SVD fires the AR33's report
+  if st.suppressed then
+    local quiet = util.try(mod.weapon.stats, def.slot == "pistol" and mod.items.wppksil or mod.items.mp5ksil)
+    if quiet then
+      t.sound, t.loudnessMin, t.loudnessMax = quiet.sound, quiet.loudnessMin, quiet.loudnessMax
+    end
+  elseif key == 7 then
+    local ar = util.try(mod.weapon.stats, mod.items.m16)
+    if ar then t.sound = ar.sound end
   end
   if next(t) then util.try(mod.weapon.setStats, itemId, t) end
   state.applied[itemId] = key
@@ -189,7 +226,7 @@ function arsenal.slotFor(key)
 end
 
 -- Put a Tactical gun in the inventory on a cartridge gun of its own.
-function arsenal.issue(key)
+function arsenal.issue(key, preset)
   if arsenal.carries(key) then return nil end
   local itemId = arsenal.slotFor(key)
   if not itemId then
@@ -198,6 +235,7 @@ function arsenal.issue(key)
   end
   util.try(mod.inventory.give, itemId)
   state.carried[itemId] = key
+  state.builds[itemId] = preset or "-"
   enforceCarry(catalog.byKey[key].slot, itemId)
   return itemId
 end
@@ -207,9 +245,11 @@ function arsenal.carry(itemId, pickup)
   if not catalog.isGunItem(itemId) then return state.carried[itemId] end
   local key = state.carried[itemId]
   if not key then
-    key = identify(itemId, pickup)
+    local preset
+    key, preset = identify(itemId, pickup)
     if not key then return nil end
     state.carried[itemId] = key
+    state.builds[itemId] = preset or "-"
     enforceCarry(catalog.byKey[key].slot, itemId)
   end
   return key
@@ -221,9 +261,9 @@ end
 function arsenal.pickedUp(itemId, pickup)
   local had = state.carried[itemId]
   if not had then return arsenal.carry(itemId, pickup) end
-  local key = identify(itemId, pickup)
+  local key, preset = identify(itemId, pickup)
   if key and key ~= had and not arsenal.carries(key) then
-    local slot = arsenal.issue(key)
+    local slot = arsenal.issue(key, preset)
     if slot then mod.log(catalog.byKey[key].name .. " carried on the " .. catalog.itemName[slot]) end
     return key
   end
@@ -241,7 +281,9 @@ function arsenal.applyKit(stage)
   end
   state.carried = {}
   for _, key in ipairs({ lo.primary, lo.pistol }) do
-    if catalog.byKey[key] and progress.owned(key) and arsenal.issue(key) then
+    local issued = catalog.byKey[key] and progress.owned(key) and arsenal.issue(key, progress.build(key))
+    if issued then
+      state.kitItems[issued] = true
       arsenal.gun(key).cap = progress.magazineChoice(key)
     end
   end
@@ -277,6 +319,30 @@ function arsenal.noteHeld(hand, itemId)
   local key = before and state.carried[before]
   if key and catalog.byKey[key].slot == "primary" then state.lastPrimary = key end
   state.held[hand] = itemId
+end
+
+-- gevrTacticalMoveScale: every carried gun's mass (hands, back and holsters)
+-- slows the player, 2.2% a kilogram past 1.7 kg, never below 76%.
+function arsenal.moveScale()
+  local mass = 0
+  for itemId, key in pairs(state.carried) do
+    local st = arsenal.stats(itemId)
+    mass = mass + (st and st.mass or 0)
+  end
+  for _, hand in ipairs(HANDS) do
+    local item = state.held[hand]
+    -- a cartridge rifle with no Tactical gun on it weighs 3 kg natively
+    if item and not state.carried[item] and (catalog.itemName[item] == "ak47" or catalog.itemName[item] == "m16"
+        or catalog.itemName[item] == "sniperrifle") then mass = mass + 3 end
+  end
+  return math.max(.76, 1 - .022 * math.max(0, mass - 1.7))
+end
+
+-- A gun's build changed on the loadout page: the kit's own guns follow it.
+function arsenal.rebuild()
+  for itemId, key in pairs(state.carried) do
+    if state.kitItems and state.kitItems[itemId] then state.builds[itemId] = progress.build(key) end
+  end
 end
 
 arsenal.HANDS = HANDS

@@ -32,6 +32,11 @@ EXTRA = r'''        } else if (!strcmp(cmd, "complete")) {
         } else if (!strcmp(cmd, "stats") && i + 4 < argc) {
             stats(atoi(argv[i + 1]), atoi(argv[i + 2]), atoi(argv[i + 3]), (float)atof(argv[i + 4]));
             i += 4;
+        } else if (!strcmp(cmd, "sound") && i + 4 < argc) {
+            s_stats[atoi(argv[i + 1])].sound = atoi(argv[i + 2]);
+            s_stats[atoi(argv[i + 1])].loudnessMin = (float)atof(argv[i + 3]);
+            s_stats[atoi(argv[i + 1])].loudnessMax = (float)atof(argv[i + 4]);
+            i += 4;
         } else if (!strcmp(cmd, "setammo") && i + 2 < argc) {
             s_ammo[atoi(argv[i + 1])] = atoi(argv[i + 2]);
             i += 2;
@@ -150,6 +155,26 @@ def draw(stage, gid):
     return (d ^ (d >> 16)) & m
 
 
+def build_damage(key, preset="-"):
+    """A build's native damage (gevrWeaponStats), from the generated assemblies.lua."""
+    text = (PACK / "scripts/tactical/assemblies.lua").read_text()
+    block = text[text.index("  [%d] = {" % key):]
+    block = block[block.index('    ["%s"] = {' % preset):]
+    return float(re.search(r"damage = ([0-9.]+)", block).group(1))
+
+
+def build_stat(key, preset, name):
+    text = (PACK / "scripts/tactical/assemblies.lua").read_text()
+    block = text[text.index("  [%d] = {" % key):]
+    block = block[block.index('    ["%s"] = {' % preset):]
+    return re.search(r"\b%s = ([0-9.]+|true|false)" % name, block).group(1)
+
+
+def native_hit(key, preset, carrier):
+    """chraction.c: the build's damage replaces the carrier's own; the harness hits for 1.0."""
+    return "%.2f" % (build_damage(key, preset) / carrier)
+
+
 def elite_hk416(stage):
     """A Janus special forces guard id whose roster gun is the HK416."""
     for gid in range(1, 500):
@@ -261,7 +286,8 @@ def scenarios(exe, temp):
     out = r("start", "prepare", 34, "begin", 34, "draw", 0, AK47, "frame",
             "hurt", 1, 3, 1.0, 1, 2, AK47, 0, "hurt", 1, 3, 1.0, 1, 2, AK47, -1)
     dmg = [l.split()[1] for l in lines(out, "DAMAGE")]
-    check(dmg == ["1.60", "1.00"], "PKM rounds hit 1.6x; a guard's own AK doesn't change (%s)" % dmg)
+    want = [native_hit(15, "-", 1.5), "1.00"]
+    check(dmg == want, "PKM rounds do the PKM's damage; a guard's own AK doesn't change (%s, want %s)" % (dmg, want))
 
     # co-op: a client tells the host its guns; the host applies them and sends the client its hits
     r = Run(exe, temp, "client", save=ALL.format(p=15, s=1))
@@ -273,7 +299,8 @@ def scenarios(exe, temp):
     out = r("start", "online", 1, 1, 0, 0, "prepare", 34, "begin", 34, "netrecv", "tactical", 1, "guns", "8:15",
             "frame", "hurt", 1, 3, 1.0, 1, 1, AK47, 1, "hurt", 1, 3, 1.0, 1, 1, AK47, 0)
     dmg = [l.split()[1] for l in lines(out, "DAMAGE")]
-    check(dmg == ["1.60", "1.00"], "the host hits with the client's PKM and its own AK-74N (%s)" % dmg)
+    want = [native_hit(15, "-", 1.5), native_hit(4, "-", 1.5)]
+    check(dmg == want, "the host hits with the client's PKM and its own AK-74N (%s, want %s)" % (dmg, want))
     stat = [l for l in lines(out, "NETSEND") if " stat " in l]
     check(len(stat) == 1 and stat[0].split()[2] == "1", "the client's headshot is sent to it alone")
 
@@ -373,8 +400,10 @@ def scenarios(exe, temp):
     check(lines(out, "AMMO %d " % RIFLE)[0] == "AMMO 3 30", "the HK416 draws on the M4's STANAG magazines")
     check(lines(out, "LOADED")[0] == "LOADED 30", "the HK416 seats a STANAG magazine from the shared rig")
     check(lines(out, "STATS %d " % AK47)[0].split()[2] == "31", "the KF7 carries the STANAG's size while it's the HK416")
-    check(lines(out, "DAMAGE")[0] == "DAMAGE 1.53",
-          "the HK416 hits as on the AR33: 1.15 x 2.0 / 1.5 (%s)" % lines(out, "DAMAGE")[0])
+    preset = "Night Detail" if draw(34, gid) % 8 == 4 else "Dark Shorty"   # the elite roster's HK416s
+    want = "DAMAGE " + native_hit(17, preset, 1.5)
+    check(lines(out, "DAMAGE")[0] == want,
+          "the looted HK416 (%s) does its build's damage on the KF7 (%s, want %s)" % (preset, lines(out, "DAMAGE")[0], want))
     p = r.progress()
     check(re.search(r"^gun 17 1 ", p, re.M) is not None, "the HK416 on the back comes home and unlocks:\n" + p)
     check(re.search(r"^gun 16 1 \d+ \d+ \d+ \d+ 1$", p, re.M) is not None, "and the M4A1 in hand gets its clear")
@@ -493,6 +522,28 @@ def looks(exe, temp):
           "a progression save draws the stock build until the preset's parts are earned (%s)" % stock)
 
 
+def handling(exe, temp):
+    """Per-build stats on the carrier, as native applies them."""
+    # the Glock 18C fires full-auto on the PPK's single-shot carrier
+    r = Run(exe, temp, "glock", save=ALL.format(p=-1, s=23))
+    out = r("start", "prepare", 34, "begin", 34, "draw", 0, WPPK, "show2", WPPK)
+    st = lines(out, "STATS2 ")[-1].split()
+    check(st[7] == "1" and st[8] == "3", "the Glock 18C fires automatic at 1200 rpm, 3 ticks a shot (%s)" % st[7:])
+    # a suppressed build sounds, and is heard, as the silenced D5K (gun.c gevrTacticalShotSound)
+    r = Run(exe, temp, "suppressed", save=ALL.format(p=16, s=1) + "build 16 Pine Watch Suppressed\n")
+    out = r("start", "prepare", 34, *GUNS, "stats", 11, 30, 3, 1.0, "sound", 11, 77, 1.5, 2.5,
+            "begin", 34, "draw", 0, M16, "show2", M16)
+    st = lines(out, "STATS2 ")[-1].split()
+    check(build_stat(16, "Pine Watch Suppressed", "suppressed") == "true" and st[4:7] == ["77", "1.50", "2.50"],
+          "a suppressed M4A1 takes the silenced D5K's sound and loudness (%s)" % st[4:7])
+    # carried weight: every carried gun's build mass, 2.2% a kilogram past 1.7 kg, at least 76%
+    r = Run(exe, temp, "weight", save=ALL.format(p=15, s=1))   # PKM and PPK
+    out = r("start", "prepare", 34, "begin", 34, "draw", 0, AK47, "frame")
+    mass = float(build_stat(15, "-", "mass")) + float(build_stat(1, "-", "mass"))
+    want = "SPEED %.2f" % max(.76, 1 - .022 * max(0, mass - 1.7))
+    check(want in out, "carrying the PKM and the PPK (%.2f kg) slows you as native does (%s)" % (mass, want))
+
+
 def main():
     problems = validate(PACK)
     check(not problems, "the pack follows docs/mod-system.md's format: %s" % problems)
@@ -509,6 +560,8 @@ def main():
             profile_isolation(exe, temp)
         if "int gevrModGameAttach(" in (ROOT / "port/tests/modapi_native.c").read_text():
             looks(exe, temp)
+        if "show2" in (ROOT / "port/tests/modapi_native.c").read_text():
+            handling(exe, temp)
     if FAILS:
         print("%d FAILED" % len(FAILS))
         sys.exit(1)

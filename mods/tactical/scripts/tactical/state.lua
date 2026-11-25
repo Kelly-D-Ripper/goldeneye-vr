@@ -5,7 +5,10 @@ function state.reset(stage)
   state.stage = stage
   state.clock = 0              -- seconds of play this mission (tick's dt summed)
   state.ticks = 0              -- ticks of play this mission
-  state.carried = {}           -- cartridge item id -> Tactical gun key
+  state.carried = {}
+  state.builds = {}            -- cartridge item id -> the gun's build (preset, "-" stock)
+  state.kitItems = {}          -- cartridge item ids issued by the loadout (they follow its builds)
+  state.speed = 1              -- the move speed last given the game           -- cartridge item id -> Tactical gun key
   state.guns = {}              -- key -> { loaded, cap, chamber }
   state.held = {}              -- "right"/"left" -> item id held, as last seen
   state.lastPrimary = nil      -- the primary last put away: the back slot

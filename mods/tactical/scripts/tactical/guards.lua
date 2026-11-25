@@ -20,12 +20,18 @@ local DAM, TRAIN = 33, 25
 -- Gun keys (guns.lua).
 local AK, MP5, MP5K, AK74N, SKORPION, MP9, EVO3, M4A1, HK416, ASVAL, P90 = 0, 2, 3, 4, 6, 11, 12, 16, 17, 18, 21
 
-local RIFLES = { AK74N, AK, AK74N, AK }
-local RARE_RIFLES = { AK, AK74N }
-local MARINE = { MP5, MP5K, EVO3, P90, AK, MP5K, MP5, MP5, MP5, SKORPION }
-local ELITE = { ASVAL, M4A1, HK416, HK416, AK74N }
+local MP7A2 = 30
+-- { key, preset }: gevr_tactical_loadouts.c's roster lists, with their Workshop presets
+local RIFLES = { { AK74N, "-" }, { AK, "-" }, { AK74N, "Guard Wooden Grip" }, { AK, "Guard Short Wooden Grip" } }
+local RARE_RIFLES = { { AK, "Suppressed Wood" }, { AK74N, "Border Patrol" } }
+local MARINE = { { MP5, "-" }, { MP5K, "-" }, { EVO3, "-" }, { P90, "P90 Default" }, { AK, "Vympel" },
+                 { MP5K, "P1" }, { MP5, "MP5SD Holo" }, { MP5, "SAS Entry" }, { MP5, "Blackout" }, { SKORPION, "-" } }
+local ELITE = { { ASVAL, "OPK Elite" }, { M4A1, "Elite Short" }, { HK416, "Night Detail" }, { HK416, "Dark Shorty" },
+                { AK74N, "Guard Elite" } }
 local ELITE_CHOICES = { 1, 1, 2, 2, 3, 4, 5, 5 }
-local JUNGLE = { M4A1, M4A1 }
+local JUNGLE = { { M4A1, "Pine Watch" }, { M4A1, "Pine Watch Suppressed" } }
+local ELITE_MP9 = { MP9, "Tactical" }   -- with an MP7A2 "Tactical Tan" in the other hand natively
+local GUARD_P90 = { P90, "P90 Default" }
 local RARE_PERCENT = 8
 
 -- Train: ten of the regular Marines wear vests (gevr_tactical_loadouts.c trainArmouredMarine).
@@ -39,17 +45,17 @@ local function rosterKey(stage, body, id, original)
   if RUSSIAN[body] then
     if stage == DAM or orig ~= "ak47" then return nil end
     local rate = draw % 100
-    if rate < RARE_PERCENT then return RARE_RIFLES[rate % #RARE_RIFLES + 1] end
-    return RIFLES[(rate - RARE_PERCENT) * #RIFLES // (100 - RARE_PERCENT) + 1]
+    if rate < RARE_PERCENT then return table.unpack(RARE_RIFLES[rate % #RARE_RIFLES + 1]) end
+    return table.unpack(RIFLES[(rate - RARE_PERCENT) * #RIFLES // (100 - RARE_PERCENT) + 1])
   elseif body == JANUS_MARINE or body == ARCTIC_COMMANDO then
-    return MARINE[draw % #MARINE + 1]
+    return table.unpack(MARINE[draw % #MARINE + 1])
   elseif body == JANUS_SF then
-    if draw % 100 < 18 then return MP9 end   -- 0.18.4 gave these an MP9 and an MP7
-    return ELITE[ELITE_CHOICES[draw % #ELITE_CHOICES + 1]]
+    if draw % 100 < 18 then return table.unpack(ELITE_MP9) end
+    return table.unpack(ELITE[ELITE_CHOICES[draw % #ELITE_CHOICES + 1]])
   elseif body == JUNGLE_COMMANDO then
-    return JUNGLE[draw % #JUNGLE + 1]
+    return table.unpack(JUNGLE[draw % #JUNGLE + 1])
   elseif orig == "fnp90" then
-    return P90
+    return table.unpack(GUARD_P90)
   end
   return nil
 end
@@ -57,8 +63,8 @@ end
 -- guard_spawning: a setup guard's gun from the roster.
 function guards.spawning(g)
   if not mod.setting("guard_rosters", true) or g.weapon == nil then return nil end
-  local key = rosterKey(state.stage, g.body, g.id, g.weapon)
-  local entry = { key = key or catalog.defaultKey(g.weapon) }
+  local key, preset = rosterKey(state.stage, g.body, g.id, g.weapon)
+  local entry = { key = key or catalog.defaultKey(g.weapon), preset = key and preset or "-" }
   entry.armoured = state.stage == TRAIN and g.body == JANUS_MARINE and TRAIN_ARMOURED[g.id] or false
   state.guards[g.id] = entry
   if not key then return nil end
@@ -69,13 +75,14 @@ end
 
 local function droppedKey(id, item)
   local g = state.guards[id]
-  if g and g.key and catalog.byKey[g.key].itemId == item then return g.key end
-  return catalog.defaultKey(item)
+  if g and g.key and catalog.byKey[g.key].itemId == item then return g.key, g.preset end
+  return catalog.defaultKey(item), "-"
 end
 
 function guards.dropped(pickup, item, from)
   if type(from) == "number" then
-    arsenal.trackDrop(pickup, item, droppedKey(from, item))
+    local key, preset = droppedKey(from, item)
+    arsenal.trackDrop(pickup, item, key, preset)
   end
 end
 
@@ -84,7 +91,10 @@ function guards.killed(id)
   if arsenal.hasPickupIds then return end
   local info = util.try(mod.guards.get, id)
   local item = info and info.weapon
-  if item and catalog.isGunItem(item) then arsenal.noteDrop(item, droppedKey(id, item)) end
+  if item and catalog.isGunItem(item) then
+    local key, preset = droppedKey(id, item)
+    arsenal.noteDrop(item, key, preset)
+  end
 end
 
 ---------------------------------------------------------------------------
