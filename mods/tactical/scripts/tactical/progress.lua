@@ -254,12 +254,13 @@ end
 
 -- Stats: the local player's own bullets, in every mode.
 function progress.shot(key) local g = gun(key); g.shots = g.shots + 1 end
-function progress.hit(key, head)
+function progress.hit(key) local g = gun(key); g.hits = g.hits + 1 end
+
+function progress.kill(key, head)
   local g = gun(key)
-  g.hits = g.hits + 1
+  g.kills = g.kills + 1
   if head then g.headshots = g.headshots + 1 end
 end
-function progress.kill(key) local g = gun(key); g.kills = g.kills + 1 end
 
 function progress.totals()
   local t = { kills = 0, headshots = 0, shots = 0, hits = 0 }

@@ -289,6 +289,15 @@ def scenarios(exe, temp):
     want = [native_hit(15, "-", 1.5), "1.00"]
     check(dmg == want, "PKM rounds do the PKM's damage; a guard's own AK doesn't change (%s, want %s)" % (dmg, want))
 
+    r = Run(exe, temp, "headshot_stats", save=ALL.format(p=4, s=1))
+    r("start", "prepare", 34, "begin", 34, "draw", 0, AK47, "frame",
+      "hurt", 1, 3, 0.25, 1, 1, AK47, 0,
+      "hurt", 1, 3, 10, 1, 2, AK47, 0, "killed", 3, 1, AK47, 0,
+      "hurt", 1, 4, 10, 1, 1, AK47, 0, "killed", 4, 1, AK47, 0,
+      "complete", "title")
+    check(re.search(r"^gun 4 \d+ 2 1 \d+ 3 \d+$", r.progress(), re.M) is not None,
+          "three hits and two kills count, with only the fatal head hit counted as a headshot")
+
     # co-op: a client tells the host its guns; the host applies them and sends the client its hits
     r = Run(exe, temp, "client", save=ALL.format(p=15, s=1))
     out = r("start", "online", 1, 0, 0, 1, "prepare", 34, "begin", 34, "draw", 0, AK47, "frame")
@@ -302,7 +311,21 @@ def scenarios(exe, temp):
     want = [native_hit(15, "-", 1.5), native_hit(4, "-", 1.5)]
     check(dmg == want, "the host hits with the client's PKM and its own AK-74N (%s, want %s)" % (dmg, want))
     stat = [l for l in lines(out, "NETSEND") if " stat " in l]
-    check(len(stat) == 1 and stat[0].split()[2] == "1", "the client's headshot is sent to it alone")
+    check(len(stat) == 1 and stat[0].split()[2] == "1", "the client's hit is sent to it alone")
+    r = Run(exe, temp, "host_headshot", save=ALL.format(p=4, s=1))
+    out = r("start", "online", 1, 1, 0, 0, "prepare", 34, "begin", 34,
+            "netrecv", "tactical", 1, "guns", "8:15", "frame",
+            "hurt", 1, 4, 10, 1, 1, AK47, 1, "killed", 4, 1, AK47, 1)
+    stat = [l.split() for l in lines(out, "NETSEND") if " stat " in l]
+    sent = [(parts[2], bytes(int(b, 16) for b in parts[6:]).decode()) for parts in stat]
+    check(sent == [("1", "hit 8 0"), ("1", "kill 8 1")],
+          "the host sends the headshot on the kill event to the player who fired")
+    r = Run(exe, temp, "client_headshot", save=ALL.format(p=15, s=1))
+    r("start", "online", 1, 0, 0, 1, "prepare", 34, "begin", 34, "draw", 0, AK47, "frame",
+      "netrecv", "tactical", 0, "stat", "hit 8 0", "netrecv", "tactical", 0, "stat", "kill 8 1",
+      "frame", "complete", "title")
+    check(re.search(r"^gun 15 \d+ 1 1 \d+ 1 \d+$", r.progress(), re.M) is not None,
+          "the client records the host's hit and fatal headshot against its own Tactical gun")
 
     # 7. Progression: bring a gun home, earn reserve, unlock magazines by clears.
     r = Run(exe, temp, "extract", save="mode 1\nloadout -1 1\n")

@@ -56,8 +56,8 @@ function coop.init()
     local kind, item, head = string.match(data, "^(%a+) (%d+) (%d)$")
     local key = item and state.carried[tonumber(item)]
     if not key then return end
-    if kind == "hit" then progress.hit(key, head == "1")
-    elseif kind == "kill" then progress.kill(key) end
+    if kind == "hit" then progress.hit(key)
+    elseif kind == "kill" then progress.kill(key, head == "1") end
   end)
 end
 

@@ -178,26 +178,36 @@ end)
 
 mod.on("guard_killed", function(id, how, item, player)
   guards.killed(id)
-  if how ~= "shot" or item == nil then return end
-  if player == nil then return end
-  if not coop.tellStat(player, "kill", item, false) then
+  local hit = state.lethalHeadHits[id]
+  state.lethalHeadHits[id] = nil
+  if how ~= "shot" or item == nil or player == nil then return end
+  local head = hit ~= nil and hit.item == item and hit.player == player
+  if not coop.tellStat(player, "kill", item, head) then
     local key = state.carried[item]
-    if key then progress.kill(key) end
+    if key then progress.kill(key, head) end
   end
+end)
+
+mod.on("corpse_retiring", function(id)
+  state.lethalHeadHits[id] = nil
 end)
 
 -- damage ---------------------------------------------------------------
 
 mod.on("before_damage", function(d)
+  if d.target == "guard" then state.lethalHeadHits[d.id] = nil end
   return firing.beforeDamage(d)
 end)
 
 mod.on("damage_applied", function(d)
   if d.target ~= "guard" or d.by == nil or d.item == nil then return end
-  local head = d.part == "head"
-  if not coop.tellStat(d.by, "hit", d.item, head) then
+  -- Damage reports the hit part before the death event confirms the kill.
+  if d.how == "shot" and d.part == "head" and d.health <= 0 then
+    state.lethalHeadHits[d.id] = { item = d.item, player = d.by }
+  end
+  if not coop.tellStat(d.by, "hit", d.item, false) then
     local key = state.carried[d.item]
-    if key then progress.hit(key, head) end
+    if key then progress.hit(key) end
   end
 end)
 

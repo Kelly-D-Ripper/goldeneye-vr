@@ -24,6 +24,7 @@ function state.reset(stage)
   state.original = {}          -- item id -> the item's own stats
   state.pull = { right = { last = -1, count = 0 }, left = { last = -1, count = 0 } }
   state.guards = {}            -- guard id -> { key, armoured }
+  state.lethalHeadHits = {}    -- guard id -> { item, player } until the death event
   state.reinforcements = { ids = {}, count = 0, after = 0, wave = nil, sequence = 0 }
   state.peers = {}             -- co-op slot -> item id -> key (the host's view of each player's guns)
   state.kitApplied = false
