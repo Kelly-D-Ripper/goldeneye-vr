@@ -219,7 +219,6 @@ static int gunModel(int hand, int item, const char *name, const float frame[4][4
                parts->pictures[GEVR_MODPART_ACTION], parts->travel[0][0], parts->travel[0][1], parts->travel[0][2],
                parts->pictures[GEVR_MODPART_HANDLE], parts->travel[1][0], parts->travel[1][1], parts->travel[1][2],
                parts->holdOpen, parts->timing.open, parts->timing.close, parts->timing.ease);
-        return name != NULL && strcmp(name, "pack-body.bin") == 0;
     }
     if (frame != NULL) {
         printf("GUNFRAME %d %.1f %.1f %.1f %.1f %.1f\n", hand,
@@ -227,7 +226,7 @@ static int gunModel(int hand, int item, const char *name, const float frame[4][4
     }
     if (muzzle != NULL) printf("GUNMUZZLE %d %.1f %.1f %.1f\n", hand, muzzle[0], muzzle[1], muzzle[2]);
     if (support != NULL) printf("GUNSUPPORT %d %.1f %.1f %.1f\n", hand, support[0], support[1], support[2]);
-    if (frame != NULL || muzzle != NULL || support != NULL) return name != NULL && strcmp(name, "pack-body.bin") == 0;
+    if (parts != NULL || frame != NULL || muzzle != NULL || support != NULL) return name != NULL && strcmp(name, "pack-body.bin") == 0;
     return name == NULL || strncmp(name, "Gtac", 4) == 0 || strcmp(name, "pack-body.bin") == 0;
 }
 void gevrModGameGunModelReset(void) { printf("GUNMODEL reset\n"); memset(s_gunBody, 0, sizeof(s_gunBody)); }

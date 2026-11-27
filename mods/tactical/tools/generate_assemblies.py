@@ -41,9 +41,13 @@ def read_assemblies(path):
                                 damage=float(v[8]), flash=float(v[9]), suppressed=v[10] == "1")
         elif f[0] == "AXES":
             cur["axes"] = [[float(x) for x in f[1 + r * 4:5 + r * 4]] for r in range(4)]
+        elif f[0] == "ACTION":
+            cur["action"] = (float(f[1]), int(f[2]))
         elif f[0] == "MOUNT":
             frame = [[float(x) for x in f[3 + r * 4:7 + r * 4]] for r in range(4)]
-            cur["mounts"].append({"path": "" if f[1] == "-" else f[1], "part": f[2], "frame": frame})
+            cur["mounts"].append({"path": "" if f[1] == "-" else f[1], "part": f[2], "frame": frame, "motion": 0})
+        elif f[0] == "MOTION":
+            cur["mounts"][-1]["motion"] = int(f[1])
     return builds
 
 
@@ -137,7 +141,10 @@ def main():
         "-- ergonomics, recoil, spread, damage, flash) and whether it's suppressed.",
         "-- preset \"-\" is the stock build. parts[1] is the body (path \"\"): mod.weapon.model",
         "-- with this frame; the rest are mod.attach on the gun. frame rows: X, Y, Z axes",
-        "-- then origin, in the gun model's units (mod.attach's basis).",
+        "-- then origin, in the gun model's units (mod.attach's basis). action: how far the",
+        "-- moving parts go fully open (carrier units, back along the gun) and the shot's base",
+        "-- return in ticks (gevrTacticalShotFired); a part's motion: 1 with each shot and the",
+        "-- rack, 2 with the rack only (gevr_tactical_mesh.c buildGearGun).",
         "return {",
     ]
     by_key = {}
@@ -160,14 +167,14 @@ def main():
                 fr = game_frame(compose(m["frame"], b["axes"]))
                 if m["path"] == "":
                     body = fr
-                parts.append((m["part"], m["path"], fr))
+                parts.append((m["part"], m["path"], fr, m["motion"]))
                 used.add(m["part"])
                 socket = m["path"].rsplit("/", 1)[-1]
                 if socket.startswith("mod_muzzle") or socket == "mod_barrel":
                     lo, hi = transform_bounds(fr, mi[1], mi[2])
                     if muzzle is None or hi[2] > muzzle[2]:
                         muzzle = [fr[3][0], fr[3][1], hi[2]]
-            if not parts or parts[0][1] != "":
+            if not parts or parts[0][1] != "" or parts[0][3]:
                 raise SystemExit(f"build {key} {b['preset']}: no body first")
             m_local = solve_local(body, muzzle) if muzzle else None
             lines.append(f"    [{lua_str(b['preset'])}] = {{")
@@ -177,9 +184,13 @@ def main():
             if st:
                 lines.append("      stats = { " + ", ".join(
                     f"{k} = {('true' if v else 'false') if isinstance(v, bool) else num(v)}" for k, v in st.items()) + " },")
+            if b.get("action") and any(motion for *_, motion in parts):
+                shift, duration = b["action"]
+                lines.append(f"      action = {{ travel = {num(shift)}, duration = {duration} }},")
             lines.append("      parts = {")
-            for part, path, fr in parts:
-                lines.append(f"        {{ model = {lua_str(part + '.bin')}, path = {lua_str(path)}, frame = {lua_frame(fr)} }},")
+            for part, path, fr, motion in parts:
+                moves = f", motion = {motion}" if motion else ""
+                lines.append(f"        {{ model = {lua_str(part + '.bin')}, path = {lua_str(path)}, frame = {lua_frame(fr)}{moves} }},")
             lines.append("      },")
             lines.append("    },")
         lines.append("  },")

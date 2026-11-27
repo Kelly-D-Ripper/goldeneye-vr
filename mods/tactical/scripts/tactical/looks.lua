@@ -17,6 +17,8 @@ local opticAssets = mod.attach and mod.attach.optic and util.try(require, "tacti
 local looks = {}
 
 local attached = { right = {}, left = {} }   -- hand -> { ids }
+local moving = { right = {}, left = {} }     -- hand -> { { id, motion } } parts that move with the action
+local drawnBuild = { right = nil, left = nil } -- hand -> { key, build } for re-timing on a mode change
 local magazine = { right = nil, left = nil } -- hand -> the magazine's attachment id
 local shown = { right = nil, left = nil }    -- hand -> "item:key:preset" drawn now
 local failed = {}
@@ -24,6 +26,37 @@ local failed = {}
 local function clear(hand)
   for _, id in ipairs(attached[hand]) do util.try(mod.attach.remove, id) end
   attached[hand], magazine[hand], shown[hand] = {}, nil, nil
+  moving[hand], drawnBuild[hand] = {}, nil
+end
+
+-- The native shot's return (gevr_tactical_session.c gevrTacticalShotFired): the
+-- base ticks, cut to the build's interval between shots outside semi (never
+-- under 3), then the action is fully open on the shot's own tick and closes over
+-- the rest, eased as gevrTacticalShotTravel's open * (0.4 + 0.6 * open).
+local function actionTiming(key, b)
+  local duration = b.action.duration
+  local rpm = b.stats and b.stats.rpm or 0
+  if progress.firemode(key) ~= "semi" and rpm > 0 then
+    duration = math.floor(math.max(3, math.min(duration, 3600 / rpm)))
+  end
+  return { open = 1, close = duration - 1, ease = 0.4 }
+end
+
+-- Each moving part along the native slide (gearPartMatrix: back along the
+-- gun by gevrTacticalActionShift of the stroke); a charging handle that only
+-- the rack moves has no shot timing.
+local function setMotion(hand, key, b)
+  if not (mod.attach.action and b.action) then return end
+  local timing = actionTiming(key, b)
+  for _, m in ipairs(moving[hand]) do
+    local spec = { travel = { 0, 0, -b.action.travel } }
+    if m.motion == 2 then
+      spec.handle = true
+    else
+      spec.open, spec.close, spec.ease = timing.open, timing.close, timing.ease
+    end
+    util.try(mod.attach.action, m.id, spec)
+  end
 end
 
 local function addPart(hand, part)
@@ -60,7 +93,10 @@ function looks.drawn(hand, itemId)
   clear(hand)
   if not b then return end
   local body = b.parts[1]
-  local ok = util.try(mod.weapon.model, hand, itemId, body.model, { frame = body.frame, muzzle = b.muzzle })
+  local look = { frame = body.frame, muzzle = b.muzzle }
+  -- native's action doesn't lock back on an empty magazine (gevrTacticalShotTravel)
+  if mod.attach.action then look.holdOpen = false end
+  local ok = util.try(mod.weapon.model, hand, itemId, body.model, look)
   if not ok then
     if not failed[body.model] then mod.log("no pack body " .. body.model .. " for " .. catalog.byKey[key].name) end
     failed[body.model] = true
@@ -72,12 +108,21 @@ function looks.drawn(hand, itemId)
     if id then
       attached[hand][#attached[hand] + 1] = id
       if p.path:match("mod_magazine$") then magazine[hand] = id end
+      if p.motion then moving[hand][#moving[hand] + 1] = { id = id, motion = p.motion } end
     elseif not failed[p.model] then
       failed[p.model] = true
       mod.log("part " .. p.model .. " (" .. p.path .. ") didn't attach")
     end
   end
+  setMotion(hand, key, b)
+  drawnBuild[hand] = { key = key, build = b }
   shown[hand] = tag
+end
+
+-- A fire mode change: the moving parts take the new mode's return.
+function looks.retime(hand)
+  local d = drawnBuild[hand]
+  if d then setMotion(hand, d.key, d.build) end
 end
 
 function looks.reloadStart(hand)
@@ -91,6 +136,7 @@ end
 -- A mission's start: the game dropped every attachment and model choice.
 function looks.reset()
   attached = { right = {}, left = {} }
+  moving, drawnBuild = { right = {}, left = {} }, {}
   magazine, shown = {}, {}
 end
 

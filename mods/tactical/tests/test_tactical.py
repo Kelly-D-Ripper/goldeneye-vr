@@ -99,7 +99,9 @@ def build(temp):
     exe = temp / ("harness.exe" if os.name == "nt" else "harness")
     subprocess.run([cc, *flags, "-I" + str(ROOT / "include"), "-I" + str(ROOT / "port/include"),
                     "-I" + str(ROOT / "port/tests"), str(harness), str(ROOT / "port/src/gevr_modapi.c"),
-                    str(ROOT / "port/src/gevr_modscript.c"), *objects, "-lm", "-o", str(exe)], check=True)
+                    str(ROOT / "port/src/gevr_modscript.c"),
+                    *[str(f) for f in [ROOT / "port/src/gevr_modattach_net.c"] if f.exists()],   # #354 and later
+                    *objects, "-lm", "-o", str(exe)], check=True)
     return exe
 
 
@@ -563,6 +565,16 @@ def looks(exe, temp):
     ids = [int(l.split()[1]) for l in attached]
     check(len(attached) == 18 and all(i > 0 for i in ids),
           "its 18 Whiteout parts attach to the gun (%d, %s)" % (len(attached), ids[:3]))
+    # its action as native moves it (gevr_tactical_mesh.c buildGearGun): the bolt with
+    # each shot, 44 units back (4.4 cm), open on the shot's tick and back over native's
+    # return, cut to the build's 800 rpm in its default auto (floor(max(3, min(6, 4.5))) = 4
+    # ticks, so 3 to close), eased 0.4; the M4's charging handle with the rack only
+    moves = [l.split() for l in seg if l.startswith("ATTACHACTION ")]
+    check(sorted(m[5:] for m in moves) == [["0", "1", "3", "0.40"], ["1"]]
+          and all(m[2:5] == ["0", "0", "-44"] for m in moves),
+          "the Whiteout bolt moves with each shot on native's timing and its charging handle with the rack (%s)" % moves)
+    parts = [l for l in seg if l.startswith("GUNPARTS 0 ")]
+    check(parts and parts[0].split()[11] == "0", "the body's action doesn't lock back on empty, as native's (%s)" % parts[:1])
     mag = next((l for l in attached if " 67c26286da8783675c5967c4.bin" in l), None)
     mag_id = mag and mag.split()[1]
     check(mag_id is not None and ("ATTACHSHOW %s 0" % mag_id) in out and ("ATTACHSHOW %s 1" % mag_id) in out,

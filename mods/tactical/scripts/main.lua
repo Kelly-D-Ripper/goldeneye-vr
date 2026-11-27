@@ -166,6 +166,7 @@ end)
 mod.on("grip", function(hand, anchor, taken)
   if hand == "left" and anchor == CHEST_SWITCH and not taken then
     firing.cycleMode("right")
+    looks.retime("right")
   end
 end)
 

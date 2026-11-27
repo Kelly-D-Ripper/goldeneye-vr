@@ -13,7 +13,11 @@
  *   AXES <16 floats>          the native gun axes (gearGunAxes, first person)
  *   STATS <modes> <rpm> <semiRpm> <burst> <mass> <ergo> <recoil> <spread> <damage> <flash> <suppressed>
  *                             gevrWeaponStats for the assembly (gevr_tactical_stats.c)
+ *   ACTION <shift> <duration>  the action's travel fully open, in carrier units
+ *                             (gevrTacticalActionShift of the shot's stroke), and
+ *                             the shot's base return in ticks (gevrTacticalShotFired)
  *   MOUNT <path or "-"> <part id> <16 floats: frame rows>
+ *   MOTION <0 none, 1 with the action, 2 with the rack only>, for the mount above
  *   END
  */
 #include <stdarg.h>
@@ -31,6 +35,7 @@
 #include "gevr_tactical_asset.h"
 #include "gevr_tactical_fit.h"
 #include "gevr_tactical_stats.h"
+#include "gevr_tactical_session.h"
 
 /* gevr_tactical_mesh.c, verbatim: the view-forward offsets and gearGunAxes
  * (first person). The native build runs with --tactical-physical. */
@@ -85,6 +90,29 @@ int sysArgCheck(const char *arg)
 }
 int gevrTacticalCampaignRules(void) { return 1; }
 
+/* gevr_tactical_mesh.c buildGearGun, verbatim: which parts move, and with what */
+static int gearUnderSocket(const char *path, const char *socket)
+{
+    const size_t size = strlen(socket);
+    return !strncmp(path, socket, size) && (!path[size] || path[size] == '/');
+}
+
+static int mountMotion(int kind, const GevrGearMount *mount)
+{
+    const int expanded = tacticalGunIsExpanded(kind);
+    const char *slot = mount->socket ? mount->socket->key : "";
+    if (!strcmp(slot, "mod_charge") || !strncmp(slot, "mod_charge_", sizeof("mod_charge_") - 1))
+        /* gevrTacticalChargeTravel(kind, action, manual): the action's, or the rack's alone */
+        return gevrTacticalChargeTravel(kind, 1.f, 0.f) > 0.f ? 1 : 2;
+    if (!strcmp(slot, "mod_bolt")) return 1;
+    if (tacticalGunIsPistol(kind) && (kind == TACTICAL_GUN_MAKAROV || expanded)
+        && (gearUnderSocket(mount->path, "mod_reciever")
+            || gearUnderSocket(mount->path, "mod_slide")
+            || gearUnderSocket(mount->path, "mod_charge")))
+        return 1;
+    return 0;
+}
+
 static void dump(int key, const char *preset, const GevrGearAssembly *a)
 {
     if (!a) return;
@@ -102,6 +130,13 @@ static void dump(int key, const char *preset, const GevrGearAssembly *a)
             printf("STATS %d %d %d %d %.9g %.9g %.9g %.9g %.9g %.9g %d\n", st.modes, st.rpm, st.semiRpm, st.burst,
                    st.mass, st.ergo, st.recoil, st.spread, st.damage, st.flash, gevrTacticalGearAssemblySuppressed(a));
     }
+    {
+        /* gevrTacticalShotFired's base return, and the stroke fully open on the
+         * shot's own tick (age 0), as gevrTacticalActionShift moves a part (physical) */
+        const int kind = kindOfKey(key);
+        const int duration = tacticalGunIsPistol(kind) ? 7 : 6;
+        printf("ACTION %.9g %d\n", gevrTacticalActionShift(kind, gevrTacticalShotTravel(kind, 0, duration), 1), duration);
+    }
     for (int i = 0; i < a->count; i++) {
         const GevrGearMount *m = &a->mounts[i];
         const GevrGearPart *p = gevrTacticalGearPart(m->part);
@@ -110,6 +145,7 @@ static void dump(int key, const char *preset, const GevrGearAssembly *a)
         for (int r = 0; r < 4; r++)
             for (int c = 0; c < 4; c++) printf(" %.9g", m->frame[r][c]);
         printf("\n");
+        printf("MOTION %d\n", mountMotion(kindOfKey(key), m));
     }
     printf("END\n");
 }
