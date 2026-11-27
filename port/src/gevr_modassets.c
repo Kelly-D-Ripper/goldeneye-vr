@@ -55,12 +55,32 @@ FILE *gevrModAssetOpenModel(const char *name)
     return fopen(path, "rb");
 }
 
+FILE *gevrModAssetOpenOptic(const char *name)
+{
+    char base[64], path[1024];
+    size_t n;
+    if (!name || (n = strlen(name)) <= 4 || n > 63 || strcmp(name + n - 4, ".opt")) return NULL;
+    memcpy(base, name, n - 4);
+    base[n - 4] = '\0';
+    if (!nameOk(base) || !assetPath(path, sizeof(path), gevrModActive(), "models", name)) return NULL;
+    return fopen(path, "rb");
+}
+
 FILE *gevrModAssetOpenModelOpacity(const char *name)
 {
     char filename[sizeof(".opaque") + 63], path[1024];
     if (!nameOk(name)) return NULL;
     snprintf(filename, sizeof(filename), "%s.opaque", name);
     if (!assetPath(path, sizeof(path), gevrModActive(), "models", filename)) return NULL;
+    return fopen(path, "rb");
+}
+
+FILE *gevrModAssetOpenEffect(const char *name)
+{
+    char filename[sizeof(".png") + 63], path[1024];
+    if (!nameOk(name) || strchr(name, '.')) return NULL;
+    snprintf(filename, sizeof(filename), "%s.png", name);
+    if (!assetPath(path, sizeof(path), gevrModActive(), "effects", filename)) return NULL;
     return fopen(path, "rb");
 }
 

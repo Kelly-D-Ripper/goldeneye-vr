@@ -90,6 +90,7 @@ static float s_beanRoomFogLine[2];
 static unsigned s_beanPaintUploads, s_beanPaintHits;
 extern "C" int gevrStatsPicture(const void *addr, const uint8_t **rgba, int *w, int *h);   // bondview2.c
 #include "gevr_bean.h"
+#include "gevr_modblood.h"
 #include "gevr_modassets.h"   /* a mod's textures (assets/textures) */
 #include "gevr_packmesh.h"
 #include "gevr_modpack.h"
@@ -202,7 +203,10 @@ void gfx_opengl_draw_vignette(float strength, float blink);   // gfx_opengl.cpp
 void gfx_opengl_draw_volumetric(int batchId);                 // gfx_opengl.cpp (issue #249)
 extern "C" float gevrStereoVignette(void);          // bondview2.c
 extern "C" float gevrTeleportBlink(void);           // gevr_teleport.c: the teleport's blink, 0..1
-void gfx_vr_scope_record(bool on, bool invert_y);   // gfx_opengl.cpp (issue #40)
+void gfx_vr_scope_record(bool on, bool invert_y);
+void gfx_mod_optic_scope_record(const float* projection, bool invert_y);
+#include "gevr_modoptic.h"
+void gfx_mod_optic_surface(const GevrOpticSurface* surface, const float projection[16], bool invert_y);   // gfx_opengl.cpp (issue #40)
 void gfx_vr_scope_only(int hand);                   // GUNRIGHT 0 / GUNLEFT 1, -1 ends
 void gfx_vr_scope_render(void);
 void gfx_vr_eye_record(bool on, const float* proj, bool invert_y, const float* presentation);
@@ -215,6 +219,8 @@ extern "C" int gevrVrFrameDeferred(void);         // gevr_engine_shim.c: the ear
 extern "C" int gevrVrBeginDeferredFrame(void);    // ... begin it now; 1 if it did
 extern "C" void vr_relocate_on_begin(void);       // vr_openxr.cpp: the replay corrects the early poses
 extern "C" int vr_eye_multisampled(void);         // vr_openxr.cpp: the eye images are multisampled
+extern "C" int gevrMvEmuActive;                   // gevr_mv_emu.cpp: multiview emulated (Vision Pro)
+extern "C" int gevr_mv_emu_view_pass(int view);   // ... one eye at a time
 static int gevr_vr_replay_frame(bool fresh);
 #ifdef GEVR_FLAT
 // a flat game's frames between game frames, on a screen faster than the game (#274)
@@ -2093,7 +2099,8 @@ static void import_texture(int i, int tile, bool is_rect) {
         /* Mods: Oddjob's hat loads its pictures the same way (gevr_oddjobhat.c) */
         if ((gevrBeanTexture(frameAddr, &beanRgba, &beanW, &beanH)
              || gevrHatTexture(frameAddr, &beanRgba, &beanW, &beanH)
-             || gevrPackMeshTexture(frameAddr, &beanRgba, &beanW, &beanH))
+             || gevrPackMeshTexture(frameAddr, &beanRgba, &beanW, &beanH)
+             || gevrModBloodTexture(frameAddr, &beanRgba, &beanW, &beanH))
             && beanRgba && beanW > 0 && beanH > 0) {
             /* UV normalization below uses the logical tile, not the 16x16
              * stand-in's byte count. Keep both axes in those same units. */
@@ -5658,6 +5665,11 @@ static void gfx_run_dl(Gfx* cmd) {
                         gfx_vr_scope_record(true, gfx_rapi->get_clip_parameters().invert_y);
                         break;
 
+                    case GEVR_OPTIC_SCOPE_RECORD:   // lv.c: the game's scopes and a pack optic's lens
+                        gfx_flush();
+                        gfx_mod_optic_scope_record(rsp.P_matrix[0], gfx_rapi->get_clip_parameters().invert_y);
+                        break;
+
                     case VR_SCOPE_REC_END:
                         gfx_flush();
                         gfx_vr_scope_record(false, false);
@@ -5701,6 +5713,11 @@ static void gfx_run_dl(Gfx* cmd) {
                 break;
             case (uint8_t)G_TEXTURE:
                 gfx_sp_texture(C1(16, 16), C1(0, 16), C0(11, 3), C0(8, 3), C0(0, 8));
+                break;
+            case G_GEVR_OPTIC_SURFACE:   // gevr_modoptic.c: a pack optic's lens on its housing
+                gfx_flush();
+                gfx_mod_optic_surface((const GevrOpticSurface*)seg_addr(cmd->words.w1),
+                    rsp.P_matrix[0], gfx_rapi->get_clip_parameters().invert_y);
                 break;
             case G_GEVR_SKY_VTX:
                 memset(s_gevrPresentedFresh, 0, sizeof(s_gevrPresentedFresh));   // pre-projected: none presented
@@ -6615,9 +6632,13 @@ extern "C" void gfx_run(Gfx* commands) {
         const bool eyeInvertY = gfx_rapi->get_clip_parameters().invert_y;
         const bool eyeDeferred = gevrVrFrameDeferred() != 0;
         const bool eyeMultisampled = vr_eye_multisampled() != 0;
-        if (!screenRendered && (eyeDeferred || eyeMultisampled) && !(VrPauseHub && VrIsPaused) &&
+        // Emulated multiview (Vision Pro): kept and replayed one eye at a time
+        // (gevr_vr_replay_frame), not drawn straight in with each draw going
+        // to both eyes in turn (a Metal render pass per draw and eye).
+        const bool eyeEmulated = gevrMvEmuActive != 0;
+        if (!screenRendered && (eyeDeferred || eyeMultisampled || eyeEmulated) && !(VrPauseHub && VrIsPaused) &&
 #if (defined(ANDROID) && !defined(GEVR_MOBILE)) || defined(GEVR_PCVR)   /* the headset build: the Quest, PC VR */
-            (!gevrNativePauseOpen() || eyeMultisampled) &&
+            (!gevrNativePauseOpen() || eyeMultisampled || eyeEmulated) &&
 #endif
             gfx_vr_eye_record_possible(eyeProj, eyeInvertY)) {
             gfx_vr_eye_record_only(true);
@@ -6909,8 +6930,15 @@ static int gevr_vr_replay_frame(bool fresh) {
     const bool have0 = recorded && gevrVrRedrawHandDelta(0, hand[0]) != 0;
     const bool have1 = recorded && gevrVrRedrawHandDelta(1, hand[1]) != 0;
     const bool haveBody = recorded && gevrVrRedrawBodyDelta(body) != 0;
-    gfx_vr_eye_replay(delta, have0 ? hand[0] : nullptr, have1 ? hand[1] : nullptr, haveBody ? body : nullptr);
-    gfx_opengl_draw_vignette(s_gevrLastVignette, gevrTeleportBlink());
+    // Emulated multiview: each eye whole, left then right, in one render pass
+    // each (see gevr_mv_emu_view_pass); otherwise both views at once.
+    const int views = gevrMvEmuActive && gevr_mv_emu_view_pass(0) ? 2 : 1;
+    for (int view = 0; view < views; view++) {
+        if (view == 1) gevr_mv_emu_view_pass(1);
+        gfx_vr_eye_replay(delta, have0 ? hand[0] : nullptr, have1 ? hand[1] : nullptr, haveBody ? body : nullptr);
+        gfx_opengl_draw_vignette(s_gevrLastVignette, gevrTeleportBlink());
+    }
+    if (views == 2) gevr_mv_emu_view_pass(-1);
     gfx_vr_gpu_end();
     vr_end_eye_render();
     // SpaceWarp: this game frame's motion vectors and depth, from the same moves

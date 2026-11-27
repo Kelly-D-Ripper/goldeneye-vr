@@ -3,6 +3,7 @@
 #include "gevr_reload_input.h"
 #include "gevr_hand_reload.h"
 #include "gevr_locomotion.h"
+#include "gevr_modoptic.h"
 #endif
 #include "system.h"
 #include <ultra64.h>
@@ -70,6 +71,7 @@
 #include "gevr_rom_segments.h"
 #ifdef GEVR
 #include "gevr_ragdoll.h"
+#include "gevr_modblood.h"
 #endif
 #ifdef GEVR
 extern bool netIsActive(void);
@@ -371,8 +373,11 @@ void lvlStageLoad(s32 stage)
 
     sndSetScalerApplyVolumeAllSfxSlot(1.0f);
 #ifdef GEVR
-    /* co-op (#94): the party's menus (the title stage) take solo's volumes */
-    if (netIsActive() && stage != LEVELID_TITLE)
+    /* co-op (#94): the party's menus (the title stage) take solo's volumes.
+     * Those are the player's Music on the title stage, solo or online: at
+     * VOLUME_MAX the intro and the menus ignored the setting, and only a
+     * level heard it (its music start applies get_mTrack2Vol). */
+    if (netIsActive() || stage == LEVELID_TITLE)
     {
         u16 volume = get_mTrack2Vol();
         musicTrack1ApplySeqpVol(volume);
@@ -963,7 +968,6 @@ Gfx* lvlRender(Gfx* DL)
             set_cur_player(0);
         }
         gevrStereoFrame(g_CurrentStageToLoad != LEVELID_TITLE);
-        if (g_CurrentStageToLoad != LEVELID_TITLE) netSpectatorFrame();
     }
 #endif
     gSPSegment(DL++, SPSEGMENT_PHYSICAL, NULL);
@@ -996,12 +1000,15 @@ Gfx* lvlRender(Gfx* DL)
             s32 playernum = get_nth_player_from_shuffled(i);
 #ifdef GEVR
             {
-                extern int netGetLocalSlot(void);
+                extern int gevrNetSlotIsLocalHuman(int slot);
                 extern bool netSlotOccupied(int slot);
-                if (netIsActive() && playernum != netGetLocalSlot())
+                extern int netGetLocalSlot(void);
+                /* the local view: this machine's humans, or a dedicated server's own
+                 * seat (no human, but its pass runs the world's once-a-frame work) */
+                if (netIsActive() && !gevrNetSlotIsLocalHuman(playernum) && playernum != netGetLocalSlot())
                 {
-                    /* Online only the local player's view is drawn; the other
-                     * players' copies get their view pass without the drawing. */
+                    /* Online only local human viewports are drawn; remote and bot
+                     * copies get their view pass without the drawing. */
                     if (netSlotOccupied(playernum))
                     {
                         gevrViewPass(playernum, GUNRIGHT);
@@ -1009,9 +1016,37 @@ Gfx* lvlRender(Gfx* DL)
                     }
                     continue;
                 }
+                {
+                    extern int gevrSlotInWorld(int slot);
+                    if (!gevrSlotInWorld(playernum)) continue;   /* a couch match's empty seat: no view */
+                }
             }
 #endif
             set_cur_player(playernum);
+#ifdef GEVR
+            if (gevrViewsBySeat())   /* online, or a couch match: the views follow the seats */
+            {
+                extern s16 bondviewGetCurrentPlayerViewportWidth(void);
+                extern s16 bondviewGetCurrentPlayerViewportHeight(void);
+                extern s16 get_curplayer_viewport_ulx(void);
+                extern s16 bondviewGetCurrentPlayerViewportUly(void);
+                extern float portNativeAspect(void);
+                s16 vw = bondviewGetCurrentPlayerViewportWidth();
+                s16 vh = bondviewGetCurrentPlayerViewportHeight();
+                s16 vl = get_curplayer_viewport_ulx();
+                s16 vt = bondviewGetCurrentPlayerViewportUly();
+                if (g_CurrentPlayer->viewx != vw || g_CurrentPlayer->viewy != vh ||
+                    g_CurrentPlayer->viewleft != vl || g_CurrentPlayer->viewtop != vt)
+                {
+                    f32 nat = portNativeAspect();
+                    f32 asp = nat > 0.0f ? ((f32)vw / (f32)vh) * 0.75f * nat : ((f32)vw / (f32)vh);
+                    set_cur_player_screen_size(vw, vh);
+                    set_cur_player_viewport_size(vl, vt);
+                    set_cur_player_aspect(asp);
+                }
+                if (netIsActive()) netSpectatorFrame();
+            }
+#endif
 
             viSetViewSize(g_CurrentPlayer->viewx, g_CurrentPlayer->viewy);
             viSetViewPosition(g_CurrentPlayer->viewleft, g_CurrentPlayer->viewtop);
@@ -1063,10 +1098,14 @@ Gfx* lvlRender(Gfx* DL)
                 /* issue #40: the world, up to the gun, is kept for the sniper scope */
                 extern s32 gevrScopeBegin(void);
 
-                gevrScopeRec = gevrScopeBegin();
+                extern s32 gevrModOpticWantScope(void);   /* gevr_modoptic.c: a pack optic's lens */
+
+                const s32 opticScope = gevrModOpticWantScope();
+                gevrScopeRec = gevrScopeBegin() || opticScope;
                 if (gevrScopeRec)
                 {
-                    gDPNoOpTag(DL++, 0x565D0000); /* VR_SCOPE_REC_BEGIN */
+                    /* GEVR_OPTIC_SCOPE_RECORD: the game's scopes and a slot for the lens */
+                    gDPNoOpTag(DL++, opticScope ? GEVR_OPTIC_SCOPE_RECORD : 0x565D0000); /* VR_SCOPE_REC_BEGIN */
                 }
             }
 #endif
@@ -1257,6 +1296,7 @@ Gfx* lvlRender(Gfx* DL)
             }
 
 #ifdef GEVR
+            DL = gevrModBloodDraw(DL);
             if (gevrScopeRec)
             {
                 gDPNoOpTag(DL++, 0x565D0001); /* VR_SCOPE_REC_END */
@@ -1445,9 +1485,9 @@ void lvlSetMultipliersForDifficulty(void)
  */
 static s32 gevrDeathPlaysHere(s32 i)
 {
-    extern int netGetLocalSlot(void);
+    extern int gevrNetSlotIsLocalHuman(int slot);
 
-    return !netIsActive() || i == netGetLocalSlot();
+    return !netIsActive() || gevrNetSlotIsLocalHuman(i);
 }
 #endif
 
@@ -1509,6 +1549,7 @@ void lvlManageMpGame(void)
 #ifdef GEVR
     gevrVrStatsSimulation((unsigned)g_ClockTimer);
     gevrRagdollTick(g_ClockTimer);
+    if (g_ClockTimer > 0) gevrModBloodTick();
     { extern void gevrHordeTick(int ticks); gevrHordeTick(g_ClockTimer); }
     { extern void gevrArenaTick(s32 ticks); gevrArenaTick(g_ClockTimer); }
 #endif
@@ -1685,7 +1726,7 @@ void lvlManageMpGame(void)
             for (i = 0; i < player_count; i++)
             {
 #ifdef GEVR
-                if (netIsActive() && !netPlayerInRound(i)) continue;
+                if (!gevrSlotInRound(i)) continue;   /* online: not in the round; a couch match: an empty seat */
 #endif
                 killed_count = 0;
                 not_dead_count = 0;
@@ -1693,7 +1734,7 @@ void lvlManageMpGame(void)
                 for (j = 0; j < player_count; j++)
                 {
 #ifdef GEVR
-                    if (netIsActive() && !netPlayerInRound(j)) continue;
+                    if (!gevrSlotInRound(j)) continue;
 #endif
                     if (g_playerPointers[j]->bonddead == 0)
                     {

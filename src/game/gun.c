@@ -110,6 +110,7 @@ void gevrNetSpawnProjectile(s32 slot, s32 kind, s32 hand, s32 item, const coord3
                             const f32 *rot9, const coord3d *extra, s32 cooktimer)
 {
     extern int netGetLocalSlot(void);
+    extern int gevrNetSlotIsLocalHuman(int slot);
     extern void gevrSetCopyTrace(s32 on);
     s32 prev = get_cur_playernum();
     s32 local = netGetLocalSlot();
@@ -121,7 +122,7 @@ void gevrNetSpawnProjectile(s32 slot, s32 kind, s32 hand, s32 item, const coord3
     s32 savedcook;
     s32 i;
 
-    if (slot < 0 || slot >= MAX_PLAYER_COUNT || slot == local || local < 0 || local >= MAX_PLAYER_COUNT || hand < 0 || hand > 1)
+    if (slot < 0 || slot >= MAX_PLAYER_COUNT || gevrNetSlotIsLocalHuman(slot) || local < 0 || local >= MAX_PLAYER_COUNT || hand < 0 || hand > 1)
     {
         return;
     }
@@ -5709,12 +5710,19 @@ Gfx *gevrGexArmOnWatch(Gfx *gdl, ModelRenderData *templ, const Mtxf *w)
  * again (gevrModGunReconcile), so setting one, clearing one and the reset (a
  * new mission, a mod stopped) never touch a player that may be gone.
  */
+#include "gevr_modaction.h"
 #include "gevr_modassets.h"
 #include "gevr_modmesh.h"
 #define GEVR_MODGUN_NAME 64
 static char s_gevrModGun[2][ITEM_IDS_MAX][GEVR_MODGUN_NAME];
 static Mtxf s_gevrModGunFit[2][ITEM_IDS_MAX];
 static u8 s_gevrModGunHasFit[2][ITEM_IDS_MAX];
+static f32 s_gevrModGunMuzzle[2][ITEM_IDS_MAX][3];
+static u8 s_gevrModGunHasMuzzle[2][ITEM_IDS_MAX];
+static f32 s_gevrModGunSupport[2][ITEM_IDS_MAX][3];
+static u8 s_gevrModGunHasSupport[2][ITEM_IDS_MAX];
+static GevrModGunParts s_gevrModGunPartsFor[2][ITEM_IDS_MAX];
+static u8 s_gevrModGunHasParts[2][ITEM_IDS_MAX];
 static struct
 {
     const void *owner;           /* the player it was loaded for: another stage's is stale */
@@ -5755,15 +5763,123 @@ const GevrModMesh *gevrModGunMesh(s32 hand)
 
 /* A new fit for the same file takes effect at the next draw. A different
  * file or item still loading must not borrow a fit from the pending choice. */
-const Mtxf *gevrModGunFrame(s32 hand)
+static s32 gevrModGunFittedItem(s32 hand)
 {
     const s32 p = get_cur_playernum();
-    if (!gevrModGunShownOk(p, hand) || s_gevrModGunShown[p][hand].mesh == NULL) return NULL;
+    if (!gevrModGunShownOk(p, hand) || s_gevrModGunShown[p][hand].mesh == NULL) return -1;
     const s32 item = g_CurrentPlayer->hand_item[hand];
     const char *name = gevrModGunModelFor(hand, item);
-    if (name == NULL || !s_gevrModGunHasFit[hand][item]
-        || strcmp(name, s_gevrModGunShown[p][hand].name) != 0) return NULL;
-    return &s_gevrModGunFit[hand][item];
+    return name != NULL && strcmp(name, s_gevrModGunShown[p][hand].name) == 0 ? item : -1;
+}
+
+const Mtxf *gevrModGunFrame(s32 hand)
+{
+    const s32 item = gevrModGunFittedItem(hand);
+    return item >= 0 && s_gevrModGunHasFit[hand][item] ? &s_gevrModGunFit[hand][item] : NULL;
+}
+
+s32 gevrModGunMuzzle(s32 hand, coord3d *out)
+{
+    const s32 item = gevrModGunFittedItem(hand);
+    if (item < 0 || !s_gevrModGunHasMuzzle[hand][item]) return FALSE;
+    const Mtxf *fit = s_gevrModGunHasFit[hand][item] ? &s_gevrModGunFit[hand][item] : NULL;
+    gevrModMeshPoint(fit, s_gevrModGunMuzzle[hand][item], out->f);
+    return TRUE;
+}
+
+s32 gevrModGunSupport(s32 hand, coord3d *out)
+{
+    const s32 item = gevrModGunFittedItem(hand);
+    if (item < 0 || !s_gevrModGunHasSupport[hand][item]) return FALSE;
+    const Mtxf *fit = s_gevrModGunHasFit[hand][item] ? &s_gevrModGunFit[hand][item] : NULL;
+    gevrModMeshPoint(fit, s_gevrModGunSupport[hand][item], out->f);
+    return TRUE;
+}
+
+/*
+ * A pack gun's moving parts (gevr_modaction.h): each hand's action, opened by
+ * the same shot that opens GoldenEye's slide (sub_GAME_7F05E808) and stepped
+ * by its rule each tick, with the hand rack's pull (bondview2.c).
+ */
+static GevrModAction s_gevrModAction[MAX_PLAYER_COUNT][2];
+static u8 s_gevrModShot[MAX_PLAYER_COUNT][2];   /* a shot this tick, for gun parts with their own timing */
+extern f32 gevrRackPullShare(s32 hand);   /* bondview2.c */
+extern s32 gevrModGameShotInterval(s32 item);   /* gevr_modgame.c */
+
+static GevrModAction *gevrModGunAction(s32 hand)
+{
+    const s32 p = get_cur_playernum();
+    return p >= 0 && p < MAX_PLAYER_COUNT && hand >= 0 && hand <= 1 ? &s_gevrModAction[p][hand] : NULL;
+}
+
+/* the body's own timing, NULL for GoldenEye's */
+static const GevrModActionTiming *gevrModGunTiming(s32 hand)
+{
+    const s32 item = gevrModGunFittedItem(hand);
+    return item >= 0 && s_gevrModGunHasParts[hand][item] ? &s_gevrModGunPartsFor[hand][item].timing : NULL;
+}
+
+void gevrModGunActionShot(s32 hand)
+{
+    GevrModAction *a = gevrModGunAction(hand);
+    if (a != NULL)
+    {
+        gevrModActionShot(a, g_CurrentPlayer->hand_item[hand]);
+        s_gevrModShot[get_cur_playernum()][hand] = TRUE;
+    }
+}
+
+static void gevrModGunActionTick(s32 hand)
+{
+    GevrModAction *a = gevrModGunAction(hand);
+    const s32 item = gevrModGunFittedItem(hand);
+    const s32 holdOpen = item < 0 || !s_gevrModGunHasParts[hand][item] || s_gevrModGunPartsFor[hand][item].holdOpen;
+    const s32 held = g_CurrentPlayer->hand_item[hand];
+    const s32 interval = gevrModGameShotInterval(held);
+    const s32 loaded = g_CurrentPlayer->hands[hand].weapon_ammo_in_magazine;
+    int open, close;
+    if (a == NULL || (netIsActive() && get_cur_playernum() != netGetLocalSlot())) return;   /* a copy: below */
+    gevrModActionTicks(gevrModGunTiming(hand), interval, &open, &close);
+    gevrModActionStep(a, held, g_GlobalTimerDelta, loaded, holdOpen, open, close);
+    /* gun parts with timing of their own step beside it (gevr_modattach.c) */
+    gevrModAttachActionTick(hand, held, s_gevrModShot[get_cur_playernum()][hand], g_GlobalTimerDelta, loaded, holdOpen, interval);
+    s_gevrModShot[get_cur_playernum()][hand] = FALSE;
+}
+
+/* another player's copy (#335), each tick: its pack parts move with the
+ * shots its own gun fires here (gunfire.c fires it as the owner's trigger
+ * says, at the gun's own rate), by that player's timing as it was told
+ * (gevr_modattach.c); asked before the hand's buffer is, as a low-memory
+ * copy's left hand has none */
+static void gevrModGunCopyActionTick(s32 hand)
+{
+    const s32 p = get_cur_playernum();
+    s32 held;
+    if (!netIsActive() || p == netGetLocalSlot() || p < 0 || p >= MAX_PLAYER_COUNT || hand < 0 || hand > 1) return;
+    held = g_CurrentPlayer->hands[hand].weaponnum;   /* its owner's, as net_player_sync.c gives it */
+    gevrModAttachRemoteActionTick(p, hand, held, s_gevrModShot[p][hand], g_GlobalTimerDelta, gevrModGameShotInterval(held));
+    s_gevrModShot[p][hand] = FALSE;
+}
+
+f32 gevrModGunActionShare(s32 hand, s32 handle)
+{
+    const GevrModAction *a = gevrModGunAction(hand);
+    if (a == NULL || a->item != g_CurrentPlayer->hand_item[hand]) a = NULL;
+    return gevrModActionShare(a, gevrRackPullShare(hand), handle, gevrModGunTiming(hand));
+}
+
+const GevrModGunParts *gevrModGunParts(s32 hand, f32 offset[GEVR_MODPART_GROUPS][3])
+{
+    const s32 item = gevrModGunFittedItem(hand);
+    const GevrModGunParts *parts;
+    s32 group, axis;
+    if (item < 0 || !s_gevrModGunHasParts[hand][item]) return NULL;
+    parts = &s_gevrModGunPartsFor[hand][item];
+    for (group = 0; group < GEVR_MODPART_GROUPS; ++group) {
+        const f32 share = gevrModGunActionShare(hand, group == GEVR_MODPART_HANDLE);
+        for (axis = 0; axis < 3; ++axis) offset[group][axis] = share * parts->travel[group][axis];
+    }
+    return parts;
 }
 
 /* each tick: a hand showing another model than its gun's choice loads it
@@ -5788,7 +5904,29 @@ static void gevrModGunReconcile(s32 hand)
     }
 }
 
-void gevrModGunModelSet(s32 hand, s32 item, const char *name, const float frame[4][4])
+/* the pack gun body the current player's hand draws now (#335: the others
+ * draw it on this player's copy): its file, the item, its fit, its authored
+ * muzzle and its moving parts; FALSE when the hand draws a cartridge model */
+s32 gevrModGunBodyNow(s32 hand, char *name, s32 cap, s32 *item, f32 fit[4][4], s32 *fitted, f32 muzzle[3], s32 *muzzled,
+                      GevrModGunParts *parts, s32 *hasParts)
+{
+    const s32 p = get_cur_playernum();
+    const s32 at = gevrModGunFittedItem(hand);
+
+    if (at < 0 || cap <= 0) return FALSE;
+    snprintf(name, (size_t)cap, "%s", s_gevrModGunShown[p][hand].name);
+    *item = at;
+    *fitted = s_gevrModGunHasFit[hand][at];
+    if (*fitted) memcpy(fit, s_gevrModGunFit[hand][at].m, sizeof(s_gevrModGunFit[hand][at].m));
+    *muzzled = s_gevrModGunHasMuzzle[hand][at];
+    if (*muzzled) memcpy(muzzle, s_gevrModGunMuzzle[hand][at], sizeof(s_gevrModGunMuzzle[hand][at]));
+    *hasParts = s_gevrModGunHasParts[hand][at];
+    if (*hasParts) *parts = s_gevrModGunPartsFor[hand][at];
+    return TRUE;
+}
+
+void gevrModGunModelSet(s32 hand, s32 item, const char *name, const float frame[4][4], const float muzzle[3], const float support[3],
+                        const GevrModGunParts *parts)
 {
     if (hand >= 0 && hand <= 1 && item > ITEM_UNARMED && item < ITEM_IDS_MAX)
     {
@@ -5796,6 +5934,18 @@ void gevrModGunModelSet(s32 hand, s32 item, const char *name, const float frame[
         s_gevrModGunHasFit[hand][item] = name != NULL && frame != NULL;
         if (s_gevrModGunHasFit[hand][item]) {
             memcpy(s_gevrModGunFit[hand][item].m, frame, sizeof(s_gevrModGunFit[hand][item].m));
+        }
+        s_gevrModGunHasMuzzle[hand][item] = name != NULL && muzzle != NULL;
+        if (s_gevrModGunHasMuzzle[hand][item]) {
+            memcpy(s_gevrModGunMuzzle[hand][item], muzzle, sizeof(s_gevrModGunMuzzle[hand][item]));
+        }
+        s_gevrModGunHasSupport[hand][item] = name != NULL && support != NULL;
+        if (s_gevrModGunHasSupport[hand][item]) {
+            memcpy(s_gevrModGunSupport[hand][item], support, sizeof(s_gevrModGunSupport[hand][item]));
+        }
+        s_gevrModGunHasParts[hand][item] = name != NULL && parts != NULL;
+        if (s_gevrModGunHasParts[hand][item]) {
+            s_gevrModGunPartsFor[hand][item] = *parts;
         }
     }
 }
@@ -5805,6 +5955,9 @@ void gevrModGunModelReset(void)
     s32 p, hand;
     memset(s_gevrModGun, 0, sizeof(s_gevrModGun));
     memset(s_gevrModGunHasFit, 0, sizeof(s_gevrModGunHasFit));
+    memset(s_gevrModGunHasMuzzle, 0, sizeof(s_gevrModGunHasMuzzle));
+    memset(s_gevrModGunHasSupport, 0, sizeof(s_gevrModGunHasSupport));
+    memset(s_gevrModGunHasParts, 0, sizeof(s_gevrModGunHasParts));
     for (p = 0; p < MAX_PLAYER_COUNT; ++p) {
         for (hand = 0; hand < 2; ++hand) {
             if (s_gevrModGunShown[p][hand].mesh != NULL) s_gevrModGunShown[p][hand].in = FALSE;
@@ -5828,8 +5981,12 @@ void used_to_load_1st_person_model_on_demand(GUNHAND hand)
     s32              gevrModUsed = FALSE;
 #endif
 
+#ifdef GEVR
+    gevrModGunCopyActionTick(hand);   /* another player's copy, even a hand without a buffer */
+#endif
     if (!g_CurrentPlayer->ptr_hand_weapon_buffer[hand]) return;
 #ifdef GEVR
+    gevrModGunActionTick(hand);
     gevrModGunReconcile(hand);
 #endif
 
@@ -6650,6 +6807,9 @@ void sub_GAME_7F05E6B4(enum GUNHAND hand, s32 arg1)
 
 void sub_GAME_7F05E808(GUNHAND hand) {
 	g_CurrentPlayer->hands[hand].field_A8C = 1;
+#ifdef GEVR
+	gevrModGunActionShot(hand);   /* and a pack gun's moving parts (gevr_modaction.h) */
+#endif
 }
 
 
@@ -6809,12 +6969,28 @@ void gunInitProjectileFromPlayer(ObjectRecord *obj, coord3d *targetpos, Mtxf *ar
     f32 ylo;
     s32 usedfallback;
     f32 stanheight;
+#ifdef GEVR
+    /*
+     * bgFindRoomsAlongSegment reads 8 start rooms and writes up to 20 rooms
+     * crossed (the 0x14 below). The N64 frame had them in pad_a's padding;
+     * a host compiler lays locals out as it likes, so with rooms[2] and one
+     * s32 it read past the first and wrote over the saved registers above
+     * the second as soon as the throw crossed a portal. The v0.5.27 Linux
+     * build kept the thrower's projectile pointer there (rbx in
+     * generate_player_thrown_knife/grenade): a knife or mine thrown through
+     * a doorway, or a remote player's copied throw, crashed on the next use.
+     */
+    u8 rooms[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    s32 sp54[0x14];
+    s32 sp50;
+#else
     u8 rooms[2];
     s32 pad_rooms;
     u8 pad_a[0x4c];
     s32 sp54;
     s32 sp50;
     s32 pad_sp;
+#endif
 
     // fake
     if (obj->prop);
@@ -6872,7 +7048,11 @@ void gunInitProjectileFromPlayer(ObjectRecord *obj, coord3d *targetpos, Mtxf *ar
         rooms[0] = bondviewGetCurrentPlayersRoom();
         rooms[1] = 0xff;
 
+#ifdef GEVR
+        bgFindRoomsAlongSegment(bondviewGetCurrentPlayersPosition3(), &pos, rooms, obj->projectile->unkCC, sp54, &sp50, 0x14);
+#else
         bgFindRoomsAlongSegment(bondviewGetCurrentPlayersPosition3(), &pos, rooms, obj->projectile->unkCC, &sp54, &sp50, 0x14);
+#endif
     }
 }
 

@@ -8,6 +8,8 @@
 #ifndef GEVR_MODAPI_H
 #define GEVR_MODAPI_H
 
+#include "gevr_modaction.h"   /* GevrModActionTiming */
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -296,6 +298,13 @@ enum { GEVR_MODAT_PLAYER = 1, GEVR_MODAT_GUARD, GEVR_MODAT_PAD };
 #define GEVR_MODAPI_SOUND_NEAR 5000.0f   /* a placed sound: full within, as chrobjSndCreatePostEventDefault */
 #define GEVR_MODAPI_SOUND_FAR 6000.0f
 
+#define GEVR_MOD_BLOOD_BODIES 256
+typedef struct GevrModBloodConfig {
+    int headBurst;   /* percent, 0 turns head bursts off */
+    unsigned char bodies[GEVR_MOD_BLOOD_BODIES];
+} GevrModBloodConfig;
+int gevrModGameBlood(const GevrModBloodConfig *config);   /* NULL restores stock effects */
+
 /* ---- the network (plan step 5): mod.net between the players' machines ---- */
 
 #define GEVR_MODAPI_NET_PAYLOAD 1024      /* a message's bytes (net_protocol.h NET_MOD_PAYLOAD_MAX) */
@@ -306,6 +315,7 @@ enum { GEVR_MODAT_PLAYER = 1, GEVR_MODAT_GUARD, GEVR_MODAT_PAD };
 enum {   /* net_protocol.h NET_MOD_* */
     GEVR_MODNET_DATA = 0, GEVR_MODNET_OFF = 1,
     GEVR_MODNET_DROP = 2, GEVR_MODNET_CLAIM = 3, GEVR_MODNET_GRANT = 4, GEVR_MODNET_GONE = 5,
+    GEVR_MODNET_ATTACH = 6,
 };
 /* a shared pickup's bytes on the wire (little-endian): a drop's u8 stage, u8
  * item, u8 ammo, u8 0, u32 id, s16 from (a guard's id, or -1 - a player's
@@ -323,6 +333,11 @@ void gevrModNetStopped(const char *mod, int from);
  * to _GONE; from the sender's slot); held, and applied in order at the next
  * frame in play if it's this mission's */
 void gevrModNetPickup(const char *mod, int from, int kind, const void *data, int len);
+/* net_core.c: another player's attachments and their state (GEVR_MODNET_ATTACH,
+ * gevr_modattach_net.h's bytes; from the sender's slot, -1 a dedicated
+ * server): checked whole, then held and applied at the next frame in play if
+ * it's this mission's */
+void gevrModNetAttach(const char *mod, int from, const void *data, int len);
 /* net_core.c netReceiveStageReady, the host: a player is in the stage;
  * peer_ready at the next frame in play */
 void gevrModApiPeerReady(int slot);
@@ -454,12 +469,30 @@ void gevrModGameScope(int hand, int mode, int item, const float at[3], float rad
 /* Which models the hand's gun is drawn with: 0 the cartridge's, 1 GoldenEye
  * X's, 2 Bean's (bondview2.c gevrFitLook), 3 a mod's (mod.weapon.model) */
 int gevrModGameLook(int hand);
+/* A pack body's moving parts (mod.weapon.model's action and handle): which of
+ * its pictures move, and where each group is when fully back, in the body's
+ * model units before its fit (gevr_modaction.h says how far along it is). */
+enum { GEVR_MODPART_ACTION, GEVR_MODPART_HANDLE, GEVR_MODPART_GROUPS };
+#define GEVR_MODAPI_PICTURES_MAX 32   /* a pack mesh's pictures (gevr_packmesh.h) */
+typedef struct GevrModGunParts {
+    unsigned pictures[GEVR_MODPART_GROUPS];   /* bit n: picture n; 0 no such group */
+    float travel[GEVR_MODPART_GROUPS][3];
+    int holdOpen;                             /* back on an empty magazine, as GoldenEye's slide */
+    GevrModActionTiming timing;               /* the action's own open, close and ease; 0 GoldenEye's */
+} GevrModGunParts;
 /* A mod's model for the gun a hand draws (gun.c gevrModGunModelSet): the
  * run's mod's assets/models/<name> for item in that hand, or name NULL the
- * item's own. 0 when the run's mod has no such file (nothing changes) */
-int gevrModGameGunModel(int hand, int item, const char *name, const float frame[4][4]);
+ * item's own. 0 when the run's mod has no such file (nothing changes), or
+ * when parts name pictures the file doesn't have */
+int gevrModGameGunModel(int hand, int item, const char *name, const float frame[4][4], const float muzzle[3], const float support[3],
+                        const GevrModGunParts *parts);
 /* every hand's own models back (a mod stopped, a new mission) */
 void gevrModGameGunModelReset(void);
+/* The pack gun body the local player's hand draws now (#335, told to the
+ * others): its file (cap bytes), the item, its fit, authored muzzle and
+ * moving parts when set; 0 when the hand draws a cartridge model */
+int gevrModGameGunBody(int hand, char *name, int cap, int *item, float fit[4][4], int *fitted, float muzzle[3], int *muzzled,
+                       GevrModGunParts *parts, int *hasParts);
 
 /* mod.attach (src/game/gevr_modattach.c): a pack's model on the local
  * player's gun, a hand or the body, placed each rendered frame */
@@ -492,10 +525,50 @@ int gevrModGameAttach(const GevrModAttach *a);
 int gevrModGameDetach(int id);
 int gevrModGameAttachShow(int id, int shown);
 int gevrModGameAttachPlace(int id, const float offset[4][4]);   /* a new offset, from the next frame */
+/* a gun attachment's travel with the action (NULL: it stays put); handle: the rack's pull only; timing
+ * NULL follows the gun's body (or GoldenEye's), else the part's own. 0 not on a gun */
+int gevrModGameAttachAction(int id, const float travel[3], int handle, const GevrModActionTiming *timing);
 void gevrModGameAttachReset(void);   /* none attached (a new mission, a mod stopped) */
+/* mod.attach.optic (gevr_modoptic.c): a pack optic profile on an attachment
+ * (NULL unbinds), with its folded housing (a pack mesh, or NULL); 1 when bound */
+int gevrModGameOpticBind(int id, const char *profile, const char *folded);
+/* its mode (from 0), zoom, modes, kind (GEVR_OPTIC_*) and whether that mode
+ * is folded; 0 for an attachment with no optic */
+int gevrModGameOpticGet(int id, int *mode, float *zoom, int *count, int *kind, int *folded);
+int gevrModGameOpticSet(int id, int mode, float zoom);   /* zoom 0: the mode's lowest */
 /* gevr_modattach.c: a guard's attachment gone with its body (chr.c
  * chrpropCleanupForRemoval): its id isn't any mod's now */
 void gevrModApiAttachGone(int id);
+/* Another player's attachments (#335), drawn on that player's copy here: on
+ * its held gun, a hand or the body (never a guard's). slot is the owner's,
+ * id the owner's own. Set adds or changes one (a new model loads; the
+ * offset, shown and body anchor's centre from the eye, cm, below, right and
+ * ahead, take effect from the next frame): 1 placed, 0 not (no room left
+ * after this player's own, a model that won't load). Gone removes one, or
+ * all the slot's with id 0. */
+int gevrModGameAttachRemote(int slot, int id, const GevrModAttach *a, int shown, const float body[3]);
+void gevrModGameAttachRemoteGone(int slot, int id);   /* id 0: its pack gun bodies too */
+/* Its optic housing (mod.attach.optic) on another player's pack mesh on the
+ * gun: the folded housing's file (NULL none), the selected mode and whether
+ * it folds the housing; never a lens. 1 set, 0 not (no such, no room) */
+int gevrModGameAttachRemoteOptic(int slot, int id, const char *housing, int mode, int folded);
+/* Its action (mod.attach.action) on another player's part on the gun: its
+ * travel (NULL it stays put), handle, its own timing (NULL the body's); it
+ * moves with the shots that player's copy fires here. 1 set, 0 no such */
+int gevrModGameAttachRemoteAction(int slot, int id, const float travel[3], int handle, const GevrModActionTiming *timing);
+/* This player's attachment's optic as the others are told it: 1 bound,
+ * with its mode, whether that folds the housing, and the housing's file */
+int gevrModGameAttachOpticState(int id, int *mode, int *folded, char *housing, int cap);
+/* Another player's pack gun body in a hand, drawn on its copy's held gun for
+ * item in place of the item's model; item 0 the item's own again. fit,
+ * muzzle and parts (its moving pictures, mod.weapon.model's action and
+ * handle) NULL when not set. 1 set, 0 not (not a pack mesh, no room); parts
+ * naming a picture the mesh hasn't: the body without them */
+int gevrModGameAttachRemoteBody(int slot, int hand, int item, const char *model, const float fit[4][4], const float muzzle[3],
+                                const GevrModGunParts *parts);
+/* This player's body anchor's centre from the eye, cm (below, to the right,
+ * ahead), from its own fit (gevr_bodyslots.c): what the others place it by */
+int gevrModGameAttachBodyAt(int where, float out[3]);
 /* A gun or thrown weapon with a model in this cartridge: what a swap or
  * mod.inventory.give/take may use */
 int gevrModGameSwappable(int item);

@@ -1511,10 +1511,6 @@ static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shad
         append_line(vs_buf, &vs_len, "uniform float uTanHalfFovRight;");
         append_line(vs_buf, &vs_len, "uniform int uVrFlat;");
         append_line(vs_buf, &vs_len, "uniform vec2 uDecalBias;");
-        // GoldenEye (issue #40): the sniper scope's pass (gfx_vr_scope_render)
-        append_line(vs_buf, &vs_len, "uniform int uScope;");
-        append_line(vs_buf, &vs_len, "uniform mat4 uScopeVP;");
-        append_line(vs_buf, &vs_len, "uniform vec2 uHeadP;");
         // GoldenEye (issue #53): the in-between frame's redraw (gfx_vr_eye_replay)
         append_line(vs_buf, &vs_len, "uniform int uReproj;");
         append_line(vs_buf, &vs_len, "uniform mat4 uReprojVP;");
@@ -1531,9 +1527,12 @@ static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shad
         // two-view shader's uReproj
         append_line(vs_buf, &vs_len, "uniform int uReproj;");
         append_line(vs_buf, &vs_len, "uniform mat4 uReprojVP;");
-        append_line(vs_buf, &vs_len, "uniform vec2 uHeadP;");
     }
 
+    // The scope pass uses the recorded camera's projection in flat and stereo.
+    append_line(vs_buf, &vs_len, "uniform int uScope;");
+    append_line(vs_buf, &vs_len, "uniform mat4 uScopeVP;");
+    append_line(vs_buf, &vs_len, "uniform vec2 uHeadP;");
 
     if (gl_es) {
         append_line(vs_buf, &vs_len, "precision highp float;");
@@ -1725,6 +1724,9 @@ static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shad
                     " vec4 c = vec4(aVtxPos.x / uHeadP.x, aVtxPos.y / uHeadP.y, -aVtxPos.w, 1.0);"
                     " gl_Position = (gl_ViewID_OVR == 0u) ? uScopeVP * c : vec4(0.0, 0.0, 2.0, 1.0);"
                     " }");
+    } else {
+        append_line(vs_buf, &vs_len,
+                    "if (uScope == 1) gl_Position = uScopeVP * vec4(aVtxPos.x / uHeadP.x, aVtxPos.y / uHeadP.y, -aVtxPos.w, 1.0);");
     }
     append_line(vs_buf, &vs_len, "}");
 
@@ -2165,24 +2167,22 @@ static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shad
 
     // VR...
     prg->vrFlatLocation = -1;
-    prg->scopeLocation = prg->scopeVPLocation = prg->scopeHeadPLocation = -1;
     prg->reprojLocation = prg->reprojVPLocation = -1;
     // The VR-only uniforms: none (-1) without the two-view shaders that declare
     // them. Left at the pool's zeroed 0 they all pointed at the uniform in
     // location 0, and every draw of a single-view game (the flat game, the
     // phone APK) failed on GL_INVALID_OPERATION and drew nothing.
     prg->zTintLocation = prg->reprojLocation = prg->reprojVPLocation = -1;
-    prg->scopeLocation = prg->scopeVPLocation = prg->scopeHeadPLocation = -1;
     prg->eyeOffsetLeftLocation = prg->eyeOffsetRightLocation = prg->isMenuLocation = -1;
     prg->worldScaleLocation = prg->IsTitleLegal = prg->TanHalfFovRight = prg->TanHalfFovLeft = -1;
     prg->vrFlatLocation = prg->decalBiasLocation = -1;
+    prg->scopeLocation = glGetUniformLocation(shader_program, "uScope");
+    prg->scopeVPLocation = glGetUniformLocation(shader_program, "uScopeVP");
+    prg->scopeHeadPLocation = glGetUniformLocation(shader_program, "uHeadP");
     if (use_multiview) {
         prg->zTintLocation = glGetUniformLocation(shader_program, "uZTint");
         prg->reprojLocation = glGetUniformLocation(shader_program, "uReproj");
         prg->reprojVPLocation = glGetUniformLocation(shader_program, "uReprojVP");
-        prg->scopeLocation = glGetUniformLocation(shader_program, "uScope");
-        prg->scopeVPLocation = glGetUniformLocation(shader_program, "uScopeVP");
-        prg->scopeHeadPLocation = glGetUniformLocation(shader_program, "uHeadP");
         prg->eyeOffsetLeftLocation = glGetUniformLocation(shader_program, "uEyeOffsetLeft");
         prg->eyeOffsetRightLocation = glGetUniformLocation(shader_program, "uEyeOffsetRight");
         prg->isMenuLocation = glGetUniformLocation(shader_program, "uIsMenu");
@@ -2198,7 +2198,6 @@ static struct ShaderProgram* gfx_opengl_create_and_load_new_shader(uint64_t shad
         // a flat game's redraw (gfx_flat_redraw_frame)
         prg->reprojLocation = glGetUniformLocation(shader_program, "uReproj");
         prg->reprojVPLocation = glGetUniformLocation(shader_program, "uReprojVP");
-        prg->scopeHeadPLocation = glGetUniformLocation(shader_program, "uHeadP");
     }
 
     gfx_opengl_load_shader(prg);
@@ -2580,6 +2579,10 @@ static float s_scopeVP[2][16], s_scopeHeadP[2][2];
 static GLuint s_scopeFbo[2], s_scopeTex[2], s_scopeDepth[2];
 static GLuint s_scopeMvTex[2], s_scopeMvDepth[2], s_scopeReadFbo[2], s_scopeDrawFbo[2];
 static bool s_scopeMultiview[2];
+/* gevr_modoptic_render.inc.h: the slot a pack optic's lens took this frame
+ * (its camera is set as the lens is drawn), and whether it set one */
+static int s_opticScopeSlot = -1;
+static bool s_opticScopeReady;
 
 static bool gevr_scope_any_taken(void)
 {
@@ -2597,6 +2600,8 @@ void gfx_vr_scope_record(bool on, bool invert_y)
     s_scopeMeshes.clear();
     s_scopeVolBatches.clear();
     s_scopeTaken[0] = s_scopeTaken[1] = false;
+    s_opticScopeSlot = -1;
+    s_opticScopeReady = false;
     // needs the mapped ring: without it every draw overwrites the last one's vertices
     if (!gevrScopeOn || s_pmPtr == NULL || gVrFlatPass) {
         return;
@@ -2614,11 +2619,27 @@ void gfx_vr_scope_record(bool on, bool invert_y)
     s_scopeRec = gevr_scope_any_taken();
 }
 
+// gfx_pc.cpp GEVR_OPTIC_SCOPE_RECORD (lv.c): the game's scopes as usual, and a
+// free slot kept for a pack optic's lens, flat or in VR; its camera is only
+// known when the lens is drawn, so the slot keeps every draw of the world
+void gfx_mod_optic_scope_record(const float* projection, bool invert_y)
+{
+    gfx_vr_scope_record(true, invert_y);
+    if (!s_pmPtr || fabsf(projection[0]) < 1e-6f || fabsf(projection[5]) < 1e-6f) return;
+    const int slot = s_scopeTaken[0] ? 1 : 0;
+    if (s_scopeTaken[slot]) return;
+    s_opticScopeSlot = slot;
+    s_scopeTaken[slot] = s_scopeRec = true;
+    s_scopeHeadP[slot][0] = projection[0];
+    s_scopeHeadP[slot][1] = invert_y ? -projection[5] : projection[5];
+}
+
 // Whether any of a batch can show through a hand's scope: not when all its
 // vertices lie outside one side of the scope's view (each side is a plane in
 // clip space, so this holds for the whole triangle), or all behind it.
 static bool gevr_scope_sees(int hand, const float* v, size_t len, size_t tris)
 {
+    if (hand == s_opticScopeSlot) return true;
     const size_t n = 3 * tris;
     if (n == 0) {
         return false;
@@ -2651,6 +2672,10 @@ static uint8_t gevr_scope_mesh_mask(const float* mp, const float* lo, const floa
     uint8_t mask = 0;
     for (int h = 0; h < 2; h++) {
         if (!s_scopeTaken[h]) continue;
+        if (h == s_opticScopeSlot) {
+            mask |= 1 << h;
+            continue;
+        }
         float scopeMP[16];
         const float* vp = s_scopeVP[h];
         for (int c = 0; c < 4; c++) {
@@ -2862,6 +2887,9 @@ void gfx_vr_scope_render(void)
     GevrProfileSection profile(GEVR_TIME_SCOPE);
     s_scopeRec = false;
     s_scopeOnlyMask = 0;
+    if (s_opticScopeSlot >= 0 && !s_opticScopeReady) {
+        s_scopeTaken[s_opticScopeSlot] = false;
+    }
     if (!gevr_scope_any_taken()) {
         return;
     }
@@ -3102,7 +3130,9 @@ void gfx_vr_scope_render(void)
 // vr_openxr.cpp: this game frame's scope image for a hand, or 0 when there is none
 GLuint gfx_vr_scope_texture(int hand)
 {
-    return (hand == 0 || hand == 1) && s_scopeDrawn[hand] ? s_scopeTex[hand] : 0;
+    /* a pack optic's lens is composited on its housing in the eye pass;
+     * only the game's own scopes use the OpenXR quad layers */
+    return (hand == 0 || hand == 1) && hand != s_opticScopeSlot && s_scopeDrawn[hand] ? s_scopeTex[hand] : 0;
 }
 
 static void gevr_eye_present_draw(void) {
@@ -3544,6 +3574,7 @@ struct GevrEyeDraw {
     uint32_t volumetric; // a volumetric smoke/explosion batch: 1 + s_eyeVolBatches entry
     uint8_t faded;     // 255 minus gevrFadeDepthAlpha: 0 a draw that does not fade
     bool clearDepthBefore;   // G_CLEAR_DEPTH_EXT before this draw (flat viewmodels on their own depth)
+    uint32_t optic;    // a pack optic's lens: 1 + its s_eyeOptics entry (gevr_modoptic_render.inc.h)
 };
 
 static std::vector<GevrEyeDraw> s_eyeDraws;
@@ -3555,6 +3586,9 @@ struct GevrEyeMesh {
     struct GfxMeshDrawParams params;
 };
 static std::vector<GevrEyeMesh> s_eyeMeshes;
+#include "gevr_modoptic.h"
+struct GevrEyeOptic { GevrOpticSurface surface; GLuint scene; };
+static std::vector<GevrEyeOptic> s_eyeOptics;   // pack optics' lenses this frame (gevr_modoptic_render.inc.h)
 static uint32_t s_eyeKeepMesh;   // gfx_opengl_draw_mesh: the draw gevr_eye_keep keeps
 static void gevr_eye_proj_times(const float* delta, float M[16]);
 
@@ -3564,6 +3598,7 @@ void gfx_vr_eye_record(bool on, const float* proj, bool invert_y, const float* p
     gevr_mesh_settle();
     if (on) {
         s_eyeDraws.clear();
+        s_eyeOptics.clear();
         s_eyeMeshes.clear();
         s_eyeVolBatches.clear();
         s_eyeReady = false;
@@ -3629,6 +3664,7 @@ void gfx_flat_record(bool on, const float* proj, bool invert_y, const float* pre
     gevr_mesh_settle();
     if (on) {
         s_eyeDraws.clear();
+        s_eyeOptics.clear();
         s_eyeMeshes.clear();
         s_eyeVolBatches.clear();
         s_eyeReady = false;
@@ -3690,7 +3726,7 @@ void gfx_vr_eye_record_only(bool on)
  */
 static bool gevr_eye_draw_joins(const GevrEyeDraw& a, const GevrEyeDraw& b)
 {
-    if (a.volumetric || b.volumetric || a.lineMode || b.lineMode || b.clearDepthBefore || a.first + a.count != b.first || a.prg != b.prg
+    if (a.optic || b.optic || a.volumetric || b.volumetric || a.lineMode || b.lineMode || b.clearDepthBefore || a.first + a.count != b.first || a.prg != b.prg
         || a.prg->opaque_depth_pass_location >= 0
         || a.decalZ || b.decalZ || a.decalDepth || b.decalDepth
         || a.gunDecal != b.gunDecal || a.decalPull != b.decalPull
@@ -3736,7 +3772,7 @@ static void gevr_eye_keep(GLint first, GLsizei count, bool lineMode)
         s_eyeSeg = s_pmSeg;
         s_eyeNeed = s_pmOff - gevr_pm_base();
     }
-    GevrEyeDraw d;
+    GevrEyeDraw d = {};
     d.prg = s_curPrg;
     d.first = first;
     d.count = count;
@@ -3801,6 +3837,8 @@ static void gevr_eye_proj_times(const float* delta, float M[16])
         }
     }
 }
+
+#include "gevr_modoptic_render.inc.h"
 
 /*
  * Into the eye buffers already bound and cleared (gfx_pc.cpp
@@ -4009,20 +4047,95 @@ void gfx_vr_eye_replay(const float* delta, const float* hand0, const float* hand
     int replayFilter[2] = { -1, -1 };
     GevrReplayBindings bindings;
     bindings.ring = ringVbo;
+    GLint curScissor[4] = {};
+    bool haveScissor = false;
+    auto applyReplayScissor = [&](const GevrEyeDraw& d) {
+        GLint sc[4] = { d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3] };
+        const GLint vx = d.viewport[0], vy = d.viewport[1], vw = d.viewport[2], vh = d.viewport[3];
+        /* Flat high-refresh redraws (#274) rotate world draws by delta while keeping
+         * GL_SCISSOR_TEST on (#337); shift sub-viewport portal scissors by the same
+         * rotation so doorways and tunnels stay aligned as the camera turns. */
+        if (!use_multiview && d.hand != 3 && !d.isMenu && vw > 0 && vh > 0 &&
+            (s_eyeHeadP[0] > 1e-6f || s_eyeHeadP[0] < -1e-6f) &&
+            (s_eyeHeadP[1] > 1e-6f || s_eyeHeadP[1] < -1e-6f) &&
+            (sc[0] > vx || sc[1] > vy || sc[0] + sc[2] < vx + vw || sc[1] + sc[3] < vy + vh)) {
+            /* The delta can also carry the walk (flat_headset.c flatApplyLocomotion):
+             * a corner can't be moved with it without its depth, so a frame that
+             * moves takes the whole view, as before #337, instead of a stale doorway
+             * scissor cutting strips off a near room. Turning alone reprojects. */
+            const bool walked = delta != NULL && (delta[12] > 1e-4f || delta[12] < -1e-4f || delta[13] > 1e-4f ||
+                                                  delta[13] < -1e-4f || delta[14] > 1e-4f || delta[14] < -1e-4f);
+            const float xs[2] = { (float)sc[0], (float)(sc[0] + sc[2]) };
+            const float ys[2] = { (float)sc[1], (float)(sc[1] + sc[3]) };
+            float minX = (float)(vx + vw), minY = (float)(vy + vh), maxX = (float)vx, maxY = (float)vy;
+            bool ok = !walked;
+            for (int ix = 0; ix < 2 && ok; ix++) {
+                for (int iy = 0; iy < 2 && ok; iy++) {
+                    const float nx = ((xs[ix] - (float)vx) / (float)vw) * 2.0f - 1.0f;
+                    const float ny = ((ys[iy] - (float)vy) / (float)vh) * 2.0f - 1.0f;
+                    const float cx = nx / s_eyeHeadP[0];
+                    const float cy = ny / s_eyeHeadP[1];
+                    const float cw = Ms[0][3] * cx + Ms[0][7] * cy - Ms[0][11];
+                    if (cw <= 1e-4f) {
+                        ok = false;
+                        break;
+                    }
+                    const float rx = (Ms[0][0] * cx + Ms[0][4] * cy - Ms[0][8]) / cw;
+                    const float ry = (Ms[0][1] * cx + Ms[0][5] * cy - Ms[0][9]) / cw;
+                    const float px = (float)vx + (rx * 0.5f + 0.5f) * (float)vw;
+                    const float py = (float)vy + (ry * 0.5f + 0.5f) * (float)vh;
+                    if (px < minX) minX = px;
+                    if (px > maxX) maxX = px;
+                    if (py < minY) minY = py;
+                    if (py > maxY) maxY = py;
+                }
+            }
+            if (ok) {
+                const GLint pad = 4;
+                GLint x0 = (GLint)minX - pad;
+                GLint y0 = (GLint)minY - pad;
+                GLint x1 = (GLint)maxX + 1 + pad;
+                GLint y1 = (GLint)maxY + 1 + pad;
+                if (x0 < vx) x0 = vx;
+                if (y0 < vy) y0 = vy;
+                if (x1 > vx + vw) x1 = vx + vw;
+                if (y1 > vy + vh) y1 = vy + vh;
+                sc[0] = x0;
+                sc[1] = y0;
+                sc[2] = x1 > x0 ? x1 - x0 : 0;
+                sc[3] = y1 > y0 ? y1 - y0 : 0;
+            } else {
+                sc[0] = vx; sc[1] = vy; sc[2] = vw; sc[3] = vh;
+            }
+        }
+        if (!haveScissor || memcmp(sc, curScissor, sizeof(sc)) != 0) {
+            glScissor(sc[0], sc[1], sc[2], sc[3]);
+            memcpy(curScissor, sc, sizeof(sc));
+            haveScissor = true;
+        }
+    };
     for (const GevrEyeDraw& d : s_eyeDraws) {
+        if (d.optic) {
+            glViewport(d.viewport[0], d.viewport[1], d.viewport[2], d.viewport[3]);
+            glScissor(d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
+            if (d.clearDepthBefore) gevr_replay_clear_depth();
+            drawModLens(s_eyeOptics[d.optic - 1], Ms[d.hand + 1], false);
+            haveTexture[0] = haveTexture[1] = false;
+            last = NULL;
+            continue;
+        }
         if (d.volumetric) {
             if (last == NULL || memcmp(d.viewport, last->viewport, sizeof(d.viewport)) != 0) {
                 glViewport(d.viewport[0], d.viewport[1], d.viewport[2], d.viewport[3]);
             }
-            if (last == NULL || memcmp(d.scissor, last->scissor, sizeof(d.scissor)) != 0) {
-                glScissor(d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
-            }
+            applyReplayScissor(d);
             if (d.clearDepthBefore) gevr_replay_clear_depth();
             const bool stereo = !s_flatRec && use_multiview && !gVrFlatPass && !d.isMenu;
             const bool invertY = framebuffers[current_framebuffer].invert_y;
             gevr_vol_draw_recorded(&s_eyeVolBatches[d.volumetric - 1], delta, s_eyeProj,
                                    stereo, true, NULL, false, invertY);
             last = NULL;
+            haveScissor = false;
             continue;
         }
         gevr_replay_vao(bindings, d.mesh ? s_eyeMeshes[d.mesh - 1].vao : opengl_vao, d.mesh != 0);
@@ -4081,9 +4194,7 @@ void gfx_vr_eye_replay(const float* delta, const float* hand0, const float* hand
         if (last == NULL || memcmp(d.viewport, last->viewport, sizeof(d.viewport)) != 0) {
             glViewport(d.viewport[0], d.viewport[1], d.viewport[2], d.viewport[3]);
         }
-        if (last == NULL || memcmp(d.scissor, last->scissor, sizeof(d.scissor)) != 0) {
-            glScissor(d.scissor[0], d.scissor[1], d.scissor[2], d.scissor[3]);
-        }
+        applyReplayScissor(d);
         if (d.mesh) {
             const GfxMeshDrawParams* params = &s_eyeMeshes[d.mesh - 1].params;
             gevr_replay_mesh(bindings, d.prg, params, params->cull);
@@ -4465,7 +4576,7 @@ void gfx_vr_motion_pass(const float* const cur[4], const float* const prev[4], b
         const GevrEyeMesh* mesh = d.mesh ? &s_eyeMeshes[d.mesh - 1] : NULL;
         // decals keep the motion of the surface they lie on (see above);
         // volumetric smoke/fire is transparent and never writes motion vectors
-        if (d.volumetric || d.isMenu || d.decalZ || d.decalDepth) {
+        if (d.optic || d.volumetric || d.isMenu || d.decalZ || d.decalDepth) {
             skipped++;
             continue;
         }

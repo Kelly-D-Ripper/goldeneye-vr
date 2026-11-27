@@ -27,6 +27,7 @@
 #include <time.h>
 
 #include "gevr_modapi.h"
+#include "gevr_modattach_net.h"
 #include "gevr_modscript.h"
 #include "system.h"
 #include "../external/lua/lua.h"
@@ -39,6 +40,7 @@ extern bool netIsDedicated(void);
 extern int netGetLocalSlot(void);
 extern int netGetHostSlot(void);
 extern int netSendModMessage(int kind, int to, const char *mod, const char *channel, const void *data, int len);
+extern int netLobbySlotConnected(int slot);
 
 /* ITEM_IDS from ITEM_UNARMED (0): mod.items, and a name for an item argument */
 static const char *const s_itemNames[GEVR_MODAPI_ITEMS] = {
@@ -604,8 +606,140 @@ static int authoredFrame(lua_State *L, int t, const char *call, float out[4][4])
     return 1;
 }
 
+static int authoredGunPoint(lua_State *L, int t, const char *key, float out[3])
+{
+    if (lua_getfield(L, t, key) == LUA_TNIL) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    if (!lua_istable(L, -1) || lua_rawlen(L, -1) != 3) {
+        return luaL_error(L, "mod.weapon.model: %s needs three numbers", key);
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        if (lua_rawgeti(L, -1, axis + 1) != LUA_TNUMBER) {
+            return luaL_error(L, "mod.weapon.model: %s needs three numbers", key);
+        }
+        const double value = lua_tonumber(L, -1);
+        if (!(value >= -GEVR_MODAPI_ATTACH_RANGE && value <= GEVR_MODAPI_ATTACH_RANGE)) {
+            return luaL_error(L, "mod.weapon.model: %s components are limited to +/-4000 model units", key);
+        }
+        out[axis] = (float)value;
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    return 1;
+}
+
+/* A travel: three numbers in model units, each within the attachment range. */
+static void travelVector(lua_State *L, int t, const char *call, float out[3])
+{
+    if (!lua_istable(L, t) || lua_rawlen(L, t) != 3) {
+        luaL_error(L, "%s: travel needs three numbers", call);
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        if (lua_rawgeti(L, t, axis + 1) != LUA_TNUMBER) {
+            luaL_error(L, "%s: travel needs three numbers", call);
+        }
+        const double value = lua_tonumber(L, -1);
+        if (!(value >= -GEVR_MODAPI_ATTACH_RANGE && value <= GEVR_MODAPI_ATTACH_RANGE)) {
+            luaL_error(L, "%s: travel components are limited to +/-4000 model units", call);
+        }
+        out[axis] = (float)value;
+        lua_pop(L, 1);
+    }
+}
+
+/* An action's own timing in its table: open and close (ticks, 1 to 30, both
+ * or neither) and ease (0 to 1, 1 linear, the default); 1 when given. */
+static int actionTiming(lua_State *L, int t, const char *call, GevrModActionTiming *out)
+{
+    static const char *const keys[] = { "open", "close", "ease" };
+    double v[3] = { 0, 0, 1 };
+    int given[3] = { 0, 0, 0 };
+
+    for (int k = 0; k < 3; ++k) {
+        const int type = lua_getfield(L, t, keys[k]);
+        if (type != LUA_TNIL) {
+            if (type != LUA_TNUMBER) return luaL_error(L, "%s: %s is a number", call, keys[k]);
+            v[k] = lua_tonumber(L, -1);
+            given[k] = 1;
+        }
+        lua_pop(L, 1);
+    }
+    if (!given[0] && !given[1] && !given[2]) return 0;
+    if (!given[0] || !given[1]) return luaL_error(L, "%s: an action's timing needs both open and close", call);
+    for (int k = 0; k < 2; ++k) {
+        if (!(v[k] >= 1 && v[k] <= GEVR_MODACTION_TICKS_MAX) || v[k] != (double)(int)v[k]) {
+            return luaL_error(L, "%s: %s is whole ticks from 1 to %d", call, keys[k], GEVR_MODACTION_TICKS_MAX);
+        }
+    }
+    if (!(v[2] >= 0 && v[2] <= 1)) return luaL_error(L, "%s: ease is from 0 to 1", call);
+    out->open = (int)v[0];
+    out->close = (int)v[1];
+    out->ease = (float)v[2];
+    return 1;
+}
+
+/* action = { pictures = { n, ... }, travel = { x, y, z }[, open, close, ease] }
+ * (and handle, without timing): the body's pictures that move, zero-based,
+ * where they are fully back, and the action's own timing */
+static int movingGroup(lua_State *L, int t, const char *key, unsigned *pictures, float travel[3],
+                       GevrModActionTiming *timing)
+{
+    if (lua_getfield(L, t, key) == LUA_TNIL) {
+        lua_pop(L, 1);
+        return 0;
+    }
+    if (!lua_istable(L, -1)) return luaL_error(L, "mod.weapon.model: %s needs { pictures, travel }", key);
+    const int group = lua_gettop(L);
+    *pictures = 0;
+    if (lua_getfield(L, group, "pictures") != LUA_TTABLE || lua_rawlen(L, -1) < 1) {
+        return luaL_error(L, "mod.weapon.model: %s.pictures needs one or more picture numbers", key);
+    }
+    for (lua_Integer i = 1; i <= (lua_Integer)lua_rawlen(L, -1); ++i) {
+        int isNumber = 0;
+        lua_rawgeti(L, -1, i);
+        const lua_Integer n = lua_tointegerx(L, -1, &isNumber);
+        if (!isNumber || n < 0 || n >= GEVR_MODAPI_PICTURES_MAX || (*pictures & (1u << n))) {
+            return luaL_error(L, "mod.weapon.model: %s.pictures are distinct picture numbers from 0 to %d", key,
+                              GEVR_MODAPI_PICTURES_MAX - 1);
+        }
+        *pictures |= 1u << n;
+        lua_pop(L, 1);
+    }
+    lua_pop(L, 1);
+    if (lua_getfield(L, group, "travel") == LUA_TNIL) {
+        return luaL_error(L, "mod.weapon.model: %s needs a travel", key);
+    }
+    char call[48];
+    snprintf(call, sizeof(call), "mod.weapon.model: %s", key);
+    travelVector(L, lua_gettop(L), call, travel);
+    lua_pop(L, 1);
+    if (timing != NULL) {
+        actionTiming(L, group, call, timing);
+    } else {
+        GevrModActionTiming none;
+        if (actionTiming(L, group, call, &none)) {
+            return luaL_error(L, "%s: a handle moves only with the rack, so it has no timing", call);
+        }
+    }
+    lua_pop(L, 1);
+    return 1;
+}
+
+/* the mods whose mod.weapon.model a hand's pack body may be (#335): the
+ * others' copies draw it while that mod runs there too */
+static char s_gunBodyMod[2][64];
+static int s_gunBodyAny;
+
+static void gunBodyTold(lua_State *L, int hand)
+{
+    snprintf(s_gunBodyMod[hand], sizeof(s_gunBodyMod[hand]), "%s", gevrModScriptIdOf(L));
+    s_gunBodyAny = 1;
+}
+
 /*
- * model(hand, item, file | nil [, { frame }]): when the hand draws item, the mod's
+ * model(hand, item, file | nil [, { frame, muzzle, support, action, handle, holdOpen }]): when the hand draws item, the mod's
  * assets/models/<file> in place of the item's cartridge model, built over
  * that model's header (its switch and texture counts, its skeleton); nil, the
  * item's own. A hand holding item now loads it at once. True when set; false
@@ -629,17 +763,37 @@ static int l_gunModel(lua_State *L)
     if (!gevrModGameSwappable(item)) {
         return luaL_argerror(L, 2, "a gun or thrown weapon with a model in this cartridge");
     }
-    float frame[4][4];
+    float frame[4][4], muzzle[3], support[3];
     const float (*fit)[4] = NULL;
+    const float *muzzlePoint = NULL, *supportPoint = NULL;
+    GevrModGunParts parts = { { 0, 0 }, { { 0 } }, 1, { 0, 0, 1.0f } };
+    int hasParts = 0;
     if (!lua_isnoneornil(L, 4)) {
         luaL_checktype(L, 4, LUA_TTABLE);
-        if (name == NULL || !authoredFrame(L, 4, "mod.weapon.model", frame)) {
-            return luaL_argerror(L, 4, "{ frame = ... } with a pack mesh file");
+        if (name == NULL) return luaL_argerror(L, 4, "only with a pack mesh file");
+        if (authoredFrame(L, 4, "mod.weapon.model", frame)) fit = frame;
+        if (authoredGunPoint(L, 4, "muzzle", muzzle)) muzzlePoint = muzzle;
+        if (authoredGunPoint(L, 4, "support", support)) supportPoint = support;
+        hasParts |= movingGroup(L, 4, "action", &parts.pictures[GEVR_MODPART_ACTION], parts.travel[GEVR_MODPART_ACTION],
+                                &parts.timing);
+        hasParts |= movingGroup(L, 4, "handle", &parts.pictures[GEVR_MODPART_HANDLE], parts.travel[GEVR_MODPART_HANDLE],
+                                NULL);
+        if (parts.pictures[GEVR_MODPART_ACTION] & parts.pictures[GEVR_MODPART_HANDLE]) {
+            return luaL_argerror(L, 4, "a picture moves with the action or the handle, not both");
         }
-        fit = frame;
+        if (lua_getfield(L, 4, "holdOpen") != LUA_TNIL) {
+            if (!lua_isboolean(L, -1)) return luaL_argerror(L, 4, "holdOpen is true or false");
+            parts.holdOpen = lua_toboolean(L, -1);
+            hasParts = 1;
+        }
+        lua_pop(L, 1);
+        if (fit == NULL && muzzlePoint == NULL && supportPoint == NULL && !hasParts)
+            return luaL_argerror(L, 4, "a frame, muzzle, support point, action, handle or holdOpen for a pack mesh");
     }
     needPlayer(L, "mod.weapon.model");
-    lua_pushboolean(L, gevrModGameGunModel(hand, item, name, fit));
+    const int set = gevrModGameGunModel(hand, item, name, fit, muzzlePoint, supportPoint, hasParts ? &parts : NULL);
+    if (set && name != NULL) gunBodyTold(L, hand);   /* a pack body is told to the others as the hand draws it */
+    lua_pushboolean(L, set);
     return 1;
 }
 
@@ -1725,8 +1879,39 @@ static int l_effectPlay(lua_State *L)
     return 1;
 }
 
+/* blood({ headBurst = percent, bodies = { body rows } }) or blood(false). */
+static int l_effectBlood(lua_State *L)
+{
+    if (lua_isboolean(L, 1) && !lua_toboolean(L, 1)) {
+        lua_pushboolean(L, gevrModGameBlood(NULL));
+        return 1;
+    }
+    luaL_checktype(L, 1, LUA_TTABLE);
+    GevrModBloodConfig config = {0};
+    wholeField(L, 1, "headBurst", 0, 100, &config.headBurst, "mod.effect.blood", "a percentage from 0 to 100");
+    lua_getfield(L, 1, "bodies");
+    if (!lua_isnil(L, -1)) {
+        luaL_checktype(L, -1, LUA_TTABLE);
+        const lua_Unsigned count = lua_rawlen(L, -1);
+        if (count > GEVR_MOD_BLOOD_BODIES) return luaL_argerror(L, 1, "too many body rows");
+        for (lua_Unsigned i = 1; i <= count; ++i) {
+            lua_rawgeti(L, -1, (lua_Integer)i);
+            int valid;
+            const lua_Integer body = lua_tointegerx(L, -1, &valid);
+            if (!valid || body < 0 || body >= GEVR_MOD_BLOOD_BODIES)
+                return luaL_argerror(L, 1, "bodies must contain integer body rows from 0 to 255");
+            config.bodies[body] = 1;
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+    lua_pushboolean(L, gevrModGameBlood(&config));
+    return 1;
+}
+
 static const luaL_Reg s_effectFuncs[] = {
     { "play", l_effectPlay },
+    { "blood", l_effectBlood },
     { NULL, NULL },
 };
 
@@ -2099,6 +2284,38 @@ static int l_uiClose(lua_State *L)
 /* which mod attached each (remove and show answer only to it), as ids come back */
 static struct { int id; char mod[64]; } s_attachOwners[GEVR_MODAPI_ATTACH_MAX];
 
+_Static_assert(GEVR_MODATTACH_GUN == GEVR_ATTNET_GUN && GEVR_MODATTACH_HAND == GEVR_ATTNET_HAND
+               && GEVR_MODATTACH_BODY == GEVR_ATTNET_BODYSLOT && GEVR_MODAPI_ATTACH_MAX == GEVR_ATTNET_OWNED
+               && GEVR_MODAPI_ANCHORS == GEVR_ATTNET_ANCHORS && GEVR_MODAPI_NET_PAYLOAD == GEVR_ATTNET_BYTES,
+               "mod.attach's limits as the network's");
+
+static void attachNetForget(void);
+
+/* Online, what this player wears is told to the others (#335,
+ * gevr_modattach_net.c): on the gun, a hand or the body, never a guard's
+ * (each headset's mod puts the same on its own guards) */
+static void attachTell(const char *mod, int id, const GevrModAttach *a)
+{
+    GevrAttachRecord r;
+    int i, j;
+
+    if (!netIsActive() || a->on == GEVR_MODATTACH_GUARD) return;
+    memset(&r, 0, sizeof(r));
+    r.op = GEVR_ATTNET_SET;
+    r.id = id;
+    r.on = a->on;
+    r.where = a->where;
+    r.node = a->on == GEVR_MODATTACH_GUN ? a->node : 0;
+    r.shown = 1;
+    for (i = 0; i < 4; i++) {
+        for (j = 0; j < 3; j++) r.frame[i][j] = a->offset[i][j];
+    }
+    if (a->on == GEVR_MODATTACH_BODY && !gevrModGameAttachBodyAt(a->where, r.body)) memset(r.body, 0, sizeof(r.body));
+    snprintf(r.model, sizeof(r.model), "%s", a->model);
+    snprintf(r.like, sizeof(r.like), "%s", a->like);
+    gevrAttachNetSet(mod, &r);
+}
+
 static void attachName(lua_State *L, const char *key, char *out, size_t cap, int optional)
 {
     size_t n;
@@ -2281,6 +2498,7 @@ static int l_attachAdd(lua_State *L)
             break;
         }
     }
+    attachTell(mod, id, &a);
     lua_pushinteger(L, id);
     return 1;
 }
@@ -2313,6 +2531,7 @@ static int l_attachRemove(lua_State *L)
 
     if (at >= 0) {
         gevrModGameDetach(s_attachOwners[at].id);
+        gevrAttachNetRemove(s_attachOwners[at].id);   /* and the others are told */
         s_attachOwners[at].id = 0;
     }
     lua_pushboolean(L, at >= 0);
@@ -2325,7 +2544,10 @@ static int l_attachShow(lua_State *L)
     const int at = attachOwned(L, luaL_checkinteger(L, 1));
 
     luaL_checktype(L, 2, LUA_TBOOLEAN);
-    if (at >= 0) gevrModGameAttachShow(s_attachOwners[at].id, lua_toboolean(L, 2));
+    if (at >= 0) {
+        gevrModGameAttachShow(s_attachOwners[at].id, lua_toboolean(L, 2));
+        gevrAttachNetShow(s_attachOwners[at].id, lua_toboolean(L, 2));
+    }
     lua_pushboolean(L, at >= 0);
     return 1;
 }
@@ -2339,16 +2561,123 @@ static int l_attachPlace(lua_State *L)
 
     luaL_checktype(L, 2, LUA_TTABLE);
     attachPlacement(L, 2, "mod.attach.place", offset);
-    if (at >= 0) gevrModGameAttachPlace(s_attachOwners[at].id, (const float (*)[4])offset);
+    if (at >= 0) {
+        float frame[4][3];
+        int i;
+
+        gevrModGameAttachPlace(s_attachOwners[at].id, (const float (*)[4])offset);
+        for (i = 0; i < 4; i++) memcpy(frame[i], offset[i], sizeof(frame[i]));
+        gevrAttachNetPlace(s_attachOwners[at].id, (const float (*)[3])frame);
+    }
     lua_pushboolean(L, at >= 0);
     return 1;
 }
 
+/* action(id, { travel = { x, y, z }, handle, open, close, ease } | nil): a
+ * part on the gun moves with its action (gevr_modaction.h), to travel in the
+ * anchor's frame when fully back; handle, only with the rack's pull; open,
+ * close and ease, timing of its own (else the body's). nil puts it back to
+ * staying where it's placed. True when this mod has it and it's on a gun. */
+static int l_attachAction(lua_State *L)
+{
+    const int at = attachOwned(L, luaL_checkinteger(L, 1));
+    float travel[3];
+    int handle = 0, moves = 0, timed = 0;
+    GevrModActionTiming timing = { 0, 0, 1.0f };
+
+    if (!lua_isnoneornil(L, 2)) {
+        luaL_checktype(L, 2, LUA_TTABLE);
+        if (lua_getfield(L, 2, "travel") == LUA_TNIL) return luaL_argerror(L, 2, "a travel");
+        travelVector(L, lua_gettop(L), "mod.attach.action", travel);
+        lua_pop(L, 1);
+        if (lua_getfield(L, 2, "handle") != LUA_TNIL) {
+            if (!lua_isboolean(L, -1)) return luaL_argerror(L, 2, "handle is true or false");
+            handle = lua_toboolean(L, -1);
+        }
+        lua_pop(L, 1);
+        timed = actionTiming(L, 2, "mod.attach.action", &timing);
+        if (timed && handle) return luaL_argerror(L, 2, "a handle moves only with the rack, so it has no timing");
+        moves = 1;
+    }
+    if (at >= 0 && gevrModGameAttachAction(s_attachOwners[at].id, moves ? travel : NULL, handle, timed ? &timing : NULL)) {
+        /* the others' copies move it too (#335) */
+        gevrAttachNetAction(s_attachOwners[at].id, moves, handle, travel, timed ? timing.open : 0, timed ? timing.close : 0,
+                            timed ? timing.ease : 0.0f);
+        lua_pushboolean(L, 1);
+    } else {
+        lua_pushboolean(L, 0);
+    }
+    return 1;
+}
+
+/* optic(id, { profile = "x.opt", folded = "x-folded.bin" }): a pack optic
+ * profile (GEVROPT4, assets/models/) on a pack-mesh attachment, drawn as a
+ * lens on it (docs/mod-system.md); false takes it off. True when bound. */
+static int l_attachOptic(lua_State *L)
+{
+    const int at = attachOwned(L, luaL_checkinteger(L, 1));
+    const char *profile = NULL, *folded = NULL;
+    size_t n;
+
+    if (lua_isboolean(L, 2) && !lua_toboolean(L, 2)) {
+        if (at >= 0) gevrModGameOpticBind(s_attachOwners[at].id, NULL, NULL);
+        lua_pushboolean(L, at >= 0);
+        return 1;
+    }
+    luaL_checktype(L, 2, LUA_TTABLE);
+    lua_getfield(L, 2, "profile");
+    if (lua_type(L, -1) == LUA_TSTRING) profile = lua_tolstring(L, -1, &n);
+    if (!profile || n <= 4 || n > 63 || memcmp(profile + n - 4, ".opt", 4)
+        || !modelNameOk(profile, n - 4)) {
+        return luaL_error(L, "mod.attach.optic: profile requires a flat .opt file name");
+    }
+    if (lua_getfield(L, 2, "folded") != LUA_TNIL) {
+        if (lua_type(L, -1) == LUA_TSTRING) folded = lua_tolstring(L, -1, &n);
+        if (!folded || !modelNameOk(folded, n)) {
+            return luaL_error(L, "mod.attach.optic: folded requires a flat model file name");
+        }
+    }
+    lua_pushboolean(L, at >= 0 && gevrModGameOpticBind(s_attachOwners[at].id, profile, folded));
+    return 1;
+}
+
+/* opticMode(id[, mode[, zoom]]): sets the mode (from 1) and zoom when
+ * given; answers the mode, zoom, modes, kind ("collimator", "scope",
+ * "night", "thermal") and whether that mode is folded, or nil */
+static int l_attachOpticMode(lua_State *L)
+{
+    static const char *const kinds[] = { "", "collimator", "scope", "night", "thermal" };
+    const int at = attachOwned(L, luaL_checkinteger(L, 1));
+    int mode, count, kind, folded;
+    float zoom;
+
+    if (at < 0 || !gevrModGameOpticGet(s_attachOwners[at].id, &mode, &zoom, &count, &kind, &folded)) {
+        lua_pushnil(L);
+        return 1;
+    }
+    if (!lua_isnoneornil(L, 2)) {
+        const lua_Integer want = luaL_checkinteger(L, 2);
+        const lua_Number z = luaL_optnumber(L, 3, 0);
+        if (want < 1 || want > count) return luaL_argerror(L, 2, "a mode from 1 to the optic's modes");
+        gevrModGameOpticSet(s_attachOwners[at].id, (int)want - 1, (float)z);
+        gevrModGameOpticGet(s_attachOwners[at].id, &mode, &zoom, &count, &kind, &folded);
+    }
+    lua_pushinteger(L, mode + 1);
+    lua_pushnumber(L, zoom);
+    lua_pushinteger(L, count);
+    lua_pushstring(L, kind >= 1 && kind <= 4 ? kinds[kind] : "");
+    lua_pushboolean(L, folded);
+    return 5;
+}
+
 static const luaL_Reg s_attachFuncs[] = {
     { "add", l_attachAdd },
+    { "optic", l_attachOptic },
+    { "opticMode", l_attachOpticMode },
     { "remove", l_attachRemove },
     { "show", l_attachShow },
     { "place", l_attachPlace },
+    { "action", l_attachAction },
     { NULL, NULL },
 };
 
@@ -2440,9 +2769,17 @@ void gevrModApiReset(void)
     gevrModGameScope(0, GEVR_MODSCOPE_GAME, 0, NULL, 0.0f, 0.0f);   /* the game's own scopes again */
     gevrModGameScope(1, GEVR_MODSCOPE_GAME, 0, NULL, 0.0f, 0.0f);
     gevrModGameGunModelReset();   /* and the hands' own models */
-    gevrModGameAttachReset();     /* and nothing attached */
+    gevrModGameAttachReset();     /* and nothing attached, this player's nor the others' */
+    gevrModGameBlood(NULL);
     gevrModGameSetSpeed(1.0f);    /* and the player's own speed */
     memset(s_attachOwners, 0, sizeof(s_attachOwners));
+    /* online, a stop in a mission is told (every headset stops with it: the
+     * others clear theirs too); a mission's end isn't (each clears its own as
+     * the next loads) */
+    gevrAttachNetReset(netIsActive() && gevrModScriptStage() >= 0);
+    attachNetForget();
+    memset(s_gunBodyMod, 0, sizeof(s_gunBodyMod));
+    s_gunBodyAny = 0;
 }
 
 /* ---- the weapons area's events ---- */
@@ -3087,6 +3424,215 @@ void gevrModNetReceive(const char *mod, int from, const char *channel, const voi
     if (len > 0) memcpy(s_inbox[at].data, data, (size_t)len);
 }
 
+/*
+ * The others' attachments (#335): their messages held as mod.net's are, and
+ * applied at the next frame in play if they're this mission's. A player who
+ * reaches the stage later is sent what everyone wears: the host answers for
+ * itself and asks the others who wear something (s_rigs, as it heard them)
+ * to send theirs to that player. A player who leaves takes theirs along.
+ */
+#define ATTACH_HELD 32
+static struct {
+    char mod[64];
+    int from, len;
+    unsigned char data[GEVR_ATTNET_BYTES];
+} s_attachIn[ATTACH_HELD];
+static int s_attachHeld, s_attachDropped, s_attachBad;
+static unsigned s_rigs;      /* players heard wearing something this mission (the host's asks) */
+static unsigned s_rigsDrawn; /* players whose attachments are placed here (gone when they leave) */
+static char s_rigMod[64];    /* a mod heard attaching, to ask in its name */
+
+static void attachNetForget(void)
+{
+    s_attachHeld = s_attachDropped = 0;
+    s_rigs = s_rigsDrawn = 0;
+}
+
+void gevrModNetAttach(const char *mod, int from, const void *data, int len)
+{
+    static GevrAttachRecord r[GEVR_ATTNET_RECORDS];
+    int n, i, keep = 0;
+
+    if (!gevrModScriptRunning() || mod == NULL || strlen(mod) >= sizeof(s_attachIn[0].mod)) return;
+    n = gevrAttachNetDecode((const unsigned char *)data, len, NULL, r);
+    if (n < 0) {
+        if (!s_attachBad) {
+            sysLogPrintf(LOG_WARNING, "mods: %s: a malformed attachments message from player %d dropped", mod, from);
+        }
+        s_attachBad = 1;   /* once a mission */
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        if (r[i].op == GEVR_ATTNET_ASK) {
+            /* the host's alone: send what this player wears to that one */
+            if ((from == netGetHostSlot() || from < 0) && r[i].slot != netGetLocalSlot()) gevrAttachNetAnswer(r[i].slot);
+            continue;
+        }
+        if (from < 0 || from >= GEVR_ATTNET_SLOTS) continue;   /* a dedicated server wears nothing */
+        keep = 1;
+        if (r[i].op == GEVR_ATTNET_SET || (r[i].op == GEVR_ATTNET_GUNBODY && r[i].item)) {
+            s_rigs |= 1u << from;
+            snprintf(s_rigMod, sizeof(s_rigMod), "%s", mod);
+        } else if (r[i].op == GEVR_ATTNET_CLEAR) {
+            s_rigs &= ~(1u << from);
+        }
+    }
+    if (!keep || netIsDedicated()) return;   /* the server draws no one */
+    if (s_attachHeld == ATTACH_HELD) {
+        s_attachDropped++;   /* logged as the frame applies them */
+        return;
+    }
+    snprintf(s_attachIn[s_attachHeld].mod, sizeof(s_attachIn[0].mod), "%s", mod);
+    s_attachIn[s_attachHeld].from = from;
+    s_attachIn[s_attachHeld].len = len;
+    memcpy(s_attachIn[s_attachHeld].data, data, (size_t)len);
+    s_attachHeld++;
+}
+
+/* a held message's records to the game, if it's this mission's and its mod runs here */
+static void attachApply(const char *mod, int from, const unsigned char *data, int len)
+{
+    static GevrAttachRecord r[GEVR_ATTNET_RECORDS];
+    int n, i, j, stage;
+
+    n = gevrAttachNetDecode(data, len, &stage, r);
+    if (n < 0 || stage != (gevrModScriptStage() & 0xFF) || !gevrModScriptOn(mod)) return;
+    for (i = 0; i < n; i++) {
+        if (r[i].op == GEVR_ATTNET_SET) {
+            GevrModAttach a;
+
+            memset(&a, 0, sizeof(a));
+            snprintf(a.model, sizeof(a.model), "%s", r[i].model);
+            snprintf(a.like, sizeof(a.like), "%s", r[i].like);
+            a.on = r[i].on;
+            a.where = r[i].where;
+            a.node = r[i].node;
+            for (j = 0; j < 4; j++) {
+                memcpy(a.offset[j], r[i].frame[j], sizeof(r[i].frame[j]));
+                a.offset[j][3] = j == 3 ? 1.0f : 0.0f;
+            }
+            if (gevrModGameAttachRemote(from, r[i].id, &a, r[i].shown, r[i].body)) {
+                s_rigsDrawn |= 1u << from;
+                /* its optic's housing, never the lens: a pack mesh's on the gun alone */
+                if (r[i].on == GEVR_ATTNET_GUN && !r[i].like[0]) {
+                    gevrModGameAttachRemoteOptic(from, r[i].id, r[i].optic ? r[i].housing : NULL, r[i].mode, r[i].folded);
+                }
+                /* its action, moved by the shots its copy fires here */
+                if (r[i].on == GEVR_ATTNET_GUN) {
+                    const GevrModActionTiming timing = { r[i].open, r[i].close, r[i].ease };
+
+                    gevrModGameAttachRemoteAction(from, r[i].id, r[i].moves ? r[i].travel : NULL, r[i].handle,
+                                                  r[i].timed ? &timing : NULL);
+                }
+            }
+        } else if (r[i].op == GEVR_ATTNET_GUNBODY) {
+            float fit[4][4];
+            GevrModGunParts parts;
+
+            for (j = 0; j < 4; j++) {
+                memcpy(fit[j], r[i].frame[j], sizeof(r[i].frame[j]));
+                fit[j][3] = j == 3 ? 1.0f : 0.0f;
+            }
+            /* its moving parts as the owner's mod.weapon.model gave them (no
+             * timing: GoldenEye's, as there) */
+            memset(&parts, 0, sizeof(parts));
+            memcpy(parts.pictures, r[i].pictures, sizeof(parts.pictures));
+            memcpy(parts.travel, r[i].partTravel, sizeof(parts.travel));
+            parts.holdOpen = r[i].holdOpen;
+            parts.timing.open = r[i].open;
+            parts.timing.close = r[i].close;
+            parts.timing.ease = r[i].open ? r[i].ease : 1.0f;
+            /* a gun this cartridge has, else the record's left alone */
+            if (r[i].item == 0 || gevrModGameSwappable(r[i].item)) {
+                if (gevrModGameAttachRemoteBody(from, r[i].where, r[i].item, r[i].item ? r[i].model : NULL,
+                                                r[i].fitted ? (const float (*)[4])fit : NULL,
+                                                r[i].muzzled ? r[i].muzzle : NULL, r[i].parts ? &parts : NULL) && r[i].item) {
+                    s_rigsDrawn |= 1u << from;
+                }
+            }
+        } else if (r[i].op == GEVR_ATTNET_REMOVE) {
+            gevrModGameAttachRemoteGone(from, r[i].id);
+        } else if (r[i].op == GEVR_ATTNET_CLEAR) {
+            gevrModGameAttachRemoteGone(from, 0);
+        }
+    }
+}
+
+static int attachOpticState(int id, int *mode, int *folded, char housing[GEVR_ATTNET_NAME + 1])
+{
+    return gevrModGameAttachOpticState(id, mode, folded, housing, GEVR_ATTNET_NAME + 1);
+}
+
+static int attachSend(int to, const char *mod, const void *data, int len)
+{
+    return netSendModMessage(GEVR_MODNET_ATTACH, to, mod, NULL, data, len);
+}
+
+/* each frame in play: the others' held messages, who left, what this player's changed */
+static void attachNetFrame(void)
+{
+    int i, slot;
+
+    if (s_attachDropped) {
+        sysLogPrintf(LOG_WARNING, "mods: %d attachments message(s) dropped: more than %d waited", s_attachDropped,
+                     ATTACH_HELD);
+        s_attachDropped = 0;
+    }
+    for (i = 0; i < s_attachHeld; i++) attachApply(s_attachIn[i].mod, s_attachIn[i].from, s_attachIn[i].data, s_attachIn[i].len);
+    s_attachHeld = 0;
+    for (slot = 0; s_rigsDrawn && slot < GEVR_ATTNET_SLOTS; slot++) {
+        if ((s_rigsDrawn & (1u << slot)) && !netLobbySlotConnected(slot)) {
+            gevrModGameAttachRemoteGone(slot, 0);   /* the player left */
+            s_rigsDrawn &= ~(1u << slot);
+            s_rigs &= ~(1u << slot);
+        }
+    }
+    if (netIsActive() && s_gunBodyAny) {
+        /* the pack gun body each hand draws now: a set, a reset to the
+         * hand's own, a gun swap, all told as they happen */
+        for (i = 0; i < 2; i++) {
+            GevrAttachRecord r;
+            GevrModGunParts parts;
+            float fit[4][4];
+            int j;
+
+            memset(&r, 0, sizeof(r));
+            if (s_gunBodyMod[i][0] && gevrModScriptOn(s_gunBodyMod[i])
+                && gevrModGameGunBody(i, r.model, sizeof(r.model), &r.item, fit, &r.fitted, r.muzzle, &r.muzzled, &parts,
+                                      &r.parts)) {
+                for (j = 0; j < 4; j++) memcpy(r.frame[j], fit[j], sizeof(r.frame[j]));
+                if (!r.fitted) memset(r.frame, 0, sizeof(r.frame));
+                if (!r.muzzled) memset(r.muzzle, 0, sizeof(r.muzzle));
+                if (r.parts) {
+                    /* its moving parts, for the copies' to move as its own (gevr_modaction.h) */
+                    memcpy(r.pictures, parts.pictures, sizeof(r.pictures));
+                    memcpy(r.partTravel, parts.travel, sizeof(r.partTravel));
+                    r.holdOpen = parts.holdOpen;
+                    r.open = parts.timing.open > 0 && parts.timing.close > 0 ? parts.timing.open : 0;
+                    r.close = r.open ? parts.timing.close : 0;
+                    r.ease = r.open ? parts.timing.ease : 0.0f;
+                }
+                if (!gevrAttachNetGunBody(s_gunBodyMod[i], i, &r)) gevrAttachNetGunBody(NULL, i, NULL);
+            } else {
+                gevrAttachNetGunBody(NULL, i, NULL);
+            }
+        }
+    }
+    if (netIsActive() && gevrAttachNetWorn()) {
+        gevrAttachNetRefreshBody(gevrModGameAttachBodyAt);
+        gevrAttachNetRefreshOptic(attachOpticState);
+    }
+    if (netIsActive()) gevrAttachNetPoll(sysGetMicroseconds(), gevrModScriptStage() & 0xFF, attachSend);
+}
+
+/* the host: a player reached the stage; what everyone wears goes to it */
+static void attachJoined(int slot)
+{
+    if (!netIsActive() || slot < 0 || slot >= GEVR_ATTNET_SLOTS) return;
+    gevrAttachNetAnswer(slot);   /* nothing when this player wears nothing */
+    if (s_rigs & ~(1u << slot)) gevrAttachNetAskFor(s_rigMod, slot);
+}
+
 void gevrModApiNetFlush(void)
 {
     int slot;
@@ -3096,6 +3642,7 @@ void gevrModApiNetFlush(void)
             GevrModArg a[1];
 
             s_readyHeld &= ~(1u << slot);
+            attachJoined(slot);
             a[0].kind = GEVR_MODARG_INTEGER;
             a[0].n = slot;
             gevrModScriptEvent("peer_ready", a, 1, 0);
@@ -3120,12 +3667,15 @@ void gevrModApiNetFlush(void)
         a[2].n = s_inbox[at].from;
         gevrModScriptEventFor(s_inbox[at].mod, "net_message", a, 3);
     }
+    attachNetFrame();
 }
 
 void gevrModApiNetClear(void)
 {
     s_inStart = s_inCount = s_inDropped = 0;
     s_readyHeld = 0;
+    attachNetForget();
+    s_attachBad = 0;
 }
 
 void gevrModNetStopped(const char *mod, int from)

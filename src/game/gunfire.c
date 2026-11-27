@@ -1210,6 +1210,15 @@ void gunUpdateAndFire(GUNHAND handnum)
 
             flashpos = *(coord3d *) flashdata;
 #ifdef GEVR
+            /* A pack body's authored muzzle (gevrModGunMuzzle): the carrier's
+             * flash is drawn there (the pack draw below), without its trim. */
+            coord3d packFlash;
+            const s32 packFlashed = gevrModGunMuzzle(handnum, &packFlash);
+            if (packFlashed)
+            {
+                flashpos = packFlash;
+            }
+            else
             {
                 if (item >= 0 && item < GEVR_MAX_WEAPONS)
                 {
@@ -1386,6 +1395,26 @@ void gunUpdateAndFire(GUNHAND handnum)
             }
 #endif
         }
+
+#ifdef GEVR
+        /* The authored point changes only the launch origin. Keep the
+         * cartridge's own flash matrices and random draws, including models
+         * that have no flash node or matrix at all. */
+        extern s32 gevrStereoWatchItem(s32 item);
+        coord3d packMuzzle;
+        if (!gevrStereoWatchItem(item) && gevrModGunMuzzle(handnum, &packMuzzle)) {
+            extern void gevrStereoNoteMuzzle(s32 hand, f32 x, f32 y, f32 z);
+            extern f32 D_800364CC;
+            mtx4TransformVecInPlace(&gunmtx, &packMuzzle);
+            gevrStereoNoteMuzzle(handnum, packMuzzle.x, packMuzzle.y, packMuzzle.z);
+            if (g_gevrStereo && D_800364CC > 1e-6f) {
+                for (int axis = 0; axis < 3; ++axis) packMuzzle.f[axis] /= D_800364CC;
+            }
+            hand->field_B64 = -packMuzzle.z;
+            mtx4TransformVecInPlace(currentPlayerGetViewToWorldMtxf(), &packMuzzle);
+            hand->field_B58 = packMuzzle;
+        }
+#endif
 
         node = mdlhdr->Switches[6];
 
@@ -3413,6 +3442,11 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
         extern void gevrBeanSetMagazine(int state);
         extern s32 gevrBeanMagShown(s32 hand);
         gevrBeanSetMagazine(gevrBeanMagShown(handnum));
+        {
+            /* a headset-free optic check (gevr_modoptic.c): the eye behind the first lens */
+            extern void gevrModOpticPreviewAlign(s32 hand, Model *gun);
+            gevrModOpticPreviewAlign(handnum, &handptr->weaponModel);
+        }
         /* issue #31: the watch items' arm is the tracked watch arm (bondview2.c gevrStereoWatchItem) */
         {
             const GevrModMesh *mesh = gevrModGunMesh(handnum);
@@ -3425,11 +3459,23 @@ void gunRenderFirstPersonGunModels(Gfx **gdlptr)
                         Mtxf offset = *fit;
                         matrix_4x4_multiply(root, &offset, &fitted);
                     }
-                    renderdata.gdl = gevrModMeshDraw(renderdata.gdl, fit != NULL ? &fitted : root, mesh);
+                    /* its moving parts, if the mod gave any, where the action is now */
+                    f32 partOffset[GEVR_MODPART_GROUPS][3];
+                    const GevrModGunParts *parts = gevrModGunParts(handnum, partOffset);
+                    renderdata.gdl = gevrModMeshDrawParts(renderdata.gdl, fit != NULL ? &fitted : root, mesh,
+                                                          parts != NULL ? parts->pictures : NULL,
+                                                          (const f32 (*)[3])partOffset);
                     /* the stock hand, less the gun pieces some models file under it
                      * (model.c modelGunHandList), known by the item's cartridge file */
                     modelDrawGunHand(&renderdata, &handptr->weaponModel,
                                      (const char *)get_ptr_item_text_call_line(item));
+                    /* with an authored muzzle, the carrier's own flash, which
+                     * gunUpdateAndFire placed there (model.c modelGunFlashList) */
+                    coord3d packMuzzle;
+                    if (gevrModGunMuzzle(handnum, &packMuzzle))
+                    {
+                        modelDrawGunFlash(&renderdata, &handptr->weaponModel);
+                    }
                 } else {
                     subdraw(&renderdata, &handptr->weaponModel);
                 }
@@ -4640,6 +4686,7 @@ static void gevrPlaceRemoteSound(ALSoundState *state, s32 hand, f32 low, f32 hig
 {
     extern bool netIsActive(void);
     extern int netGetLocalSlot(void);
+    extern int gevrNetSlotIsLocalHuman(int slot);
     struct player *listener;
     s32 local;
     f32 dx, dz, dist, pan, yaw;
@@ -4649,7 +4696,7 @@ static void gevrPlaceRemoteSound(ALSoundState *state, s32 hand, f32 low, f32 hig
         return;
     }
     local = netGetLocalSlot();
-    if (get_cur_playernum() == local || local < 0 || local >= MAX_PLAYER_COUNT)
+    if (gevrNetSlotIsLocalHuman(get_cur_playernum()) || local < 0 || local >= MAX_PLAYER_COUNT)
     {
         return;
     }
@@ -7158,22 +7205,32 @@ void gunTickGameplay(s32 triggerOn)
 #endif
     gunTickHandState(0, trigger_state.triggerOn[0]); // Right hand
 #ifdef GEVR
-    if (netIsActive() && get_cur_playernum() != netGetLocalSlot() && !g_CurrentPlayer->ptr_hand_weapon_buffer[GUNLEFT]) {
-        /* A low-memory copy needs shot timing and its third-person gun, never a 1P model. */
-        static s32 next_fire[MAX_PLAYER_COUNT];
-        int slot = get_cur_playernum(), item = netRemoteWeapon(slot, GUNLEFT);
-        struct hand *left = &g_CurrentPlayer->hands[GUNLEFT];
-        left->weapon_firing_status = left->field_87D = 0;
-        if (!trigger_state.triggerOn[GUNLEFT] || item == ITEM_UNARMED) next_fire[slot] = 0;
-        else if (g_GlobalTimer >= next_fire[slot] && !lvlGetControlsLockedFlag() && !g_CurrentPlayer->bonddead) {
-            int rate = bondwalkItemGetAutomaticFiringRate(item);
-            next_fire[slot] = g_GlobalTimer + (rate > 0 ? rate : 6);
-            left->weapon_firing_status = left->field_87D = 1;
-            if (bondwalkItemGetSound(item)) gevrPlaceRemoteGunSound(sndPlaySfx(g_musicSfxBufferPtr, bondwalkItemGetSound(item), NULL), GUNLEFT);
+    {
+        extern int gevrNetSlotIsLocalHuman(int slot);
+        if (netIsActive() && !gevrNetSlotIsLocalHuman(get_cur_playernum()) && !g_CurrentPlayer->ptr_hand_weapon_buffer[GUNLEFT]) {
+            /* A low-memory copy needs shot timing and its third-person gun, never a 1P model. */
+            static s32 next_fire[MAX_PLAYER_COUNT];
+            int slot = get_cur_playernum(), item = netRemoteWeapon(slot, GUNLEFT);
+            struct hand *left = &g_CurrentPlayer->hands[GUNLEFT];
+            left->weapon_firing_status = left->field_87D = 0;
+            if (!trigger_state.triggerOn[GUNLEFT] || item == ITEM_UNARMED) next_fire[slot] = 0;
+            else if (g_GlobalTimer >= next_fire[slot] && !lvlGetControlsLockedFlag() && !g_CurrentPlayer->bonddead) {
+                int rate = bondwalkItemGetAutomaticFiringRate(item);
+                next_fire[slot] = g_GlobalTimer + (rate > 0 ? rate : 6);
+                left->weapon_firing_status = left->field_87D = 1;
+                {
+                    extern void gevrModGunActionShot(s32 hand);   /* gun.c: its pack parts' shot (#335) */
+                    gevrModGunActionShot(GUNLEFT);
+                }
+                if (bondwalkItemGetSound(item)) gevrPlaceRemoteGunSound(sndPlaySfx(g_musicSfxBufferPtr, bondwalkItemGetSound(item), NULL), GUNLEFT);
+            }
+        } else {
+            gunTickHandState(1, trigger_state.triggerOn[1]); // Left hand
         }
-    } else
-#endif
+    }
+#else
     gunTickHandState(1, trigger_state.triggerOn[1]); // Left hand
+#endif
     used_to_load_1st_person_model_on_demand(0);
     used_to_load_1st_person_model_on_demand(1);
     gunTickNoise();
@@ -9352,7 +9409,7 @@ Gfx *gevrDrawNameTags(Gfx *gdl)
         rgba_f32 fog;
         s32 fogged;
 
-        if (i == netGetLocalSlot() || netPlayerIsSpectator(i) || i == netSpectatorTarget() || pl == NULL || pl->prop == NULL || pl->bonddead
+        if (i == get_cur_playernum() || netPlayerIsSpectator(i) || i == netSpectatorTarget() || pl == NULL || pl->prop == NULL || pl->bonddead
             || !(pl->prop->flags & PROPFLAG_ONSCREEN))
         {
             continue;

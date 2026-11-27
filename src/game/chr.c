@@ -33,6 +33,7 @@
 #include "net_horde.h"
 #include "gevr_romlayout.h"
 #include "gevr_ragdoll.h"
+#include "gevr_modblood.h"
 #include "gevr_avatar.h"
 #include "gevr_modapi.h"   /* mods' guards area */
 #endif
@@ -3331,6 +3332,12 @@ Gfx *chrRenderProp(PropRecord *prop, Gfx *gdl, s32 withalpha)
 
                 mrData.gdl = gevrModAttachDrawGuard(chr, &mrData, chrfadealpha, mrData.gdl);
             }
+            {
+                /* and what another player wears on a hand or the body (mod.attach, #335) */
+                extern Gfx *gevrModAttachDrawPlayer(ChrRecord *chr, ModelRenderData *body, s32 fadealpha, Gfx *gdl);
+
+                mrData.gdl = gevrModAttachDrawPlayer(chr, &mrData, chrfadealpha, mrData.gdl);
+            }
             if (chrfadealpha < 0xFF)
             {
                 gDPNoOpTag(mrData.gdl++, 0x56620000 | 0xFF);
@@ -4077,7 +4084,21 @@ void chrHandleBulletHit(struct ShotData *shot, struct BulletHit *bhit)
     // Make a fleshy impact sound.
     recall_joy2_hits_edit_detail_edit_flag(shot->weapon, bhit->prop, -1);
 
-    chrCreateHitPuffs(bhit->prop, bhit->hitpart, &hitpos, &nearhitpos);
+#ifdef GEVR
+    int texturedBlood = FALSE;
+    if (gevrModBloodEnabled() && bhit->prop->type == PROP_TYPE_CHR &&
+        bhit->hitpart != HIT_GUN && bhit->hitpart != HIT_HAT &&
+        gevrModBloodFirearm(shot->weapon) && fabsf(shot->viewDir.z) > 1e-6f) {
+        const float distance = -bhit->dist / shot->viewDir.z;
+        const int room = bhit->prop->stan ? getTileRoom(bhit->prop->stan) : -1;
+        float impact[3];
+        for (int axis = 0; axis < 3; ++axis)
+            impact[axis] = shot->gunpos.f[axis] + shot->dir.f[axis] * distance;
+        texturedBlood = gevrModBloodImpact(room, impact, shot->dir.f);
+    }
+    if (!texturedBlood)
+#endif
+        chrCreateHitPuffs(bhit->prop, bhit->hitpart, &hitpos, &nearhitpos);
 
 #ifdef GEVR
     gevrRagdollNoteHit(chr, bhit->room, bhit->hitpart, shot->dir.f, shot->weapon);
